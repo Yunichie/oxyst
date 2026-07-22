@@ -70,6 +70,7 @@ pub struct Document {
     saved_state: u64,
     next_state: u64,
     last_edit: Option<TextEdit>,
+    word_count: usize,
 }
 
 impl Document {
@@ -86,6 +87,7 @@ impl Document {
             saved_state: 0,
             next_state: 1,
             last_edit: None,
+            word_count: text.unicode_words().count(),
         }
     }
 
@@ -159,6 +161,11 @@ impl Document {
     #[must_use]
     pub fn revision(&self) -> u64 {
         self.state
+    }
+
+    #[must_use]
+    pub fn word_count(&self) -> usize {
+        self.word_count
     }
 
     #[must_use]
@@ -391,8 +398,7 @@ impl Document {
 
         let inserted_end = edit.start + edit.inserted.chars().count();
         let range = self.text.char_to_byte(edit.start)..self.text.char_to_byte(inserted_end);
-        self.text.remove(edit.start..inserted_end);
-        self.text.insert(edit.start, &edit.removed);
+        self.replace_text(edit.start, inserted_end, &edit.removed);
         self.cursor = edit.cursor_before;
         self.selection_anchor = None;
         self.state = edit.state_before;
@@ -411,8 +417,7 @@ impl Document {
 
         let removed_end = edit.start + edit.removed.chars().count();
         let range = self.text.char_to_byte(edit.start)..self.text.char_to_byte(removed_end);
-        self.text.remove(edit.start..removed_end);
-        self.text.insert(edit.start, &edit.inserted);
+        self.replace_text(edit.start, removed_end, &edit.inserted);
         self.cursor = edit.cursor_after;
         self.selection_anchor = None;
         self.state = edit.state_after;
@@ -433,8 +438,7 @@ impl Document {
         let state_after = self.next_state;
         self.next_state = self.next_state.wrapping_add(1);
 
-        self.text.remove(start..end);
-        self.text.insert(start, inserted);
+        self.replace_text(start, end, inserted);
         self.cursor = cursor_after;
         self.selection_anchor = None;
         self.state = state_after;
@@ -460,6 +464,31 @@ impl Document {
             self.undo.pop_front();
         }
         self.undo.push_back(edit);
+    }
+
+    fn replace_text(&mut self, start: usize, end: usize, inserted: &str) {
+        let before = self.words_in_affected_lines(start, end);
+        self.text.remove(start..end);
+        self.text.insert(start, inserted);
+        let inserted_end = start + inserted.chars().count();
+        let after = self.words_in_affected_lines(start, inserted_end);
+        self.word_count = self.word_count.saturating_sub(before) + after;
+    }
+
+    fn words_in_affected_lines(&self, start: usize, end: usize) -> usize {
+        let start_line = self.text.char_to_line(start.min(self.text.len_chars()));
+        let end_line = self.text.char_to_line(end.min(self.text.len_chars()));
+        let range_start = self.text.line_to_char(start_line);
+        let range_end = if end_line + 1 < self.text.len_lines() {
+            self.text.line_to_char(end_line + 1)
+        } else {
+            self.text.len_chars()
+        };
+        self.text
+            .slice(range_start..range_end)
+            .to_string()
+            .unicode_words()
+            .count()
     }
 
     fn move_vertically(&mut self, direction: isize) {
@@ -774,5 +803,26 @@ mod tests {
         let wrapped = document.find("α界", false).ok_or("search did not wrap")?;
         assert_eq!(wrapped.start, 0);
         Ok(())
+    }
+
+    #[test]
+    fn word_count_tracks_edits_line_joins_and_history() {
+        let mut document = Document::new("one two\nthree");
+        assert_eq!(document.word_count(), 3);
+
+        assert!(document.set_cursor_line_char(0, 3));
+        document.insert_text("fold");
+        assert_eq!(document.text(), "onefold two\nthree");
+        assert_eq!(document.word_count(), 3);
+
+        assert!(document.set_cursor_line_char(1, 0));
+        document.backspace();
+        assert_eq!(document.text(), "onefold twothree");
+        assert_eq!(document.word_count(), 2);
+
+        document.undo();
+        assert_eq!(document.word_count(), 3);
+        document.redo();
+        assert_eq!(document.word_count(), 2);
     }
 }
