@@ -33,27 +33,41 @@ impl Preview {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn encode_pages(
         picker: &Picker,
         rendered: RenderedDocument,
         width: u16,
     ) -> Result<Vec<SlicedProtocol>, String> {
+        Self::encode_pages_cancellable(picker, rendered, width, || false)?
+            .ok_or_else(|| "preview encoding was cancelled".to_owned())
+    }
+
+    pub(crate) fn encode_pages_cancellable(
+        picker: &Picker,
+        rendered: RenderedDocument,
+        width: u16,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Option<Vec<SlicedProtocol>>, String> {
         let width = width.max(1);
         let font = picker.font_size();
-        rendered
-            .into_pages()
-            .into_iter()
-            .map(|page| {
-                let pixel_width = u64::from(page.width().max(1));
-                let target_pixel_width = u64::from(width) * u64::from(font.width.max(1));
-                let scaled_height = u64::from(page.height()) * target_pixel_width / pixel_width;
-                let rows = scaled_height
-                    .div_ceil(u64::from(font.height.max(1)))
-                    .clamp(1, u64::from(u16::MAX)) as u16;
+        let mut pages = Vec::new();
+        for page in rendered.into_pages() {
+            if cancelled() {
+                return Ok(None);
+            }
+            let pixel_width = u64::from(page.width().max(1));
+            let target_pixel_width = u64::from(width) * u64::from(font.width.max(1));
+            let scaled_height = u64::from(page.height()) * target_pixel_width / pixel_width;
+            let rows = scaled_height
+                .div_ceil(u64::from(font.height.max(1)))
+                .clamp(1, u64::from(u16::MAX)) as u16;
+            pages.push(
                 SlicedProtocol::new(picker, page.into_image(), Some(Size::new(width, rows)))
-                    .map_err(|error| error.to_string())
-            })
-            .collect()
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        Ok(Some(pages))
     }
 
     pub(crate) fn replace_pages(&mut self, pages: Vec<SlicedProtocol>) {

@@ -160,7 +160,7 @@ impl App {
             root,
             display_name,
             picker,
-            compile_worker: CompileWorker::new(compiler, sender.clone(), runtime.clone()),
+            compile_worker: CompileWorker::new(compiler, text, sender.clone(), runtime.clone()),
             export_worker: ExportWorker::new(sender, runtime),
             internal_events,
             compile_debounce: CompileDebounce::default(),
@@ -664,7 +664,16 @@ impl App {
         let cursor = self.document.cursor_byte_index();
         self.editor.update(&action, &mut self.document);
         if self.document.revision() != revision {
-            self.compile_generation = self.compile_worker.invalidate();
+            if let Some(edit) = self.document.last_edit() {
+                match self.compile_worker.apply_edit(edit) {
+                    Ok(generation) => self.compile_generation = generation,
+                    Err(error) => {
+                        self.compile_state = CompileState::Error;
+                        self.status = Some(error);
+                        return;
+                    }
+                }
+            }
             self.compile_debounce.schedule(Instant::now());
             self.cursor_sync_deadline = None;
             self.compile_state = CompileState::Stale;
@@ -827,7 +836,7 @@ impl App {
             .unwrap_or_else(|| self.root.join("untitled.typ"));
         self.compile_generation = self.compile_worker.spawn_with_world(
             self.document.revision(),
-            self.document.text(),
+            &self.document.text(),
             self.picker.clone(),
             self.preview.target_width(),
             self.root.clone(),
