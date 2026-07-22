@@ -1,0 +1,15 @@
+[package]
+name = "typst-tui-document"
+description = "Editable document model for typst-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ropey.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
+
+[lints]
+workspace = true

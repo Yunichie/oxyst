@@ -1,0 +1,10 @@
+[package]
+name = "typst-tui-render"
+description = "Typst page rendering for typst-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
