@@ -3,14 +3,16 @@ use std::{cmp, ops::Range};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::Style,
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph},
 };
-use typst_syntax::{LinkedNode, Source, highlight};
+use typst_syntax::{LinkedNode, Source, Tag, highlight};
 use typst_tui_compiler::Severity;
-use typst_tui_document::Document;
+use typst_tui_document::{Document, Motion};
 use typst_tui_theme::{TextStyle, Theme};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     action::Action,
@@ -22,11 +24,13 @@ use super::Diagnostics;
 #[derive(Debug)]
 pub(crate) struct Editor {
     vertical_scroll: usize,
-    horizontal_scroll: usize,
     inner: Rect,
     text_area: Rect,
     source: Source,
     highlighted_lines: Vec<Line<'static>>,
+    non_code_ranges: Vec<Range<usize>>,
+    visual_rows: Vec<VisualRow>,
+    layout_width: u16,
     theme: Theme,
 }
 
@@ -34,13 +38,16 @@ impl Editor {
     pub(crate) fn new(text: &str, theme: Theme) -> Self {
         let source = Source::detached(text);
         let highlighted_lines = highlighted_lines(&source, theme);
+        let non_code_ranges = non_code_ranges(&source);
         Self {
             vertical_scroll: 0,
-            horizontal_scroll: 0,
             inner: Rect::default(),
             text_area: Rect::default(),
             source,
             highlighted_lines,
+            non_code_ranges,
+            visual_rows: Vec::new(),
+            layout_width: 0,
             theme,
         }
     }
@@ -48,6 +55,7 @@ impl Editor {
     pub(crate) fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
         self.highlighted_lines = highlighted_lines(&self.source, theme);
+        self.layout_width = 0;
     }
 
     pub(crate) fn update(&mut self, action: &Action, document: &mut Document) {
@@ -57,7 +65,11 @@ impl Editor {
             Action::InsertText(text) => document.insert_text(text),
             Action::Backspace => document.backspace(),
             Action::Delete => document.delete(),
+            Action::Move(Motion::Up) => self.move_vertically(document, -1, false),
+            Action::Move(Motion::Down) => self.move_vertically(document, 1, false),
             Action::Move(motion) => document.move_cursor(*motion),
+            Action::Select(Motion::Up) => self.move_vertically(document, -1, true),
+            Action::Select(Motion::Down) => self.move_vertically(document, 1, true),
             Action::Select(motion) => document.move_cursor_selecting(*motion, true),
             Action::SelectAll => document.select_all(),
             Action::Undo => document.undo(),
@@ -72,6 +84,8 @@ impl Editor {
                 self.source.replace(&document.text());
             }
             self.highlighted_lines = highlighted_lines(&self.source, self.theme);
+            self.non_code_ranges = non_code_ranges(&self.source);
+            self.layout_width = 0;
         }
     }
 
@@ -110,79 +124,90 @@ impl Editor {
         .areas(inner);
         self.text_area = text_area;
         let cursor = document.cursor_position();
-        self.keep_cursor_visible(cursor.line, cursor.visual_column, text_area);
+        self.ensure_layout(text_area.width);
+        let cursor_row = self.cursor_visual_row(cursor.line, cursor.visual_column);
+        self.keep_cursor_visible(cursor_row, text_area);
 
         let visible_lines = usize::from(text_area.height);
-        let end_line = (self.vertical_scroll + visible_lines).min(document.line_count());
+        let end_line = (self.vertical_scroll + visible_lines).min(self.visual_rows.len());
         let gutter = (self.vertical_scroll..end_line)
-            .map(|line| {
-                let (marker, marker_color) = match diagnostics.severity_at(line) {
-                    Some(Severity::Error) => ("E", self.theme.error),
-                    Some(Severity::Warning) => ("W", self.theme.warning),
-                    None => (" ", typst_tui_theme::Color::Reset),
+            .map(|row| {
+                let visual = &self.visual_rows[row];
+                let (marker, marker_color) = if visual.continuation {
+                    ("↪", self.theme.muted)
+                } else {
+                    match diagnostics.severity_at(visual.logical_line) {
+                        Some(Severity::Error) => ("E", self.theme.error),
+                        Some(Severity::Warning) => ("W", self.theme.warning),
+                        None => (" ", typst_tui_theme::Color::Reset),
+                    }
+                };
+                let number = if visual.continuation {
+                    String::new()
+                } else {
+                    (visual.logical_line + 1).to_string()
                 };
                 Line::from(vec![
                     Span::styled(marker, Style::default().fg(color(marker_color))),
                     Span::styled(
-                        format!("{:>width$} ", line + 1, width = usize::from(number_width)),
+                        format!("{number:>width$} ", width = usize::from(number_width)),
                         Style::default().fg(color(self.theme.muted)),
                     ),
                 ])
             })
             .collect::<Vec<_>>();
         let selection = document.selection_byte_range();
+        let brackets = matching_brackets(
+            self.source.text(),
+            document.cursor_byte_index(),
+            &self.non_code_ranges,
+        );
         let text = (self.vertical_scroll..end_line)
-            .map(|line| {
-                let style = if line == cursor.line {
+            .map(|row| {
+                let visual = &self.visual_rows[row];
+                let style = if visual.logical_line == cursor.line {
                     Style::default().bg(color(self.theme.current_line))
                 } else {
                     Style::default()
                 };
-                let content = self.highlighted_lines.get(line).cloned().map_or_else(
-                    || Line::from(document.line(line).unwrap_or_default()).style(style),
-                    |content| content.style(style),
+                let content = apply_bracket_matches(
+                    visual.content.clone().style(style),
+                    visual.byte_start,
+                    brackets.as_ref(),
                 );
-                let line_start = self
-                    .source
-                    .lines()
-                    .line_to_range(line)
-                    .map_or(0, |range| range.start);
-                apply_selection(content, line_start, selection.as_ref(), self.theme)
+                apply_selection(content, visual.byte_start, selection.as_ref(), self.theme)
             })
             .collect::<Vec<_>>();
 
         frame.render_widget(Paragraph::new(gutter), gutter_area);
-        frame.render_widget(
-            Paragraph::new(text).scroll((0, scroll_as_u16(self.horizontal_scroll))),
-            text_area,
-        );
+        frame.render_widget(Paragraph::new(text), text_area);
 
-        if focused && cursor.line >= self.vertical_scroll && cursor.line < end_line {
-            let cursor_x = cursor.visual_column.saturating_sub(self.horizontal_scroll);
+        if focused && cursor_row >= self.vertical_scroll && cursor_row < end_line {
+            let row = &self.visual_rows[cursor_row];
+            let cursor_x = cursor
+                .visual_column
+                .saturating_sub(row.start_visual_column)
+                .min(usize::from(text_area.width.saturating_sub(1)));
             let x = text_area.x.saturating_add(scroll_as_u16(cursor_x));
             let y = text_area
                 .y
-                .saturating_add(scroll_as_u16(cursor.line - self.vertical_scroll));
+                .saturating_add(scroll_as_u16(cursor_row - self.vertical_scroll));
             if x < text_area.right() && y < text_area.bottom() {
                 frame.set_cursor_position((x, y));
             }
         }
     }
 
-    fn keep_cursor_visible(&mut self, line: usize, visual_column: usize, area: Rect) {
+    fn keep_cursor_visible(&mut self, row: usize, area: Rect) {
         let height = usize::from(area.height.max(1));
-        if line < self.vertical_scroll {
-            self.vertical_scroll = line;
-        } else if line >= self.vertical_scroll + height {
-            self.vertical_scroll = line + 1 - height;
+        if row < self.vertical_scroll {
+            self.vertical_scroll = row;
+        } else if row >= self.vertical_scroll + height {
+            self.vertical_scroll = row + 1 - height;
         }
-
-        let width = usize::from(area.width.max(1));
-        if visual_column < self.horizontal_scroll {
-            self.horizontal_scroll = visual_column;
-        } else if visual_column >= self.horizontal_scroll + width {
-            self.horizontal_scroll = visual_column + 1 - width;
-        }
+        self.vertical_scroll = self
+            .vertical_scroll
+            .min(self.visual_rows.len().saturating_sub(1));
     }
 
     pub(crate) fn contains(&self, column: u16, row: u16) -> bool {
@@ -207,24 +232,100 @@ impl Editor {
         if !self.contains(column, row) {
             return false;
         }
-        let line = self
+        let row = self
             .vertical_scroll
             .saturating_add(usize::from(row.saturating_sub(self.text_area.y)))
-            .min(document.line_count().saturating_sub(1));
+            .min(self.visual_rows.len().saturating_sub(1));
+        let visual = &self.visual_rows[row];
         let visual_column = if column < self.text_area.x {
-            0
+            visual.start_visual_column
         } else {
-            self.horizontal_scroll
+            visual
+                .start_visual_column
                 .saturating_add(usize::from(column - self.text_area.x))
         };
-        document.set_cursor_visual_position(line, visual_column, selecting)
+        document.set_cursor_visual_position(visual.logical_line, visual_column, selecting)
     }
 
-    pub(crate) fn scroll_lines(&mut self, lines: isize, document: &Document) {
+    pub(crate) fn scroll_lines(&mut self, lines: isize, _document: &Document) {
         self.vertical_scroll = self
             .vertical_scroll
             .saturating_add_signed(lines)
-            .min(document.line_count().saturating_sub(1));
+            .min(self.visual_rows.len().saturating_sub(1));
+    }
+
+    fn ensure_layout(&mut self, width: u16) {
+        let width = width.max(1);
+        if self.layout_width == width && !self.visual_rows.is_empty() {
+            return;
+        }
+        self.layout_width = width;
+        self.visual_rows.clear();
+        for (logical_line, content) in self.highlighted_lines.iter().enumerate() {
+            let byte_start = self
+                .source
+                .lines()
+                .line_to_range(logical_line)
+                .map_or(0, |range| range.start);
+            self.visual_rows.extend(wrap_line(
+                content,
+                logical_line,
+                byte_start,
+                usize::from(width),
+            ));
+        }
+        if self.visual_rows.is_empty() {
+            self.visual_rows.push(VisualRow::empty(0, 0, 0, false));
+        }
+        self.vertical_scroll = self
+            .vertical_scroll
+            .min(self.visual_rows.len().saturating_sub(1));
+    }
+
+    fn cursor_visual_row(&self, logical_line: usize, visual_column: usize) -> usize {
+        self.visual_rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                row.logical_line == logical_line && row.start_visual_column <= visual_column
+            })
+            .map(|(index, _)| index)
+            .next_back()
+            .or_else(|| {
+                self.visual_rows
+                    .iter()
+                    .position(|row| row.logical_line == logical_line)
+            })
+            .unwrap_or(0)
+    }
+
+    fn move_vertically(&self, document: &mut Document, direction: isize, selecting: bool) {
+        let motion = if direction < 0 {
+            Motion::Up
+        } else {
+            Motion::Down
+        };
+        if self.visual_rows.is_empty() || (!selecting && document.selection_byte_range().is_some())
+        {
+            document.move_cursor_selecting(motion, selecting);
+            return;
+        }
+
+        let cursor = document.cursor_position();
+        let current = self.cursor_visual_row(cursor.line, cursor.visual_column);
+        let target = current
+            .saturating_add_signed(direction)
+            .min(self.visual_rows.len().saturating_sub(1));
+        let current_row = &self.visual_rows[current];
+        let target_row = &self.visual_rows[target];
+        let column = cursor
+            .visual_column
+            .saturating_sub(current_row.start_visual_column);
+        document.set_cursor_visual_position(
+            target_row.logical_line,
+            target_row.start_visual_column.saturating_add(column),
+            selecting,
+        );
     }
 }
 
@@ -244,6 +345,203 @@ impl Default for Editor {
 struct StyledRange {
     range: Range<usize>,
     style: TextStyle,
+}
+
+#[derive(Clone, Debug)]
+struct VisualRow {
+    logical_line: usize,
+    start_visual_column: usize,
+    byte_start: usize,
+    content: Line<'static>,
+    continuation: bool,
+}
+
+impl VisualRow {
+    fn empty(
+        logical_line: usize,
+        start_visual_column: usize,
+        byte_start: usize,
+        continuation: bool,
+    ) -> Self {
+        Self {
+            logical_line,
+            start_visual_column,
+            byte_start,
+            content: Line::default(),
+            continuation,
+        }
+    }
+}
+
+fn wrap_line(
+    line: &Line<'static>,
+    logical_line: usize,
+    line_byte_start: usize,
+    width: usize,
+) -> Vec<VisualRow> {
+    let mut rows = Vec::new();
+    let mut spans = Vec::new();
+    let mut row_width = 0_usize;
+    let mut visual_column = 0_usize;
+    let mut byte = line_byte_start;
+    let mut row_byte_start = byte;
+    let mut row_visual_start = visual_column;
+
+    for span in &line.spans {
+        for grapheme in span.content.graphemes(true) {
+            let grapheme_width = UnicodeWidthStr::width(grapheme);
+            if row_width > 0 && row_width.saturating_add(grapheme_width) > width {
+                rows.push(VisualRow {
+                    logical_line,
+                    start_visual_column: row_visual_start,
+                    byte_start: row_byte_start,
+                    content: Line::from(std::mem::take(&mut spans)),
+                    continuation: !rows.is_empty(),
+                });
+                row_width = 0;
+                row_byte_start = byte;
+                row_visual_start = visual_column;
+            }
+            push_span(&mut spans, grapheme, span.style);
+            row_width = row_width.saturating_add(grapheme_width);
+            visual_column = visual_column.saturating_add(grapheme_width);
+            byte += grapheme.len();
+        }
+    }
+
+    rows.push(VisualRow {
+        logical_line,
+        start_visual_column: row_visual_start,
+        byte_start: row_byte_start,
+        content: Line::from(spans),
+        continuation: !rows.is_empty(),
+    });
+    rows
+}
+
+fn push_span(spans: &mut Vec<Span<'static>>, content: &str, style: Style) {
+    if let Some(previous) = spans.last_mut()
+        && previous.style == style
+    {
+        previous.content.to_mut().push_str(content);
+        return;
+    }
+    spans.push(Span::styled(content.to_owned(), style));
+}
+
+fn non_code_ranges(source: &Source) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    collect_non_code_ranges(&LinkedNode::new(source.root()), &mut ranges);
+    ranges
+}
+
+fn collect_non_code_ranges(node: &LinkedNode<'_>, ranges: &mut Vec<Range<usize>>) {
+    if matches!(highlight(node), Some(Tag::Comment | Tag::Raw | Tag::String)) {
+        ranges.push(node.range());
+        return;
+    }
+    for child in node.children() {
+        collect_non_code_ranges(&child, ranges);
+    }
+}
+
+fn matching_brackets(
+    text: &str,
+    cursor: usize,
+    non_code_ranges: &[Range<usize>],
+) -> Option<[Range<usize>; 2]> {
+    let candidate = bracket_at(text, cursor).or_else(|| {
+        text.get(..cursor)
+            .and_then(|before| before.char_indices().next_back())
+            .filter(|(_, character)| is_bracket(*character))
+    })?;
+    let (start, bracket) = candidate;
+    if is_non_code(start, non_code_ranges) {
+        return None;
+    }
+    let (matching, forward) = match bracket {
+        '(' => (')', true),
+        '[' => (']', true),
+        '{' => ('}', true),
+        ')' => ('(', false),
+        ']' => ('[', false),
+        '}' => ('{', false),
+        _ => return None,
+    };
+    let found = if forward {
+        find_forward_match(text, start, bracket, matching, non_code_ranges)
+    } else {
+        find_backward_match(text, start, bracket, matching, non_code_ranges)
+    }?;
+    Some([
+        start..start + bracket.len_utf8(),
+        found..found + matching.len_utf8(),
+    ])
+}
+
+fn bracket_at(text: &str, byte: usize) -> Option<(usize, char)> {
+    let character = text.get(byte..)?.chars().next()?;
+    is_bracket(character).then_some((byte, character))
+}
+
+fn is_bracket(character: char) -> bool {
+    matches!(character, '(' | ')' | '[' | ']' | '{' | '}')
+}
+
+fn is_non_code(byte: usize, ranges: &[Range<usize>]) -> bool {
+    ranges
+        .partition_point(|range| range.start <= byte)
+        .checked_sub(1)
+        .is_some_and(|index| byte < ranges[index].end)
+}
+
+fn find_forward_match(
+    text: &str,
+    start: usize,
+    opening: char,
+    closing: char,
+    non_code_ranges: &[Range<usize>],
+) -> Option<usize> {
+    let mut depth = 1_usize;
+    for (offset, character) in text.get(start + opening.len_utf8()..)?.char_indices() {
+        let byte = start + opening.len_utf8() + offset;
+        if is_non_code(byte, non_code_ranges) {
+            continue;
+        }
+        if character == opening {
+            depth += 1;
+        } else if character == closing {
+            depth -= 1;
+            if depth == 0 {
+                return Some(byte);
+            }
+        }
+    }
+    None
+}
+
+fn find_backward_match(
+    text: &str,
+    start: usize,
+    closing: char,
+    opening: char,
+    non_code_ranges: &[Range<usize>],
+) -> Option<usize> {
+    let mut depth = 1_usize;
+    for (byte, character) in text.get(..start)?.char_indices().rev() {
+        if is_non_code(byte, non_code_ranges) {
+            continue;
+        }
+        if character == closing {
+            depth += 1;
+        } else if character == opening {
+            depth -= 1;
+            if depth == 0 {
+                return Some(byte);
+            }
+        }
+    }
+    None
 }
 
 fn highlighted_lines(source: &Source, theme: Theme) -> Vec<Line<'static>> {
@@ -326,6 +624,56 @@ fn highlighted_line(
     Line::from(spans)
 }
 
+fn apply_bracket_matches(
+    mut line: Line<'static>,
+    line_start: usize,
+    matches: Option<&[Range<usize>; 2]>,
+) -> Line<'static> {
+    let Some(matches) = matches else {
+        return line;
+    };
+    for range in matches {
+        line = apply_modifier(line, line_start, range, Modifier::REVERSED);
+    }
+    line
+}
+
+fn apply_modifier(
+    line: Line<'static>,
+    line_start: usize,
+    range: &Range<usize>,
+    modifier: Modifier,
+) -> Line<'static> {
+    let mut offset = line_start;
+    let mut spans = Vec::new();
+    for span in line.spans {
+        let content = span.content.into_owned();
+        let end = offset + content.len();
+        let styled_start = range.start.clamp(offset, end);
+        let styled_end = range.end.clamp(offset, end);
+        if offset < styled_start {
+            spans.push(Span::styled(
+                content[..styled_start - offset].to_owned(),
+                span.style,
+            ));
+        }
+        if styled_start < styled_end {
+            spans.push(Span::styled(
+                content[styled_start - offset..styled_end - offset].to_owned(),
+                span.style.add_modifier(modifier),
+            ));
+        }
+        if styled_end < end {
+            spans.push(Span::styled(
+                content[styled_end - offset..].to_owned(),
+                span.style,
+            ));
+        }
+        offset = end;
+    }
+    Line::from(spans).style(line.style)
+}
+
 fn apply_selection(
     line: Line<'static>,
     line_start: usize,
@@ -374,11 +722,12 @@ mod tests {
     use std::convert::Infallible;
 
     use ratatui::{Terminal, backend::TestBackend, style::Color};
+    use typst_syntax::Source;
     use typst_tui_compiler::{Diagnostic, Severity};
     use typst_tui_document::{Document, Motion};
     use typst_tui_theme::{ColorDepth, Theme, ThemeName};
 
-    use super::{Diagnostics, Editor};
+    use super::{Diagnostics, Editor, matching_brackets, non_code_ranges};
     use crate::action::Action;
 
     fn theme() -> Theme {
@@ -458,6 +807,7 @@ mod tests {
             line: Some(1),
             column: Some(0),
             is_main: true,
+            notes: Vec::new(),
         }]);
         let backend = TestBackend::new(30, 6);
         let mut terminal = Terminal::new(backend)?;
@@ -512,6 +862,62 @@ mod tests {
         assert!(editor.place_cursor(&mut document, 6, 2, false));
         assert_eq!(document.cursor_position().line, 1);
         assert_eq!(document.cursor_position().visual_column, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn soft_wraps_wide_text_and_maps_continuation_clicks() -> Result<(), Infallible> {
+        let source = "ab\u{754c}cdefgh";
+        let mut document = Document::new(source);
+        let mut editor = Editor::new(source, theme());
+        let diagnostics = Diagnostics::default();
+        let backend = TestBackend::new(12, 6);
+        let mut terminal = Terminal::new(backend)?;
+        terminal.draw(|frame| editor.draw(frame, frame.area(), &document, &diagnostics, true))?;
+
+        assert!(editor.visual_rows.len() > 1);
+        assert!(editor.visual_rows[1].continuation);
+        let continuation_column = editor.visual_rows[1].start_visual_column;
+        editor.update(&Action::Move(Motion::Down), &mut document);
+        assert_eq!(document.cursor_position().line, 0);
+        assert_eq!(
+            document.cursor_position().visual_column,
+            continuation_column
+        );
+        assert!(editor.place_cursor(
+            &mut document,
+            editor.text_area.x,
+            editor.text_area.y + 1,
+            false,
+        ));
+        assert_eq!(
+            document.cursor_position().visual_column,
+            continuation_column
+        );
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| cell.symbol() == "↪")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bracket_matching_ignores_strings() -> Result<(), &'static str> {
+        let text = "#let value = (\"ignored )\" + [1])";
+        let source = Source::detached(text);
+        let non_code = non_code_ranges(&source);
+        let opening = text.find('(').ok_or("opening bracket is missing")?;
+        let closing = text.rfind(')').ok_or("closing bracket is missing")?;
+        let matched =
+            matching_brackets(text, opening, &non_code).ok_or("outer brackets did not match")?;
+        assert_eq!(matched[1].start, closing);
+
+        let string_bracket = text.find(")\"").ok_or("string bracket is missing")?;
+        assert!(matching_brackets(text, string_bracket, &non_code).is_none());
         Ok(())
     }
 }

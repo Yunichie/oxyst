@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub use diagnostics::{Diagnostic, Severity};
+pub use diagnostics::{Diagnostic, DiagnosticNote, DiagnosticNoteKind, Severity};
 pub use sync::{DocumentSync, PagePosition};
 use thiserror::Error;
 use typst::diag::Warned;
@@ -78,6 +78,10 @@ impl Compiler {
         }
         self.world.edit_source(range, replacement);
         Ok(())
+    }
+
+    pub fn invalidate_files(&mut self) {
+        self.world.invalidate_files();
     }
 
     #[must_use]

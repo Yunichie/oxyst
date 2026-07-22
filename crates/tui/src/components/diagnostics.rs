@@ -7,7 +7,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph},
 };
-use typst_tui_compiler::{Diagnostic, Severity};
+use typst_tui_compiler::{Diagnostic, DiagnosticNote, DiagnosticNoteKind, Severity};
 use typst_tui_theme::Theme;
 
 use crate::style::color;
@@ -19,6 +19,10 @@ pub(crate) struct Diagnostics {
     selected: Option<usize>,
     scroll: usize,
     visible: bool,
+    row_offsets: Vec<usize>,
+    row_count: usize,
+    error_count: usize,
+    warning_count: usize,
 }
 
 impl Diagnostics {
@@ -27,7 +31,17 @@ impl Diagnostics {
         self.selected = self.selected.filter(|index| *index < self.items.len());
         self.scroll = 0;
         self.line_severity.clear();
+        self.row_offsets.clear();
+        self.row_count = 0;
+        self.error_count = 0;
+        self.warning_count = 0;
         for diagnostic in &self.items {
+            self.row_offsets.push(self.row_count);
+            self.row_count += 1 + diagnostic.notes.len();
+            match diagnostic.severity {
+                Severity::Error => self.error_count += 1,
+                Severity::Warning => self.warning_count += 1,
+            }
             let Some(line) = diagnostic.line.filter(|_| diagnostic.is_main) else {
                 continue;
             };
@@ -58,14 +72,11 @@ impl Diagnostics {
     }
 
     pub(crate) fn errors(&self) -> usize {
-        self.items
-            .iter()
-            .filter(|diagnostic| diagnostic.severity == Severity::Error)
-            .count()
+        self.error_count
     }
 
     pub(crate) fn warnings(&self) -> usize {
-        self.items.len().saturating_sub(self.errors())
+        self.warning_count
     }
 
     pub(crate) fn select(&mut self, direction: isize) -> Option<&Diagnostic> {
@@ -106,11 +117,32 @@ impl Diagnostics {
         }
 
         self.keep_selection_visible(usize::from(inner.height));
-        let end = (self.scroll + usize::from(inner.height)).min(self.items.len());
-        let lines = self.items[self.scroll..end]
-            .iter()
-            .enumerate()
-            .map(|(offset, diagnostic)| {
+        let end = (self.scroll + usize::from(inner.height)).min(self.row_count);
+        let lines = (self.scroll..end)
+            .filter_map(|row| self.row(row))
+            .map(|(item_index, note)| {
+                let diagnostic = &self.items[item_index];
+                if let Some(note) = note {
+                    let note_color = match note.kind {
+                        DiagnosticNoteKind::Hint => theme.info,
+                        DiagnosticNoteKind::Trace => theme.muted,
+                    };
+                    let line = Line::from(vec![
+                        Span::styled(
+                            match note.kind {
+                                DiagnosticNoteKind::Hint => "  hint: ",
+                                DiagnosticNoteKind::Trace => "  trace: ",
+                            },
+                            Style::default().fg(color(note_color)),
+                        ),
+                        Span::raw(format_note(note)),
+                    ]);
+                    return if self.selected == Some(item_index) {
+                        line.style(Style::default().bg(color(theme.selection)))
+                    } else {
+                        line
+                    };
+                }
                 let severity_color = match diagnostic.severity {
                     Severity::Error => theme.error,
                     Severity::Warning => theme.warning,
@@ -123,7 +155,7 @@ impl Diagnostics {
                     Span::styled(severity, Style::default().fg(color(severity_color))),
                     Span::raw(format_diagnostic(diagnostic)),
                 ]);
-                if self.selected == Some(self.scroll + offset) {
+                if self.selected == Some(item_index) {
                     line.style(Style::default().bg(color(theme.selection)))
                 } else {
                     line
@@ -137,11 +169,22 @@ impl Diagnostics {
         let Some(selected) = self.selected else {
             return;
         };
-        if selected < self.scroll {
-            self.scroll = selected;
-        } else if selected >= self.scroll + height.max(1) {
-            self.scroll = selected + 1 - height.max(1);
+        let row = self.row_offsets.get(selected).copied().unwrap_or(0);
+        if row < self.scroll {
+            self.scroll = row;
+        } else if row >= self.scroll + height.max(1) {
+            self.scroll = row + 1 - height.max(1);
         }
+    }
+
+    fn row(&self, row: usize) -> Option<(usize, Option<&DiagnosticNote>)> {
+        let item = self.row_offsets.partition_point(|offset| *offset <= row);
+        let item = item.checked_sub(1)?;
+        let note = row.checked_sub(self.row_offsets[item] + 1);
+        Some((
+            item,
+            note.and_then(|index| self.items[item].notes.get(index)),
+        ))
     }
 }
 
@@ -155,12 +198,22 @@ pub(crate) fn format_diagnostic(diagnostic: &Diagnostic) -> String {
     }
 }
 
+fn format_note(note: &DiagnosticNote) -> String {
+    let message = note.message.replace(['\r', '\n'], " ");
+    match (&note.path, note.line, note.column) {
+        (Some(path), Some(line), Some(column)) => {
+            format!("{path}:{}:{}: {message}", line + 1, column + 1)
+        }
+        _ => message,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::convert::Infallible;
 
     use ratatui::{Terminal, backend::TestBackend};
-    use typst_tui_compiler::{Diagnostic, Severity};
+    use typst_tui_compiler::{Diagnostic, DiagnosticNote, DiagnosticNoteKind, Severity};
     use typst_tui_theme::{ColorDepth, Theme, ThemeName};
 
     use super::Diagnostics;
@@ -173,15 +226,35 @@ mod tests {
             line: Some(line),
             column: Some(2),
             is_main: true,
+            notes: Vec::new(),
         }
     }
 
     #[test]
     fn draws_and_navigates_diagnostics() -> Result<(), Infallible> {
         let mut diagnostics = Diagnostics::default();
+        let mut error = diagnostic(Severity::Error, 1, "blocking error");
+        error.notes = vec![
+            DiagnosticNote {
+                kind: DiagnosticNoteKind::Trace,
+                message: "while calling helper".to_owned(),
+                path: Some("main.typ".to_owned()),
+                line: Some(0),
+                column: Some(0),
+                is_main: true,
+            },
+            DiagnosticNote {
+                kind: DiagnosticNoteKind::Hint,
+                message: "use text instead".to_owned(),
+                path: None,
+                line: None,
+                column: None,
+                is_main: false,
+            },
+        ];
         diagnostics.set_items(vec![
             diagnostic(Severity::Warning, 1, "first warning"),
-            diagnostic(Severity::Error, 1, "blocking error"),
+            error,
         ]);
         diagnostics.toggle();
 
@@ -209,6 +282,8 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("1 errors, 1 warnings"));
         assert!(rendered.contains("blocking error"));
+        assert!(rendered.contains("while calling helper"));
+        assert!(rendered.contains("use text instead"));
 
         Ok(())
     }
