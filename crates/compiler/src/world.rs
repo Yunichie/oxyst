@@ -25,7 +25,7 @@ use crate::Error;
 
 pub(crate) struct TypstWorld {
     resources: Arc<WorldResources>,
-    files: FileStore<SecureFiles>,
+    files: Arc<FileStore<SecureFiles>>,
     main: FileId,
     main_source: Source,
     now: Time,
@@ -71,7 +71,7 @@ impl TypstWorld {
         });
 
         Ok(Self {
-            files: FileStore::new(SecureFiles::new(Arc::clone(&resources))),
+            files: Arc::new(FileStore::new(SecureFiles::new(Arc::clone(&resources)))),
             resources,
             main,
             main_source: Source::new(main, String::new()),
@@ -90,7 +90,7 @@ impl TypstWorld {
     pub(crate) fn snapshot(&self) -> Self {
         Self {
             resources: Arc::clone(&self.resources),
-            files: FileStore::new(SecureFiles::new(Arc::clone(&self.resources))),
+            files: Arc::clone(&self.files),
             main: self.main,
             main_source: self.main_source.clone(),
             now: Time::system(),
@@ -103,6 +103,12 @@ impl TypstWorld {
 
     pub(crate) fn source_text(&self) -> &str {
         self.main_source.text()
+    }
+
+    pub(crate) fn invalidate_files(&mut self) {
+        self.files = Arc::new(FileStore::new(SecureFiles::new(Arc::clone(
+            &self.resources,
+        ))));
     }
 }
 
@@ -216,5 +222,26 @@ impl FileLoader for SecureFiles {
                 self.resources.packages.obtain(package)?.load(id.vpath())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{error::Error, path::PathBuf, sync::Arc};
+
+    use super::TypstWorld;
+
+    #[test]
+    fn snapshots_reuse_files_until_resource_invalidation() -> Result<(), Box<dyn Error>> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        let mut world = TypstWorld::new(&root, &root.join("simple.typ"))?;
+        let first = world.snapshot();
+        let second = world.snapshot();
+        assert!(Arc::ptr_eq(&first.files, &second.files));
+
+        world.invalidate_files();
+        let invalidated = world.snapshot();
+        assert!(!Arc::ptr_eq(&first.files, &invalidated.files));
+        Ok(())
     }
 }
