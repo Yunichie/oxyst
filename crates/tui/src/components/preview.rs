@@ -2,7 +2,9 @@ use ratatui::{
     Frame,
     layout::{Rect, Size},
     style::{Modifier, Style},
-    widgets::{Block, BorderType, Borders, Paragraph},
+    widgets::{
+        Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    },
 };
 use ratatui_image::{
     picker::Picker,
@@ -249,6 +251,19 @@ impl Preview {
                 inner,
             );
         }
+        let content_height = self.content_height();
+        if content_height > usize::from(inner.height) && inner.width > 1 {
+            let mut state = ScrollbarState::new(content_height)
+                .position(self.scroll)
+                .viewport_content_length(usize::from(inner.height));
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .thumb_style(Style::default().fg(color(theme.muted)))
+                    .track_style(Style::default().fg(color(theme.border))),
+                inner,
+                &mut state,
+            );
+        }
     }
 
     fn current_page(&self) -> usize {
@@ -264,11 +279,15 @@ impl Preview {
     }
 
     fn clamp_scroll(&mut self) {
-        let content_height = self.pages.iter().fold(0_usize, |height, page| {
-            height + usize::from(page.size().height) + 1
-        });
+        let content_height = self.content_height();
         let max_scroll = content_height.saturating_sub(usize::from(self.viewport.height));
         self.scroll = self.scroll.min(max_scroll);
+    }
+
+    fn content_height(&self) -> usize {
+        self.pages.iter().fold(0_usize, |height, page| {
+            height + usize::from(page.size().height) + 1
+        })
     }
 }
 
@@ -329,7 +348,7 @@ mod tests {
         let mut preview = Preview::new();
         preview.replace_pages(pages);
 
-        let backend = TestBackend::new(32, 14);
+        let backend = TestBackend::new(32, 8);
         let mut terminal = Terminal::new(backend)?;
         terminal.draw(|frame| preview.draw(frame, frame.area(), true, false, &theme()))?;
 
@@ -345,6 +364,14 @@ mod tests {
         });
         assert!(rendered.contains("Page 1 / 1"));
         assert!(has_raster_color);
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| matches!(cell.symbol(), "▲" | "▼" | "█"))
+        );
 
         let clicked = preview
             .position_at(16, 2)
