@@ -6,5 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[dependencies]
+image.workspace = true
+thiserror.workspace = true
+typst-render.workspace = true
+typst-tui-compiler.workspace = true
+
 [lints]
 workspace = true

@@ -9,8 +9,12 @@ license.workspace = true
 [dependencies]
 crossterm.workspace = true
 ratatui.workspace = true
+ratatui-image.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+typst-tui-compiler.workspace = true
 typst-tui-document.workspace = true
+typst-tui-render.workspace = true
 unicode-width.workspace = true
 
 [lints]
