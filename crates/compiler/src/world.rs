@@ -1,6 +1,8 @@
 use std::{
     fs, io,
+    ops::Range,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use typst::{
@@ -22,12 +24,18 @@ use typst_kit::{
 use crate::Error;
 
 pub(crate) struct TypstWorld {
-    library: LazyHash<Library>,
-    fonts: FontStore,
+    resources: Arc<WorldResources>,
     files: FileStore<SecureFiles>,
     main: FileId,
     main_source: Source,
     now: Time,
+}
+
+struct WorldResources {
+    root: PathBuf,
+    library: LazyHash<Library>,
+    fonts: FontStore,
+    packages: Arc<SystemPackages>,
 }
 
 impl TypstWorld {
@@ -51,34 +59,60 @@ impl TypstWorld {
         font_store.extend(fonts::system());
         font_store.extend(fonts::embedded());
 
-        Ok(Self {
+        let packages = Arc::new(SystemPackages::new(SystemDownloader::new(concat!(
+            "typst-tui/",
+            env!("CARGO_PKG_VERSION")
+        ))));
+        let resources = Arc::new(WorldResources {
+            root,
             library: LazyHash::new(Library::default()),
             fonts: font_store,
-            files: FileStore::new(SecureFiles::new(root)),
+            packages,
+        });
+
+        Ok(Self {
+            files: FileStore::new(SecureFiles::new(Arc::clone(&resources))),
+            resources,
             main,
             main_source: Source::new(main, String::new()),
             now: Time::system(),
         })
     }
 
-    pub(crate) fn reset(&mut self, text: &str) {
+    pub(crate) fn replace_source(&mut self, text: &str) {
         self.main_source.replace(text);
-        self.files.reset();
-        self.now.reset();
+    }
+
+    pub(crate) fn edit_source(&mut self, range: Range<usize>, replacement: &str) {
+        self.main_source.edit(range, replacement);
+    }
+
+    pub(crate) fn snapshot(&self) -> Self {
+        Self {
+            resources: Arc::clone(&self.resources),
+            files: FileStore::new(SecureFiles::new(Arc::clone(&self.resources))),
+            main: self.main,
+            main_source: self.main_source.clone(),
+            now: Time::system(),
+        }
     }
 
     pub(crate) fn main_source(&self) -> Source {
         self.main_source.clone()
     }
+
+    pub(crate) fn source_text(&self) -> &str {
+        self.main_source.text()
+    }
 }
 
 impl World for TypstWorld {
     fn library(&self) -> &LazyHash<Library> {
-        &self.library
+        &self.resources.library
     }
 
     fn book(&self) -> &LazyHash<FontBook> {
-        self.fonts.book()
+        self.resources.fonts.book()
     }
 
     fn main(&self) -> FileId {
@@ -102,7 +136,7 @@ impl World for TypstWorld {
     }
 
     fn font(&self, index: usize) -> Option<Font> {
-        self.fonts.font(index)
+        self.resources.fonts.font(index)
     }
 
     fn today(&self, offset: Option<Duration>) -> Option<Datetime> {
@@ -146,24 +180,19 @@ fn resolve_main(main: &Path) -> Result<PathBuf, Error> {
 }
 
 struct SecureFiles {
-    root: PathBuf,
-    packages: SystemPackages,
+    resources: Arc<WorldResources>,
 }
 
 impl SecureFiles {
-    fn new(root: PathBuf) -> Self {
-        let downloader = SystemDownloader::new(concat!("typst-tui/", env!("CARGO_PKG_VERSION")));
-        Self {
-            root,
-            packages: SystemPackages::new(downloader),
-        }
+    fn new(resources: Arc<WorldResources>) -> Self {
+        Self { resources }
     }
 
     fn load_project(&self, vpath: &VirtualPath) -> FileResult<Bytes> {
-        let lexical = vpath.realize(&self.root)?;
+        let lexical = vpath.realize(&self.resources.root)?;
         let canonical =
             fs::canonicalize(&lexical).map_err(|error| FileError::from_io(error, &lexical))?;
-        if !canonical.starts_with(&self.root) {
+        if !canonical.starts_with(&self.resources.root) {
             return Err(FileError::AccessDenied);
         }
 
@@ -183,7 +212,9 @@ impl FileLoader for SecureFiles {
     fn load(&self, id: FileId) -> FileResult<Bytes> {
         match id.root() {
             VirtualRoot::Project => self.load_project(id.vpath()),
-            VirtualRoot::Package(package) => self.packages.obtain(package)?.load(id.vpath()),
+            VirtualRoot::Package(package) => {
+                self.resources.packages.obtain(package)?.load(id.vpath())
+            }
         }
     }
 }

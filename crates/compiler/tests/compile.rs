@@ -82,3 +82,36 @@ fn maps_between_source_and_preview_positions() -> Result<(), Box<dyn Error>> {
 
     Ok(())
 }
+
+#[test]
+fn incrementally_edits_the_source_used_by_snapshots() -> Result<(), Box<dyn Error>> {
+    let root = fixtures();
+    let source = read("simple.typ")?;
+    let start = source
+        .find("Hello")
+        .ok_or_else(|| io::Error::other("fixture text is missing"))?;
+    let mut compiler = Compiler::new(&root, root.join("simple.typ"))?;
+    compiler.replace_source(&source);
+    compiler.apply_edit(start..start + "Hello".len(), "Updated")?;
+
+    let CompileOutcome::Success(document) = compiler.snapshot().compile() else {
+        return Err("incrementally edited source failed to compile".into());
+    };
+    assert_eq!(document.page_count(), 1);
+    Ok(())
+}
+
+#[test]
+fn snapshots_keep_the_source_revision_they_were_created_from() -> Result<(), Box<dyn Error>> {
+    let root = fixtures();
+    let mut compiler = Compiler::new(&root, root.join("simple.typ"))?;
+    compiler.replace_source("= Valid snapshot");
+    let valid = compiler.snapshot();
+
+    compiler.replace_source("#let broken =");
+    let invalid = compiler.snapshot();
+
+    assert!(matches!(valid.compile(), CompileOutcome::Success(_)));
+    assert!(matches!(invalid.compile(), CompileOutcome::Failure(_)));
+    Ok(())
+}
