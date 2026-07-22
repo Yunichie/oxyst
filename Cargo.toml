@@ -27,24 +27,30 @@ license = "MIT OR Apache-2.0"
 anyhow = "1.0.104"
 clap = { version = "4.6.4", features = ["derive"] }
 crossterm = "0.29.0"
-image = { version = "0.25.10", default-features = false }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 ropey = "1.6.1"
+serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.19"
 tokio = { version = "1.53.1", features = ["rt-multi-thread"] }
+toml = "0.9.8"
 typst = "0.15.1"
 typst-ide = "0.15.1"
 typst-kit = { version = "0.15.1", features = ["datetime", "embedded-fonts", "scan-fonts", "system-downloader", "system-packages"] }
 typst-layout = "0.15.1"
+typst-pdf = "0.15.1"
 typst-render = "0.15.1"
 typst-syntax = "0.15.1"
+typst-svg = "0.15.1"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
 typst-tui-app = { path = "crates/tui" }
 typst-tui-compiler = { path = "crates/compiler" }
+typst-tui-config = { path = "crates/config" }
 typst-tui-document = { path = "crates/document" }
 typst-tui-render = { path = "crates/render" }
+typst-tui-theme = { path = "crates/theme" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -58,6 +64,7 @@ unwrap_used = "deny"
 anyhow.workspace = true
 clap.workspace = true
 typst-tui-app.workspace = true
+typst-tui-config.workspace = true
 
 [lints]
 workspace = true

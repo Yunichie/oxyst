@@ -13,8 +13,10 @@ ratatui-image.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 typst-tui-compiler.workspace = true
+typst-tui-config.workspace = true
 typst-tui-document.workspace = true
 typst-tui-render.workspace = true
+typst-tui-theme.workspace = true
 typst-syntax.workspace = true
 unicode-width.workspace = true
 

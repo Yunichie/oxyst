@@ -9,7 +9,10 @@ license.workspace = true
 [dependencies]
 image.workspace = true
 thiserror.workspace = true
+typst.workspace = true
+typst-pdf.workspace = true
 typst-render.workspace = true
+typst-svg.workspace = true
 typst-tui-compiler.workspace = true
 
 [lints]
