@@ -9,6 +9,7 @@ mod event;
 mod export;
 mod input;
 mod style;
+mod watcher;
 
 use std::{io, path::PathBuf, time::Duration};
 

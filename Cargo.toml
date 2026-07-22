@@ -29,6 +29,7 @@ arboard = "3.6.1"
 clap = { version = "4.6.4", features = ["derive"] }
 crossterm = "0.29.0"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+notify = "8.2.0"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 ropey = "1.6.1"

@@ -116,6 +116,10 @@ impl CompileWorker {
         Ok(generation)
     }
 
+    pub(crate) fn invalidate(&self) -> Result<u64, String> {
+        self.advance_and_cancel_pending()
+    }
+
     pub(crate) fn spawn(&self, revision: u64, picker: Picker, width: u16) -> u64 {
         let generation = match self.advance_and_cancel_pending() {
             Ok(generation) => generation,
