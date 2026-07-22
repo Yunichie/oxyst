@@ -1,7 +1,7 @@
 use ratatui::{
     Frame,
     layout::{Rect, Size},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     widgets::{Block, BorderType, Borders, Paragraph},
 };
 use ratatui_image::{
@@ -10,12 +10,16 @@ use ratatui_image::{
 };
 use typst_tui_compiler::PagePosition;
 use typst_tui_render::RenderedDocument;
+use typst_tui_theme::Theme;
+
+use crate::style::color;
 
 pub(crate) struct Preview {
     pages: Vec<SlicedProtocol>,
     scroll: usize,
     viewport: Size,
     inner: Rect,
+    zoom: u16,
 }
 
 impl Preview {
@@ -25,6 +29,7 @@ impl Preview {
             scroll: 0,
             viewport: Size::new(40, 20),
             inner: Rect::default(),
+            zoom: 100,
         }
     }
 
@@ -57,8 +62,35 @@ impl Preview {
         self.clamp_scroll();
     }
 
+    pub(crate) fn clear(&mut self) {
+        self.pages.clear();
+        self.scroll = 0;
+    }
+
     pub(crate) fn target_width(&self) -> u16 {
-        self.viewport.width.max(1)
+        let width = u32::from(self.viewport.width.max(1)) * u32::from(self.zoom) / 100;
+        u16::try_from(width).unwrap_or(u16::MAX).max(1)
+    }
+
+    pub(crate) fn zoom(&mut self, direction: isize) -> bool {
+        let delta = if direction < 0 { -25 } else { 25 };
+        let next = self.zoom.saturating_add_signed(delta);
+        let next = next.clamp(50, 200);
+        let changed = next != self.zoom;
+        self.zoom = next;
+        changed
+    }
+
+    pub(crate) fn go_to_page(&mut self, page: usize) -> bool {
+        if page == 0 || page > self.pages.len() {
+            return false;
+        }
+        self.scroll = self.pages[..page - 1]
+            .iter()
+            .map(|page| usize::from(page.size().height) + 1)
+            .sum();
+        self.clamp_scroll();
+        true
     }
 
     pub(crate) fn set_viewport(&mut self, area: Rect) {
@@ -137,26 +169,30 @@ impl Preview {
         self.scroll_lines(pages.saturating_mul(page_height));
     }
 
-    pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect, focused: bool, dimmed: bool) {
+    pub(crate) fn draw(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        focused: bool,
+        dimmed: bool,
+        theme: &Theme,
+    ) {
         self.set_viewport(area);
-        let border_color = if focused {
-            Color::Cyan
-        } else {
-            Color::DarkGray
-        };
+        let border_color = if focused { theme.accent } else { theme.border };
         let title = if self.pages.is_empty() {
             " Preview ".to_owned()
         } else {
             format!(
-                " Preview | Page {} / {} ",
+                " Preview | Page {} / {} | {}% ",
                 self.current_page(),
-                self.pages.len()
+                self.pages.len(),
+                self.zoom
             )
         };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(border_color))
+            .border_style(Style::default().fg(color(border_color)))
             .title(title);
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -187,7 +223,7 @@ impl Preview {
             if divider_y >= 0 && divider_y < i64::from(inner.height) {
                 frame.render_widget(
                     Paragraph::new("-".repeat(usize::from(inner.width)))
-                        .style(Style::default().fg(Color::DarkGray)),
+                        .style(Style::default().fg(color(theme.border))),
                     Rect::new(inner.x, inner.y + divider_y as u16, inner.width, 1),
                 );
             }
@@ -239,8 +275,13 @@ mod tests {
     };
     use ratatui_image::picker::Picker;
     use typst_tui_compiler::{CompileOutcome, Compiler, PagePosition};
+    use typst_tui_theme::{ColorDepth, Theme, ThemeName};
 
     use super::Preview;
+
+    fn theme() -> Theme {
+        Theme::new(ThemeName::Dark, ColorDepth::Ansi16)
+    }
 
     #[test]
     fn draws_empty_preview_state() -> Result<(), Infallible> {
@@ -248,7 +289,7 @@ mod tests {
         let mut terminal = Terminal::new(backend)?;
         let mut preview = Preview::new();
 
-        terminal.draw(|frame| preview.draw(frame, frame.area(), true, false))?;
+        terminal.draw(|frame| preview.draw(frame, frame.area(), true, false, &theme()))?;
 
         let buffer = terminal.backend().buffer();
         let rendered = (0..buffer.area.height)
@@ -276,7 +317,7 @@ mod tests {
 
         let backend = TestBackend::new(32, 14);
         let mut terminal = Terminal::new(backend)?;
-        terminal.draw(|frame| preview.draw(frame, frame.area(), true, false))?;
+        terminal.draw(|frame| preview.draw(frame, frame.area(), true, false, &theme()))?;
 
         let buffer = terminal.backend().buffer();
         let rendered = (0..buffer.area.height)
@@ -300,7 +341,7 @@ mod tests {
             x: 0.5,
             y: 1.0,
         });
-        terminal.draw(|frame| preview.draw(frame, frame.area(), true, true))?;
+        terminal.draw(|frame| preview.draw(frame, frame.area(), true, true, &theme()))?;
         assert!(
             terminal
                 .backend()

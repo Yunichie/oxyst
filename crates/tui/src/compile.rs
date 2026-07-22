@@ -9,7 +9,7 @@ use std::{
 
 use ratatui_image::{picker::Picker, sliced::SlicedProtocol};
 use tokio::runtime::Handle;
-use typst_tui_compiler::{CompileOutcome, Compiler, Diagnostic, DocumentSync};
+use typst_tui_compiler::{CompileOutcome, CompiledDocument, Compiler, Diagnostic, DocumentSync};
 
 use crate::{components::Preview, event::Event};
 
@@ -25,6 +25,7 @@ pub(crate) enum CompileResultKind {
         pages: Vec<SlicedProtocol>,
         diagnostics: Vec<Diagnostic>,
         sync: DocumentSync,
+        document: Box<CompiledDocument>,
     },
     Diagnostics(Vec<Diagnostic>),
     Error(String),
@@ -52,6 +53,29 @@ impl CompileWorker {
     }
 
     pub(crate) fn spawn(&self, revision: u64, source: String, picker: Picker, width: u16) -> u64 {
+        self.spawn_inner(revision, source, picker, width, None)
+    }
+
+    pub(crate) fn spawn_with_world(
+        &self,
+        revision: u64,
+        source: String,
+        picker: Picker,
+        width: u16,
+        root: std::path::PathBuf,
+        main: std::path::PathBuf,
+    ) -> u64 {
+        self.spawn_inner(revision, source, picker, width, Some((root, main)))
+    }
+
+    fn spawn_inner(
+        &self,
+        revision: u64,
+        source: String,
+        picker: Picker,
+        width: u16,
+        world: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    ) -> u64 {
         let compiler = Arc::clone(&self.compiler);
         let sender = self.sender.clone();
         let generations = Arc::clone(&self.generation);
@@ -61,8 +85,15 @@ impl CompileWorker {
                 return;
             }
             let started = Instant::now();
-            let Some(outcome) = compile(compiler, source, &picker, width, &generations, generation)
-            else {
+            let Some(outcome) = compile(
+                compiler,
+                source,
+                &picker,
+                width,
+                world,
+                &generations,
+                generation,
+            ) else {
                 return;
             };
             let result = CompileResult {
@@ -84,9 +115,17 @@ fn compile(
     source: String,
     picker: &Picker,
     width: u16,
+    world: Option<(std::path::PathBuf, std::path::PathBuf)>,
     generations: &AtomicU64,
     generation: u64,
 ) -> Option<CompileResultKind> {
+    let new_compiler = match world {
+        Some((root, main)) => match Compiler::new(root, main) {
+            Ok(compiler) => Some(compiler),
+            Err(error) => return Some(CompileResultKind::Error(error.to_string())),
+        },
+        None => None,
+    };
     if !is_current(generations, generation) {
         return None;
     }
@@ -98,6 +137,9 @@ fn compile(
             ));
         }
     };
+    if let Some(new_compiler) = new_compiler {
+        *compiler = new_compiler;
+    }
     if !is_current(generations, generation) {
         return None;
     }
@@ -134,6 +176,7 @@ fn compile(
         pages,
         diagnostics: compiled.warnings().to_vec(),
         sync,
+        document: Box::new(compiled),
     })
 }
 

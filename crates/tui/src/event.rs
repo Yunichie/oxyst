@@ -6,13 +6,14 @@ use std::{
 
 use crossterm::event::{self, KeyEvent, MouseEvent};
 
-use crate::compile::CompileResult;
+use crate::{compile::CompileResult, export::ExportResult};
 
 pub(crate) enum Event {
     Key(KeyEvent),
     Mouse(MouseEvent),
     Paste(String),
     CompileFinished(CompileResult),
+    ExportFinished(ExportResult),
     Tick,
     Ignored,
 }

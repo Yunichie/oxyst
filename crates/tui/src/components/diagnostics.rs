@@ -3,11 +3,14 @@ use std::collections::BTreeMap;
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph},
 };
 use typst_tui_compiler::{Diagnostic, Severity};
+use typst_tui_theme::Theme;
+
+use crate::style::color;
 
 #[derive(Debug, Default)]
 pub(crate) struct Diagnostics {
@@ -81,7 +84,7 @@ impl Diagnostics {
         self.selected.and_then(|index| self.items.get(index))
     }
 
-    pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect) {
+    pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let title = format!(
             " Diagnostics | {} errors, {} warnings ",
             self.errors(),
@@ -90,7 +93,7 @@ impl Diagnostics {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(color(theme.accent)))
             .title(title);
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -109,19 +112,19 @@ impl Diagnostics {
             .enumerate()
             .map(|(offset, diagnostic)| {
                 let severity_color = match diagnostic.severity {
-                    Severity::Error => Color::Red,
-                    Severity::Warning => Color::Yellow,
+                    Severity::Error => theme.error,
+                    Severity::Warning => theme.warning,
                 };
                 let severity = match diagnostic.severity {
                     Severity::Error => "E ",
                     Severity::Warning => "W ",
                 };
                 let line = Line::from(vec![
-                    Span::styled(severity, Style::default().fg(severity_color)),
+                    Span::styled(severity, Style::default().fg(color(severity_color))),
                     Span::raw(format_diagnostic(diagnostic)),
                 ]);
                 if self.selected == Some(self.scroll + offset) {
-                    line.style(Style::default().bg(Color::DarkGray))
+                    line.style(Style::default().bg(color(theme.selection)))
                 } else {
                     line
                 }
@@ -158,6 +161,7 @@ mod tests {
 
     use ratatui::{Terminal, backend::TestBackend};
     use typst_tui_compiler::{Diagnostic, Severity};
+    use typst_tui_theme::{ColorDepth, Theme, ThemeName};
 
     use super::Diagnostics;
 
@@ -193,7 +197,8 @@ mod tests {
 
         let backend = TestBackend::new(50, 6);
         let mut terminal = Terminal::new(backend)?;
-        terminal.draw(|frame| diagnostics.draw(frame, frame.area()))?;
+        let theme = Theme::new(ThemeName::Dark, ColorDepth::Ansi16);
+        terminal.draw(|frame| diagnostics.draw(frame, frame.area(), &theme))?;
 
         let rendered = terminal
             .backend()

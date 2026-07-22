@@ -3,15 +3,19 @@ use std::{cmp, ops::Range};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph},
 };
-use typst_syntax::{LinkedNode, Source, Tag, highlight};
+use typst_syntax::{LinkedNode, Source, highlight};
 use typst_tui_compiler::Severity;
 use typst_tui_document::Document;
+use typst_tui_theme::{TextStyle, Theme};
 
-use crate::action::Action;
+use crate::{
+    action::Action,
+    style::{color, text_style},
+};
 
 use super::Diagnostics;
 
@@ -21,18 +25,25 @@ pub(crate) struct Editor {
     horizontal_scroll: usize,
     source: Source,
     highlighted_lines: Vec<Line<'static>>,
+    theme: Theme,
 }
 
 impl Editor {
-    pub(crate) fn new(text: &str) -> Self {
+    pub(crate) fn new(text: &str, theme: Theme) -> Self {
         let source = Source::detached(text);
-        let highlighted_lines = highlighted_lines(&source);
+        let highlighted_lines = highlighted_lines(&source, theme);
         Self {
             vertical_scroll: 0,
             horizontal_scroll: 0,
             source,
             highlighted_lines,
+            theme,
         }
+    }
+
+    pub(crate) fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+        self.highlighted_lines = highlighted_lines(&self.source, theme);
     }
 
     pub(crate) fn update(&mut self, action: &Action, document: &mut Document) {
@@ -45,19 +56,7 @@ impl Editor {
             Action::Move(motion) => document.move_cursor(*motion),
             Action::Undo => document.undo(),
             Action::Redo => document.redo(),
-            Action::Recompile
-            | Action::CompileFinished(_)
-            | Action::Tick
-            | Action::SwitchFocus
-            | Action::ToggleDiagnostics
-            | Action::NavigateDiagnostic(_)
-            | Action::Click { .. }
-            | Action::ScrollAt { .. }
-            | Action::ScrollPreviewPages(_)
-            | Action::Save
-            | Action::RequestQuit
-            | Action::Quit
-            | Action::CancelQuit => {}
+            _ => {}
         }
 
         if document.revision() != revision {
@@ -66,7 +65,7 @@ impl Editor {
             } else {
                 self.source.replace(&document.text());
             }
-            self.highlighted_lines = highlighted_lines(&self.source);
+            self.highlighted_lines = highlighted_lines(&self.source, self.theme);
         }
     }
 
@@ -79,14 +78,14 @@ impl Editor {
         focused: bool,
     ) {
         let border_color = if focused {
-            Color::Cyan
+            self.theme.accent
         } else {
-            Color::DarkGray
+            self.theme.border
         };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(border_color))
+            .border_style(Style::default().fg(color(border_color)))
             .title(" Editor ");
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -109,16 +108,16 @@ impl Editor {
         let end_line = (self.vertical_scroll + visible_lines).min(document.line_count());
         let gutter = (self.vertical_scroll..end_line)
             .map(|line| {
-                let (marker, color) = match diagnostics.severity_at(line) {
-                    Some(Severity::Error) => ("E", Color::Red),
-                    Some(Severity::Warning) => ("W", Color::Yellow),
-                    None => (" ", Color::Reset),
+                let (marker, marker_color) = match diagnostics.severity_at(line) {
+                    Some(Severity::Error) => ("E", self.theme.error),
+                    Some(Severity::Warning) => ("W", self.theme.warning),
+                    None => (" ", typst_tui_theme::Color::Reset),
                 };
                 Line::from(vec![
-                    Span::styled(marker, Style::default().fg(color)),
+                    Span::styled(marker, Style::default().fg(color(marker_color))),
                     Span::styled(
                         format!("{:>width$} ", line + 1, width = usize::from(number_width)),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(color(self.theme.muted)),
                     ),
                 ])
             })
@@ -126,7 +125,7 @@ impl Editor {
         let text = (self.vertical_scroll..end_line)
             .map(|line| {
                 let style = if line == cursor.line {
-                    Style::default().bg(Color::DarkGray)
+                    Style::default().bg(color(self.theme.current_line))
                 } else {
                     Style::default()
                 };
@@ -174,21 +173,28 @@ impl Editor {
 
 impl Default for Editor {
     fn default() -> Self {
-        Self::new("")
+        Self::new(
+            "",
+            Theme::new(
+                typst_tui_theme::ThemeName::Dark,
+                typst_tui_theme::ColorDepth::Ansi16,
+            ),
+        )
     }
 }
 
 #[derive(Debug)]
 struct StyledRange {
     range: Range<usize>,
-    style: Style,
+    style: TextStyle,
 }
 
-fn highlighted_lines(source: &Source) -> Vec<Line<'static>> {
+fn highlighted_lines(source: &Source, theme: Theme) -> Vec<Line<'static>> {
     let mut ranges = Vec::new();
     collect_ranges(
         &LinkedNode::new(source.root()),
-        Style::default(),
+        TextStyle::default(),
+        theme,
         &mut ranges,
     );
 
@@ -199,8 +205,13 @@ fn highlighted_lines(source: &Source) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn collect_ranges(node: &LinkedNode<'_>, inherited: Style, ranges: &mut Vec<StyledRange>) {
-    let style = highlight(node).map_or(inherited, |tag| inherited.patch(style_for(tag)));
+fn collect_ranges(
+    node: &LinkedNode<'_>,
+    inherited: TextStyle,
+    theme: Theme,
+    ranges: &mut Vec<StyledRange>,
+) {
+    let style = highlight(node).map_or(inherited, |tag| inherited.patch(theme.syntax(tag)));
     if !node.leaf_text().is_empty() {
         ranges.push(StyledRange {
             range: node.range(),
@@ -210,7 +221,7 @@ fn collect_ranges(node: &LinkedNode<'_>, inherited: Style, ranges: &mut Vec<Styl
     }
 
     for child in node.children() {
-        collect_ranges(&child, style, ranges);
+        collect_ranges(&child, style, theme, ranges);
     }
 }
 
@@ -244,7 +255,10 @@ fn highlighted_line(
             spans.push(Span::raw(text[cursor..start].to_owned()));
         }
         if start < end {
-            spans.push(Span::styled(text[start..end].to_owned(), range.style));
+            spans.push(Span::styled(
+                text[start..end].to_owned(),
+                text_style(range.style),
+            ));
             cursor = end;
         }
     }
@@ -253,38 +267,6 @@ fn highlighted_line(
     }
 
     Line::from(spans)
-}
-
-fn style_for(tag: Tag) -> Style {
-    match tag {
-        Tag::Comment => Style::default()
-            .fg(Color::Gray)
-            .add_modifier(Modifier::ITALIC),
-        Tag::Punctuation => Style::default().fg(Color::Gray),
-        Tag::Escape | Tag::MathDelimiter | Tag::MathOperator | Tag::MathGroupingParens => {
-            Style::default().fg(Color::LightMagenta)
-        }
-        Tag::Strong => Style::default().add_modifier(Modifier::BOLD),
-        Tag::Emph => Style::default().add_modifier(Modifier::ITALIC),
-        Tag::Link => Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::UNDERLINED),
-        Tag::Raw | Tag::String => Style::default().fg(Color::Green),
-        Tag::Label | Tag::Ref => Style::default().fg(Color::LightCyan),
-        Tag::Heading | Tag::ListMarker | Tag::ListTerm => Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-        Tag::Keyword => Style::default()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::BOLD),
-        Tag::Operator => Style::default().fg(Color::LightMagenta),
-        Tag::Number => Style::default().fg(Color::LightBlue),
-        Tag::Function => Style::default().fg(Color::LightBlue),
-        Tag::Interpolated => Style::default().fg(Color::Cyan),
-        Tag::Error => Style::default()
-            .fg(Color::Red)
-            .add_modifier(Modifier::UNDERLINED),
-    }
 }
 
 fn scroll_as_u16(value: usize) -> u16 {
@@ -298,16 +280,21 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend, style::Color};
     use typst_tui_compiler::{Diagnostic, Severity};
     use typst_tui_document::{Document, Motion};
+    use typst_tui_theme::{ColorDepth, Theme, ThemeName};
 
     use super::{Diagnostics, Editor};
     use crate::action::Action;
+
+    fn theme() -> Theme {
+        Theme::new(ThemeName::Dark, ColorDepth::Ansi16)
+    }
 
     #[test]
     fn draws_line_numbers_and_buffer_text() -> Result<(), Infallible> {
         let backend = TestBackend::new(30, 6);
         let mut terminal = Terminal::new(backend)?;
         let document = Document::new("first\nsecond");
-        let mut editor = Editor::new("first\nsecond");
+        let mut editor = Editor::new("first\nsecond", theme());
         let diagnostics = Diagnostics::default();
 
         terminal.draw(|frame| {
@@ -333,7 +320,7 @@ mod tests {
     fn applies_typst_syntax_styles() -> Result<(), Infallible> {
         let source = "= Heading\n#let answer = 42";
         let document = Document::new(source);
-        let mut editor = Editor::new(source);
+        let mut editor = Editor::new(source, theme());
         let diagnostics = Diagnostics::default();
         let backend = TestBackend::new(40, 6);
         let mut terminal = Terminal::new(backend)?;
@@ -344,12 +331,7 @@ mod tests {
 
         let buffer = terminal.backend().buffer();
         assert!(buffer.content().iter().any(|cell| cell.fg == Color::Yellow));
-        assert!(
-            buffer
-                .content()
-                .iter()
-                .any(|cell| cell.fg == Color::LightBlue)
-        );
+        assert!(buffer.content().iter().any(|cell| cell.fg == Color::Blue));
 
         Ok(())
     }
@@ -359,7 +341,7 @@ mod tests {
         let source = "#let value = 1";
         let mut document = Document::new(source);
         document.move_cursor(Motion::DocumentEnd);
-        let mut editor = Editor::new(source);
+        let mut editor = Editor::new(source, theme());
 
         editor.update(&Action::Insert('0'), &mut document);
         assert_eq!(editor.source.text(), "#let value = 10");
@@ -371,7 +353,7 @@ mod tests {
     #[test]
     fn draws_main_source_diagnostic_markers() -> Result<(), Infallible> {
         let document = Document::new("first\nsecond");
-        let mut editor = Editor::new("first\nsecond");
+        let mut editor = Editor::new("first\nsecond", theme());
         let mut diagnostics = Diagnostics::default();
         diagnostics.set_items(vec![Diagnostic {
             severity: Severity::Error,

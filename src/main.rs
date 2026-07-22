@@ -13,13 +13,23 @@ struct Cli {
     /// Project root used to resolve imports and assets
     #[arg(long)]
     root: Option<PathBuf>,
+    /// Color theme: dark or light
+    #[arg(long)]
+    theme: Option<String>,
+    /// Load configuration from this TOML file
+    #[arg(long)]
+    config: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let text = load(&cli.file)?;
     let root = project_root(cli.root, cli.file.as_deref())?;
-    typst_tui_app::run(cli.file, root, &text)?;
+    let mut config = typst_tui_config::Config::load(cli.config.as_deref())?;
+    if let Some(theme) = cli.theme {
+        config.set_theme(theme);
+    }
+    typst_tui_app::run(cli.file, root, &text, config)?;
     Ok(())
 }
 

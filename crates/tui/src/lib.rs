@@ -5,7 +5,9 @@ mod app;
 mod compile;
 mod components;
 mod event;
+mod export;
 mod input;
+mod style;
 
 use std::{io, path::PathBuf, time::Duration};
 
@@ -21,9 +23,16 @@ pub enum Error {
     Compiler(#[from] typst_tui_compiler::Error),
     #[error("terminal I/O failed")]
     Terminal(#[from] std::io::Error),
+    #[error("invalid application configuration: {0}")]
+    Configuration(String),
 }
 
-pub fn run(path: Option<PathBuf>, root: PathBuf, text: &str) -> Result<(), Error> {
+pub fn run(
+    path: Option<PathBuf>,
+    root: PathBuf,
+    text: &str,
+    config: typst_tui_config::Config,
+) -> Result<(), Error> {
     let main = path.clone().unwrap_or_else(|| root.join("untitled.typ"));
     let compiler = typst_tui_compiler::Compiler::new(&root, main)?;
     let runtime = tokio::runtime::Builder::new_multi_thread().build()?;
@@ -37,7 +46,23 @@ pub fn run(path: Option<PathBuf>, root: PathBuf, text: &str) -> Result<(), Error
         runtime.shutdown_timeout(Duration::from_millis(100));
         return Err(Error::Terminal(error));
     }
-    let mut app = app::App::new(path, text, compiler, picker, runtime.handle().clone());
+    let mut app = match app::App::new(
+        path,
+        root,
+        text,
+        compiler,
+        picker,
+        runtime.handle().clone(),
+        config,
+    ) {
+        Ok(app) => app,
+        Err(error) => {
+            let _ = execute!(io::stdout(), DisableMouseCapture);
+            let _ = ratatui::try_restore();
+            runtime.shutdown_timeout(Duration::from_millis(100));
+            return Err(Error::Configuration(error));
+        }
+    };
     let run_result = app.run(&mut terminal);
     let mouse_result = execute!(io::stdout(), DisableMouseCapture);
     let restore_result = ratatui::try_restore();
