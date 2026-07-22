@@ -13,6 +13,7 @@ pub struct Diagnostic {
     pub path: Option<String>,
     pub line: Option<usize>,
     pub column: Option<usize>,
+    pub is_main: bool,
 }
 
 pub(crate) fn convert_diagnostics(
@@ -47,5 +48,6 @@ fn convert_diagnostic(world: &dyn World, diagnostic: SourceDiagnostic) -> Diagno
         path,
         line: position.map(|(line, _)| line),
         column: position.map(|(_, column)| column),
+        is_main: id == Some(world.main()),
     }
 }
