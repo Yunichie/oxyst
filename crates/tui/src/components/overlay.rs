@@ -10,7 +10,8 @@ use typst_tui_render::ExportFormat;
 use typst_tui_theme::Theme;
 
 use super::{
-    Command, CommandPalette, Component, Help, Prompt, PromptKind, Search, SearchMode, modal_area,
+    Command, CommandPalette, Component, Help, Prompt, PromptKind, RecentPicker, Search, SearchMode,
+    modal_area,
 };
 use crate::{
     action::Action,
@@ -40,6 +41,7 @@ enum Overlay {
     Prompt(Prompt),
     Search(Search),
     Help(Help),
+    Recent(RecentPicker),
     Confirm(Confirmation),
 }
 
@@ -47,6 +49,7 @@ pub(crate) enum OverlaySubmission {
     Command(Command),
     Prompt(Prompt),
     Confirm(ConfirmIntent),
+    Recent(PathBuf),
 }
 
 pub(crate) struct OverlayHost {
@@ -70,6 +73,7 @@ impl OverlayHost {
             Overlay::Palette(_) | Overlay::Prompt(_) => Some(InputMode::Overlay),
             Overlay::Search(_) => Some(InputMode::Search),
             Overlay::Help(_) => Some(InputMode::Help),
+            Overlay::Recent(_) => Some(InputMode::Overlay),
             Overlay::Confirm(_) => Some(InputMode::Confirmation),
         }
     }
@@ -96,6 +100,10 @@ impl OverlayHost {
 
     pub(crate) fn open_search(&mut self, mode: SearchMode, query: impl Into<String>) {
         self.current = Overlay::Search(Search::new(mode, query));
+    }
+
+    pub(crate) fn open_recent(&mut self, entries: Vec<PathBuf>) {
+        self.current = Overlay::Recent(RecentPicker::new(entries, self.theme));
     }
 
     pub(crate) fn confirm(&mut self, message: String, intent: ConfirmIntent) {
@@ -133,6 +141,7 @@ impl OverlayHost {
             Overlay::Palette(palette) => palette.selected().map(OverlaySubmission::Command),
             Overlay::Prompt(prompt) => Some(OverlaySubmission::Prompt(prompt)),
             Overlay::Confirm(confirmation) => Some(OverlaySubmission::Confirm(confirmation.intent)),
+            Overlay::Recent(recent) => recent.selected().map(OverlaySubmission::Recent),
             Overlay::Search(_) | Overlay::Help(_) | Overlay::None => None,
         }
     }
@@ -184,6 +193,7 @@ impl Component for OverlayHost {
             }
             (Overlay::Search(search), Action::OverlayBackspace) => search.backspace(),
             (Overlay::Help(help), Action::OverlayMove(direction)) => help.scroll(direction),
+            (Overlay::Recent(recent), action) => recent.update(action),
             _ => {}
         }
     }
@@ -195,6 +205,7 @@ impl Component for OverlayHost {
             Overlay::Prompt(prompt) => prompt.draw(frame, &self.theme),
             Overlay::Search(search) => search.draw(frame, &self.theme),
             Overlay::Help(help) => help.draw(frame, frame.area(), &self.keymap, &self.theme),
+            Overlay::Recent(recent) => recent.draw(frame, frame.area(), true),
             Overlay::Confirm(confirmation) => {
                 let area = modal_area(frame.area(), 72, 5);
                 frame.render_widget(Clear, area);
@@ -218,5 +229,45 @@ impl Component for OverlayHost {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use typst_tui_config::Config;
+    use typst_tui_theme::{ColorDepth, Theme, ThemeName};
+
+    use super::{Component, Event, Keymap, OverlayHost, OverlaySubmission};
+    use crate::action::Action;
+
+    #[test]
+    fn routes_recent_picker_input_to_a_submission() -> Result<(), String> {
+        let theme = Theme::new(ThemeName::Dark, ColorDepth::Ansi16);
+        let mut overlay = OverlayHost::new(Keymap::new(&Config::default())?, theme);
+        let second = PathBuf::from("second.typ");
+        overlay.open_recent(vec![PathBuf::from("first.typ"), second.clone()]);
+
+        let move_action = overlay
+            .handle_event(&Event::Key(KeyEvent::new(
+                KeyCode::Down,
+                KeyModifiers::NONE,
+            )))
+            .ok_or_else(|| "recent picker did not handle Down".to_owned())?;
+        overlay.update(move_action);
+        let submit_action = overlay
+            .handle_event(&Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .ok_or_else(|| "recent picker did not handle Enter".to_owned())?;
+        assert!(matches!(submit_action, Action::OverlaySubmit));
+        assert!(matches!(
+            overlay.submit(),
+            Some(OverlaySubmission::Recent(path)) if path == second
+        ));
+        Ok(())
     }
 }

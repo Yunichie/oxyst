@@ -30,6 +30,7 @@ use crate::{
     event::{self, Event},
     export::{ExportResult, ExportWorker},
     input::{self, InputMode, Keymap},
+    recent::RecentFiles,
     style::{base, color},
     watcher::ProjectWatcher,
     workspace::Workspace,
@@ -109,6 +110,7 @@ pub(crate) struct App {
     quit_confirmation: bool,
     should_quit: bool,
     status: Option<String>,
+    recent: RecentFiles,
 }
 
 pub(crate) struct AppInit<'a> {
@@ -119,6 +121,8 @@ pub(crate) struct AppInit<'a> {
     pub(crate) picker: Picker,
     pub(crate) runtime: Handle,
     pub(crate) config: Config,
+    pub(crate) recent: RecentFiles,
+    pub(crate) startup_status: Option<String>,
 }
 
 impl App {
@@ -131,6 +135,8 @@ impl App {
             picker,
             runtime,
             config,
+            recent,
+            startup_status,
         } = init;
         let color_depth = ColorDepth::detect();
         let theme = Theme::named(&config.theme, color_depth).map_err(|error| error.to_string())?;
@@ -142,7 +148,11 @@ impl App {
             keymap.display("confirm"),
             keymap.display("cancel_confirmation"),
         );
-        let welcome = path.is_none().then(|| Welcome::new(theme));
+        let welcome = path.is_none().then(|| {
+            let mut welcome = Welcome::new(theme);
+            welcome.set_recent_count(recent.entries().len());
+            welcome
+        });
         let (sender, internal_events) = channel();
         let watcher = ProjectWatcher::new(&root, path.as_deref(), sender.clone())?;
 
@@ -180,7 +190,8 @@ impl App {
             overlay,
             quit_confirmation: false,
             should_quit: false,
-            status: None,
+            status: startup_status,
+            recent,
         })
     }
 
@@ -335,7 +346,11 @@ impl App {
                 WelcomeChoice::NewDocument => self.start_new_document(),
                 WelcomeChoice::OpenFile => self.open_file_prompt(),
                 WelcomeChoice::OpenRecent => {
-                    self.status = Some("Recent files are not available yet".to_owned());
+                    if self.recent.entries().is_empty() {
+                        self.status = Some("No recent files".to_owned());
+                    } else {
+                        self.overlay.open_recent(self.recent.entries().to_vec());
+                    }
                 }
             }
             return;
@@ -345,6 +360,7 @@ impl App {
             Some(OverlaySubmission::Command(command)) => self.execute_command(command),
             Some(OverlaySubmission::Prompt(prompt)) => self.submit_prompt(prompt),
             Some(OverlaySubmission::Confirm(intent)) => self.confirm(intent),
+            Some(OverlaySubmission::Recent(path)) => self.request_open(path),
             None => {}
         }
     }
@@ -450,13 +466,16 @@ impl App {
         self.diagnostics = Diagnostics::new(self.theme);
         self.document_sync = None;
         self.compiled_document = None;
-        self.workspace.opened(path, root.clone());
+        self.workspace.opened(path.clone(), root.clone());
         self.explorer.set_root(root);
         self.welcome = None;
         self.focus = Pane::Editor;
         self.fullscreen = false;
         self.status = None;
         self.start_compile_with_world();
+        if opened.existed {
+            self.record_recent(&path);
+        }
         if let Some(error) = watch_error {
             self.status = Some(format!("File watch failed: {error}"));
         }
@@ -477,7 +496,9 @@ impl App {
             self.overlay.open_prompt(PromptKind::SaveAs, "");
             return;
         };
-        self.write_document(&path);
+        if self.write_document(&path) {
+            self.record_recent(&path);
+        }
     }
 
     fn save_as(&mut self, path: PathBuf) {
@@ -491,6 +512,7 @@ impl App {
             .err();
         self.explorer.set_root(self.workspace.root().to_owned());
         self.start_compile_with_world();
+        self.record_recent(&path);
         if let Some(error) = watch_error {
             self.status = Some(format!("File watch failed: {error}"));
         }
@@ -507,6 +529,12 @@ impl App {
                 self.status = Some(error);
                 false
             }
+        }
+    }
+
+    fn record_recent(&mut self, path: &Path) {
+        if let Err(error) = self.recent.record(path) {
+            self.status = Some(error);
         }
     }
 
@@ -1154,6 +1182,8 @@ mod tests {
             picker: Picker::halfblocks(),
             runtime: runtime.handle().clone(),
             config: Config::default(),
+            recent: crate::recent::RecentFiles::disabled(),
+            startup_status: None,
         })
         .map_err(std::io::Error::other)?;
 
@@ -1199,6 +1229,8 @@ mod tests {
             picker: Picker::halfblocks(),
             runtime: runtime.handle().clone(),
             config,
+            recent: crate::recent::RecentFiles::disabled(),
+            startup_status: None,
         })
         .map_err(std::io::Error::other)?;
         crate::components::Component::update(&mut app.editor, crate::action::Action::Insert('x'));

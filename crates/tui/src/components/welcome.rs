@@ -24,6 +24,7 @@ pub(crate) enum WelcomeChoice {
 #[derive(Debug)]
 pub(crate) struct Welcome {
     selected: usize,
+    recent_count: usize,
     theme: Theme,
 }
 
@@ -31,15 +32,23 @@ impl Welcome {
     const CHOICES: &[(WelcomeChoice, &str)] = &[
         (WelcomeChoice::NewDocument, "New document"),
         (WelcomeChoice::OpenFile, "Open file"),
-        (WelcomeChoice::OpenRecent, "Open recent (none)"),
+        (WelcomeChoice::OpenRecent, "Open recent"),
     ];
 
     pub(crate) fn new(theme: Theme) -> Self {
-        Self { selected: 0, theme }
+        Self {
+            selected: 0,
+            recent_count: 0,
+            theme,
+        }
     }
 
     pub(crate) fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
+    }
+
+    pub(crate) fn set_recent_count(&mut self, count: usize) {
+        self.recent_count = count;
     }
 
     pub(crate) fn move_selection(&mut self, direction: isize) {
@@ -65,10 +74,15 @@ impl Welcome {
         ];
         lines.extend(Self::CHOICES.iter().enumerate().map(|(index, (_, label))| {
             let marker = if index == self.selected { ">" } else { " " };
+            let label = if index == 2 {
+                format!("{label} ({})", self.recent_count)
+            } else {
+                (*label).to_owned()
+            };
             let line = Line::from(vec![Span::raw(format!("{marker} {label}"))]);
             if index == self.selected {
                 line.style(Style::default().bg(color(self.theme.selection)))
-            } else if index == 2 {
+            } else if index == 2 && self.recent_count == 0 {
                 line.style(Style::default().fg(color(self.theme.muted)))
             } else {
                 line
@@ -111,5 +125,36 @@ impl Component for Welcome {
 
     fn draw(&mut self, frame: &mut Frame, area: Rect, _focused: bool) {
         self.draw_welcome(frame, area);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::convert::Infallible;
+
+    use ratatui::{Terminal, backend::TestBackend};
+    use typst_tui_theme::{ColorDepth, Theme, ThemeName};
+
+    use super::{Action, Component, Welcome, WelcomeChoice};
+
+    #[test]
+    fn draws_and_selects_available_recent_files() -> Result<(), Infallible> {
+        let theme = Theme::new(ThemeName::Dark, ColorDepth::Ansi16);
+        let mut welcome = Welcome::new(theme);
+        welcome.set_recent_count(2);
+        welcome.update(Action::OverlayMove(2));
+        assert_eq!(welcome.selected(), WelcomeChoice::OpenRecent);
+
+        let mut terminal = Terminal::new(TestBackend::new(50, 12))?;
+        terminal.draw(|frame| welcome.draw(frame, frame.area(), true))?;
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Open recent (2)"));
+        Ok(())
     }
 }

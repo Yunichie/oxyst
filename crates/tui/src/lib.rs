@@ -8,6 +8,7 @@ mod components;
 mod event;
 mod export;
 mod input;
+mod recent;
 mod style;
 mod watcher;
 mod workspace;
@@ -44,6 +45,12 @@ pub fn run(
         Ok(picker) => picker,
         Err(_) => ratatui_image::picker::Picker::halfblocks(),
     };
+    let (mut recent, mut startup_status) = recent::RecentFiles::load_default();
+    if let Some(path) = path.as_deref().filter(|path| path.is_file())
+        && let Err(error) = recent.record(path)
+    {
+        startup_status = Some(error);
+    }
     if let Err(error) = execute!(io::stdout(), EnableMouseCapture) {
         let _ = ratatui::try_restore();
         runtime.shutdown_timeout(Duration::from_millis(100));
@@ -57,6 +64,8 @@ pub fn run(
         picker,
         runtime: runtime.handle().clone(),
         config,
+        recent,
+        startup_status,
     }) {
         Ok(app) => app,
         Err(error) => {

@@ -8,6 +8,7 @@ use typst_tui_render::ExportFormat;
 
 pub(crate) struct OpenedSource {
     pub(crate) text: String,
+    pub(crate) existed: bool,
 }
 
 pub(crate) struct Workspace {
@@ -59,9 +60,13 @@ impl Workspace {
 
     pub(crate) fn read_source(path: &Path) -> Result<OpenedSource, String> {
         match fs::read_to_string(path) {
-            Ok(text) => Ok(OpenedSource { text }),
+            Ok(text) => Ok(OpenedSource {
+                text,
+                existed: true,
+            }),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(OpenedSource {
                 text: String::new(),
+                existed: false,
             }),
             Err(error) => Err(format!("Open failed: {error}")),
         }
