@@ -96,7 +96,7 @@ fn png(document: &CompiledDocument) -> Result<Vec<u8>, Error> {
     let mut y = 0_u32;
     for page in pages {
         let x = (width - page.image.width()) / 2;
-        imageops::replace(&mut image, &page.image, i64::from(x), i64::from(y));
+        imageops::replace(&mut image, page.image.as_ref(), i64::from(x), i64::from(y));
         y = y
             .saturating_add(page.image.height())
             .saturating_add(PAGE_GAP);
