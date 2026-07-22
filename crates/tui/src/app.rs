@@ -246,6 +246,8 @@ impl App {
             }
             Action::OpenFind => self.open_search(SearchMode::Find),
             Action::OpenReplace => self.open_search(SearchMode::Replace),
+            Action::NewDocument => self.start_new_document(),
+            Action::OpenFile => self.open_file_prompt(),
             Action::SearchNext(reverse) => self.search_next(reverse),
             Action::SearchToggleField => {
                 if let Overlay::Search(search) = &mut self.overlay {
@@ -261,7 +263,10 @@ impl App {
             Action::CompileFinished(result) => self.finish_compile(result),
             Action::ExportFinished(result) => self.finish_export(result),
             Action::Resize => {}
-            Action::ProjectFilesChanged => self.schedule_compile(true, true),
+            Action::ProjectFilesChanged => {
+                self.explorer.mark_dirty();
+                self.schedule_compile(true, true);
+            }
             Action::FileWatchFailed(error) => {
                 self.status = Some(format!("File watch failed: {error}"));
             }
@@ -312,11 +317,8 @@ impl App {
         if let Some(welcome) = &mut self.welcome
             && matches!(self.overlay, Overlay::None)
         {
-            match action {
-                Action::OverlayMove(direction) => welcome.move_selection(direction),
-                Action::OverlayInput('n' | 'N') => self.start_new_document(),
-                Action::OverlayInput('o' | 'O') => self.open_file_prompt(),
-                _ => {}
+            if let Action::OverlayMove(direction) = action {
+                welcome.move_selection(direction);
             }
             return;
         }
@@ -379,6 +381,7 @@ impl App {
         if query_changed {
             if let Some(origin) = query_origin {
                 let _ = self.document.set_cursor_byte_index(origin);
+                self.editor.reset_preferred_visual_column();
             }
             self.search_next(false);
         }
@@ -486,7 +489,7 @@ impl App {
             ConfirmIntent::Export(_, path) => path,
         };
         self.overlay = Overlay::Confirm(Confirmation {
-            message: format!("Overwrite {}? Y/N", path.display()),
+            message: format!("Overwrite {}?", path.display()),
             intent,
         });
     }
@@ -494,7 +497,7 @@ impl App {
     fn request_open(&mut self, path: PathBuf) {
         if self.document.is_dirty() {
             self.overlay = Overlay::Confirm(Confirmation {
-                message: "Discard unsaved changes and open file? Y/N".to_owned(),
+                message: "Discard unsaved changes and open file?".to_owned(),
                 intent: ConfirmIntent::Open(path),
             });
         } else {
@@ -646,6 +649,7 @@ impl App {
         if let Some(line) = line
             && self.document.set_cursor_line_char(line - 1, 0)
         {
+            self.editor.reset_preferred_visual_column();
             self.focus = Pane::Editor;
             self.status = None;
             return;
@@ -735,6 +739,7 @@ impl App {
             return;
         };
         if self.document.select_byte_range(range) {
+            self.editor.reset_preferred_visual_column();
             self.cursor_sync_deadline = Some(Instant::now() + CURSOR_SYNC_DELAY);
             self.status = None;
         }
@@ -993,6 +998,7 @@ impl App {
                 .document
                 .set_cursor_line_char(line, diagnostic.column.unwrap_or(0))
         {
+            self.editor.reset_preferred_visual_column();
             self.focus = Pane::Editor;
             self.cursor_sync_deadline = Some(Instant::now() + CURSOR_SYNC_DELAY);
         }
@@ -1014,6 +1020,7 @@ impl App {
             return;
         };
         if self.document.set_cursor_byte_index(byte) {
+            self.editor.reset_preferred_visual_column();
             self.focus = Pane::Editor;
             self.cursor_sync_deadline = None;
             self.status = None;
@@ -1190,7 +1197,11 @@ impl App {
         );
         let (status, foreground) = if self.quit_confirmation {
             (
-                "Unsaved changes. Press Y to quit, N or Esc to cancel".to_owned(),
+                format!(
+                    "Unsaved changes. {} quit, {} cancel",
+                    self.keymap.display("confirm"),
+                    self.keymap.display("cancel_confirmation")
+                ),
                 self.theme.warning,
             )
         } else if let Some(status) = &self.status {
@@ -1251,16 +1262,21 @@ impl App {
                 let area = modal_area(frame.area(), 72, 5);
                 frame.render_widget(Clear, area);
                 frame.render_widget(
-                    Paragraph::new(confirmation.message.as_str())
-                        .centered()
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .border_type(BorderType::Rounded)
-                                .border_style(Style::default().fg(color(self.theme.warning)))
-                                .style(base(&self.theme))
-                                .title(" Confirm "),
-                        ),
+                    Paragraph::new(format!(
+                        "{}\n{} confirm | {} cancel",
+                        confirmation.message,
+                        self.keymap.display("confirm"),
+                        self.keymap.display("cancel_confirmation")
+                    ))
+                    .centered()
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(color(self.theme.warning)))
+                            .style(base(&self.theme))
+                            .title(" Confirm "),
+                    ),
                     area,
                 );
             }
@@ -1370,6 +1386,13 @@ mod tests {
         let main = root.join("simple.typ");
         let compiler = Compiler::new(&root, &main)?;
         let runtime = tokio::runtime::Builder::new_multi_thread().build()?;
+        let mut config = Config::default();
+        config
+            .keys
+            .insert("confirm".to_owned(), vec!["alt+y".to_owned()]);
+        config
+            .keys
+            .insert("cancel_confirmation".to_owned(), vec!["alt+n".to_owned()]);
         let mut app = App::new(
             Some(main),
             root,
@@ -1377,7 +1400,7 @@ mod tests {
             compiler,
             Picker::halfblocks(),
             runtime.handle().clone(),
-            Config::default(),
+            config,
         )
         .map_err(std::io::Error::other)?;
         app.document.insert_char('x');
@@ -1394,6 +1417,18 @@ mod tests {
         assert!(rendered.contains("●"));
         assert!(rendered.contains("✓ up to date"));
         assert!(rendered.contains("2 words"));
+
+        app.quit_confirmation = true;
+        terminal.draw(|frame| app.draw(frame))?;
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("alt+y quit"));
+        assert!(rendered.contains("alt+n cancel"));
 
         drop(app);
         runtime.shutdown_timeout(Duration::from_millis(100));
