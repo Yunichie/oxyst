@@ -7,8 +7,9 @@ pub(crate) fn resolve(event: Event, confirming_quit: bool) -> Option<Action> {
     match event {
         Event::Paste(text) if !confirming_quit => Some(Action::InsertText(text)),
         Event::CompileFinished(result) => Some(Action::CompileFinished(result)),
+        Event::Tick => Some(Action::Tick),
         Event::Key(key) if is_press(key) => resolve_key(key, confirming_quit),
-        Event::Paste(_) | Event::Key(_) | Event::Tick | Event::Ignored => None,
+        Event::Paste(_) | Event::Key(_) | Event::Ignored => None,
     }
 }
 

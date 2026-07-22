@@ -2,7 +2,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::mpsc::{Receiver, channel},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use ratatui::{
@@ -26,6 +26,7 @@ use crate::{
 };
 
 const NARROW_WIDTH: u16 = 80;
+const AUTO_COMPILE_DELAY: Duration = Duration::from_millis(150);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompileState {
@@ -35,6 +36,31 @@ enum CompileState {
     Stale,
     Failed(usize),
     Error,
+}
+
+#[derive(Default)]
+struct CompileDebounce {
+    deadline: Option<Instant>,
+}
+
+impl CompileDebounce {
+    fn schedule(&mut self, now: Instant) {
+        self.deadline = Some(now + AUTO_COMPILE_DELAY);
+    }
+
+    fn cancel(&mut self) {
+        self.deadline = None;
+    }
+
+    fn take_due(&mut self, now: Instant) -> bool {
+        match self.deadline {
+            Some(deadline) if now >= deadline => {
+                self.deadline = None;
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 pub(crate) struct App {
@@ -47,6 +73,8 @@ pub(crate) struct App {
     picker: Picker,
     compile_worker: CompileWorker,
     internal_events: Receiver<Event>,
+    compile_debounce: CompileDebounce,
+    compile_generation: u64,
     compile_state: CompileState,
     diagnostics: Vec<Diagnostic>,
     last_compile_time: Option<Duration>,
@@ -74,7 +102,7 @@ impl App {
 
         Self {
             document: Document::new(text),
-            editor: Editor::default(),
+            editor: Editor::new(text),
             preview: Preview::new(),
             focus: Pane::Editor,
             path,
@@ -82,6 +110,8 @@ impl App {
             picker,
             compile_worker: CompileWorker::new(compiler, sender, runtime),
             internal_events,
+            compile_debounce: CompileDebounce::default(),
+            compile_generation: 0,
             compile_state: CompileState::NotStarted,
             diagnostics: Vec::new(),
             last_compile_time: None,
@@ -96,7 +126,7 @@ impl App {
         while !self.should_quit {
             terminal.draw(|frame| self.draw(frame))?;
             if !initial_compile_requested {
-                self.request_compile();
+                self.start_compile();
                 initial_compile_requested = true;
             }
             if let Some(action) =
@@ -112,8 +142,9 @@ impl App {
     fn update(&mut self, action: Action) {
         match action {
             Action::Save => self.save(),
-            Action::Recompile => self.request_compile(),
+            Action::Recompile => self.start_compile(),
             Action::CompileFinished(result) => self.finish_compile(result),
+            Action::Tick => self.start_compile_if_due(),
             Action::SwitchFocus => {
                 self.focus = match self.focus {
                     Pane::Editor => Pane::Preview,
@@ -141,21 +172,23 @@ impl App {
     fn update_editor(&mut self, action: Action) {
         let revision = self.document.revision();
         self.editor.update(&action, &mut self.document);
-        if self.document.revision() != revision
-            && !matches!(self.compile_state, CompileState::Compiling)
-        {
+        if self.document.revision() != revision {
+            self.compile_generation = self.compile_worker.invalidate();
+            self.compile_debounce.schedule(Instant::now());
             self.compile_state = CompileState::Stale;
         }
         self.status = None;
     }
 
-    fn request_compile(&mut self) {
-        if self.compile_state == CompileState::Compiling {
-            self.status = Some("Compilation already in progress".to_owned());
-            return;
+    fn start_compile_if_due(&mut self) {
+        if self.compile_debounce.take_due(Instant::now()) {
+            self.start_compile();
         }
+    }
 
-        self.compile_worker.spawn(
+    fn start_compile(&mut self) {
+        self.compile_debounce.cancel();
+        self.compile_generation = self.compile_worker.spawn(
             self.document.revision(),
             self.document.text(),
             self.picker.clone(),
@@ -166,9 +199,12 @@ impl App {
     }
 
     fn finish_compile(&mut self, result: CompileResult) {
+        if result.generation != self.compile_generation {
+            return;
+        }
         if result.revision != self.document.revision() {
             self.compile_state = CompileState::Stale;
-            self.status = Some("Document changed during compilation; press Ctrl+R".to_owned());
+            self.status = None;
             return;
         }
 
@@ -314,5 +350,26 @@ fn format_diagnostic(diagnostic: &Diagnostic) -> String {
             format!("{path}:{}:{}: {}", line + 1, column + 1, diagnostic.message)
         }
         _ => diagnostic.message.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::CompileDebounce;
+
+    #[test]
+    fn compile_debounce_restarts_after_each_edit() {
+        let start = Instant::now();
+        let mut debounce = CompileDebounce::default();
+
+        debounce.schedule(start);
+        assert!(!debounce.take_due(start + Duration::from_millis(149)));
+
+        debounce.schedule(start + Duration::from_millis(100));
+        assert!(!debounce.take_due(start + Duration::from_millis(249)));
+        assert!(debounce.take_due(start + Duration::from_millis(250)));
+        assert!(!debounce.take_due(start + Duration::from_millis(300)));
     }
 }

@@ -18,6 +18,7 @@ pub(crate) enum Action {
     Redo,
     Recompile,
     CompileFinished(CompileResult),
+    Tick,
     SwitchFocus,
     ScrollPreviewPages(isize),
     Save,
