@@ -9,7 +9,7 @@ use std::{
 
 use ratatui_image::{picker::Picker, sliced::SlicedProtocol};
 use tokio::runtime::Handle;
-use typst_tui_compiler::{CompileOutcome, Compiler, Diagnostic};
+use typst_tui_compiler::{CompileOutcome, Compiler, Diagnostic, DocumentSync};
 
 use crate::{components::Preview, event::Event};
 
@@ -24,6 +24,7 @@ pub(crate) enum CompileResultKind {
     Success {
         pages: Vec<SlicedProtocol>,
         diagnostics: Vec<Diagnostic>,
+        sync: DocumentSync,
     },
     Diagnostics(Vec<Diagnostic>),
     Error(String),
@@ -111,6 +112,7 @@ fn compile(
     if !is_current(generations, generation) {
         return None;
     }
+    let sync = compiled.sync();
 
     let font_width = picker.font_size().width.max(1);
     let max_columns = (2_048 / font_width).max(1);
@@ -131,6 +133,7 @@ fn compile(
     is_current(generations, generation).then_some(CompileResultKind::Success {
         pages,
         diagnostics: compiled.warnings().to_vec(),
+        sync,
     })
 }
 

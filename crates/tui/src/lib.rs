@@ -7,8 +7,12 @@ mod components;
 mod event;
 mod input;
 
-use std::{path::PathBuf, time::Duration};
+use std::{io, path::PathBuf, time::Duration};
 
+use crossterm::{
+    event::{DisableMouseCapture, EnableMouseCapture},
+    execute,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -28,12 +32,19 @@ pub fn run(path: Option<PathBuf>, root: PathBuf, text: &str) -> Result<(), Error
         Ok(picker) => picker,
         Err(_) => ratatui_image::picker::Picker::halfblocks(),
     };
+    if let Err(error) = execute!(io::stdout(), EnableMouseCapture) {
+        let _ = ratatui::try_restore();
+        runtime.shutdown_timeout(Duration::from_millis(100));
+        return Err(Error::Terminal(error));
+    }
     let mut app = app::App::new(path, text, compiler, picker, runtime.handle().clone());
     let run_result = app.run(&mut terminal);
+    let mouse_result = execute!(io::stdout(), DisableMouseCapture);
     let restore_result = ratatui::try_restore();
     runtime.shutdown_timeout(Duration::from_millis(100));
 
     run_result?;
+    mouse_result?;
     restore_result?;
     Ok(())
 }

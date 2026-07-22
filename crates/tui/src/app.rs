@@ -14,19 +14,20 @@ use ratatui::{
 };
 use ratatui_image::picker::Picker;
 use tokio::runtime::Handle;
-use typst_tui_compiler::{Compiler, Diagnostic, Severity};
+use typst_tui_compiler::{Compiler, DocumentSync, Severity};
 use typst_tui_document::{Document, Motion};
 
 use crate::{
     action::{Action, Pane},
     compile::{CompileResult, CompileResultKind, CompileWorker},
-    components::{Editor, Preview},
+    components::{Diagnostics, Editor, Preview, format_diagnostic},
     event::{self, Event},
     input,
 };
 
 const NARROW_WIDTH: u16 = 80;
 const AUTO_COMPILE_DELAY: Duration = Duration::from_millis(150);
+const CURSOR_SYNC_DELAY: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompileState {
@@ -75,8 +76,10 @@ pub(crate) struct App {
     internal_events: Receiver<Event>,
     compile_debounce: CompileDebounce,
     compile_generation: u64,
+    document_sync: Option<(u64, DocumentSync)>,
+    cursor_sync_deadline: Option<Instant>,
     compile_state: CompileState,
-    diagnostics: Vec<Diagnostic>,
+    diagnostics: Diagnostics,
     last_compile_time: Option<Duration>,
     quit_confirmation: bool,
     should_quit: bool,
@@ -112,8 +115,10 @@ impl App {
             internal_events,
             compile_debounce: CompileDebounce::default(),
             compile_generation: 0,
+            document_sync: None,
+            cursor_sync_deadline: None,
             compile_state: CompileState::NotStarted,
-            diagnostics: Vec::new(),
+            diagnostics: Diagnostics::default(),
             last_compile_time: None,
             quit_confirmation: false,
             should_quit: false,
@@ -144,7 +149,14 @@ impl App {
             Action::Save => self.save(),
             Action::Recompile => self.start_compile(),
             Action::CompileFinished(result) => self.finish_compile(result),
-            Action::Tick => self.start_compile_if_due(),
+            Action::Tick => self.tick(),
+            Action::ToggleDiagnostics => self.diagnostics.toggle(),
+            Action::NavigateDiagnostic(direction) => self.navigate_diagnostic(direction),
+            Action::Click { column, row } => self.click_preview(column, row),
+            Action::ScrollAt { column, row, lines } if self.preview.contains(column, row) => {
+                self.preview.scroll_lines(lines);
+                self.focus = Pane::Preview;
+            }
             Action::SwitchFocus => {
                 self.focus = match self.focus {
                     Pane::Editor => Pane::Preview,
@@ -171,13 +183,28 @@ impl App {
 
     fn update_editor(&mut self, action: Action) {
         let revision = self.document.revision();
+        let cursor = self.document.cursor_byte_index();
         self.editor.update(&action, &mut self.document);
         if self.document.revision() != revision {
             self.compile_generation = self.compile_worker.invalidate();
             self.compile_debounce.schedule(Instant::now());
+            self.cursor_sync_deadline = None;
             self.compile_state = CompileState::Stale;
+        } else if self.document.cursor_byte_index() != cursor {
+            self.cursor_sync_deadline = Some(Instant::now() + CURSOR_SYNC_DELAY);
         }
         self.status = None;
+    }
+
+    fn tick(&mut self) {
+        self.start_compile_if_due();
+        if self
+            .cursor_sync_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.cursor_sync_deadline = None;
+            self.sync_cursor_to_preview();
+        }
     }
 
     fn start_compile_if_due(&mut self) {
@@ -210,11 +237,17 @@ impl App {
 
         self.last_compile_time = Some(result.elapsed);
         match result.outcome {
-            CompileResultKind::Success { pages, diagnostics } => {
+            CompileResultKind::Success {
+                pages,
+                diagnostics,
+                sync,
+            } => {
                 self.preview.replace_pages(pages);
-                self.diagnostics = diagnostics;
+                self.diagnostics.set_items(diagnostics);
+                self.document_sync = Some((result.revision, sync));
                 self.compile_state = CompileState::Ready;
                 self.status = None;
+                self.sync_cursor_to_preview();
             }
             CompileResultKind::Diagnostics(diagnostics) => {
                 let errors = diagnostics
@@ -222,13 +255,61 @@ impl App {
                     .filter(|diagnostic| diagnostic.severity == Severity::Error)
                     .count();
                 self.status = diagnostics.first().map(format_diagnostic);
-                self.diagnostics = diagnostics;
+                self.diagnostics.set_items(diagnostics);
                 self.compile_state = CompileState::Failed(errors);
             }
             CompileResultKind::Error(error) => {
                 self.compile_state = CompileState::Error;
                 self.status = Some(format!("Preview failed: {error}"));
             }
+        }
+    }
+
+    fn navigate_diagnostic(&mut self, direction: isize) {
+        let Some(diagnostic) = self.diagnostics.select(direction).cloned() else {
+            self.status = Some("No diagnostics".to_owned());
+            return;
+        };
+
+        self.status = Some(format_diagnostic(&diagnostic));
+        if diagnostic.is_main
+            && let Some(line) = diagnostic.line
+            && self
+                .document
+                .set_cursor_line_char(line, diagnostic.column.unwrap_or(0))
+        {
+            self.focus = Pane::Editor;
+            self.cursor_sync_deadline = Some(Instant::now() + CURSOR_SYNC_DELAY);
+        }
+    }
+
+    fn click_preview(&mut self, column: u16, row: u16) {
+        let Some(position) = self.preview.position_at(column, row) else {
+            return;
+        };
+        let Some(byte) = self
+            .document_sync
+            .as_ref()
+            .filter(|(revision, _)| *revision == self.document.revision())
+            .and_then(|(_, sync)| sync.source_from_click(position))
+        else {
+            return;
+        };
+        if self.document.set_cursor_byte_index(byte) {
+            self.focus = Pane::Editor;
+            self.cursor_sync_deadline = None;
+            self.status = None;
+        }
+    }
+
+    fn sync_cursor_to_preview(&mut self) {
+        let position = self
+            .document_sync
+            .as_ref()
+            .filter(|(revision, _)| *revision == self.document.revision())
+            .and_then(|(_, sync)| sync.position_from_cursor(self.document.cursor_byte_index()));
+        if let Some(position) = position {
+            self.preview.scroll_to(position);
         }
     }
 
@@ -268,33 +349,63 @@ impl App {
             header_area,
         );
 
-        if content_area.width < NARROW_WIDTH {
-            self.preview.set_viewport(content_area);
+        let (workspace_area, diagnostics_area) = if self.diagnostics.is_visible() {
+            let height = self.diagnostics.drawer_height(content_area.height);
+            let [workspace, drawer] =
+                Layout::vertical([Constraint::Fill(1), Constraint::Length(height)])
+                    .areas(content_area);
+            (workspace, Some(drawer))
+        } else {
+            (content_area, None)
+        };
+
+        let preview_dimmed = self
+            .document_sync
+            .as_ref()
+            .is_some_and(|(revision, _)| *revision != self.document.revision());
+        if workspace_area.width < NARROW_WIDTH {
+            self.preview.set_viewport(workspace_area);
             match self.focus {
-                Pane::Editor => self.editor.draw(frame, content_area, &self.document, true),
-                Pane::Preview => self.preview.draw(frame, content_area, true),
+                Pane::Editor => {
+                    self.preview.hide();
+                    self.editor.draw(
+                        frame,
+                        workspace_area,
+                        &self.document,
+                        &self.diagnostics,
+                        true,
+                    );
+                }
+                Pane::Preview => {
+                    self.preview
+                        .draw(frame, workspace_area, true, preview_dimmed);
+                }
             }
         } else {
             let [editor_area, preview_area] =
                 Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
-                    .areas(content_area);
+                    .areas(workspace_area);
             self.editor.draw(
                 frame,
                 editor_area,
                 &self.document,
+                &self.diagnostics,
                 self.focus == Pane::Editor,
             );
-            self.preview
-                .draw(frame, preview_area, self.focus == Pane::Preview);
+            self.preview.draw(
+                frame,
+                preview_area,
+                self.focus == Pane::Preview,
+                preview_dimmed,
+            );
+        }
+        if let Some(area) = diagnostics_area {
+            self.diagnostics.draw(frame, area);
         }
 
         let cursor = self.document.cursor_position();
-        let errors = self
-            .diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.severity == Severity::Error)
-            .count();
-        let warnings = self.diagnostics.len().saturating_sub(errors);
+        let errors = self.diagnostics.errors();
+        let warnings = self.diagnostics.warnings();
         let compile_time = self.last_compile_time.map_or_else(
             || "--".to_owned(),
             |time| format!("{} ms", time.as_millis()),
@@ -308,17 +419,30 @@ impl App {
             (status.clone(), Color::White)
         } else {
             (
-                format!(
-                    "Ln {}, Col {} | {errors} errors, {warnings} warnings | {compile_time}",
-                    cursor.line + 1,
-                    cursor.column + 1,
-                ),
+                format!("Ln {}, Col {}", cursor.line + 1, cursor.column + 1),
                 Color::Gray,
             )
         };
+        let diagnostic_color = if errors > 0 {
+            Color::Red
+        } else if warnings > 0 {
+            Color::Yellow
+        } else {
+            Color::Gray
+        };
         frame.render_widget(
-            Paragraph::new(format!(" {status}"))
-                .style(Style::default().fg(foreground).bg(Color::DarkGray)),
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!(" {status} | "), Style::default().fg(foreground)),
+                Span::styled(
+                    format!("{errors} errors, {warnings} warnings"),
+                    Style::default().fg(diagnostic_color),
+                ),
+                Span::styled(
+                    format!(" | {compile_time}"),
+                    Style::default().fg(Color::Gray),
+                ),
+            ]))
+            .style(Style::default().bg(Color::DarkGray)),
             status_area,
         );
     }
@@ -341,15 +465,6 @@ impl App {
             CompileState::Ready => Color::Green,
             CompileState::NotStarted => Color::Gray,
         }
-    }
-}
-
-fn format_diagnostic(diagnostic: &Diagnostic) -> String {
-    match (&diagnostic.path, diagnostic.line, diagnostic.column) {
-        (Some(path), Some(line), Some(column)) => {
-            format!("{path}:{}:{}: {}", line + 1, column + 1, diagnostic.message)
-        }
-        _ => diagnostic.message.clone(),
     }
 }
 

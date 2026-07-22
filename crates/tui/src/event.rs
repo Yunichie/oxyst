@@ -4,12 +4,13 @@ use std::{
     time::Duration,
 };
 
-use crossterm::event::{self, KeyEvent};
+use crossterm::event::{self, KeyEvent, MouseEvent};
 
 use crate::compile::CompileResult;
 
 pub(crate) enum Event {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     Paste(String),
     CompileFinished(CompileResult),
     Tick,
@@ -28,7 +29,7 @@ pub(crate) fn read(internal: &Receiver<Event>) -> io::Result<Event> {
 
     Ok(match event::read()? {
         event::Event::Key(key) => Event::Key(key),
-        event::Event::Mouse(_) => Event::Ignored,
+        event::Event::Mouse(mouse) => Event::Mouse(mouse),
         event::Event::Paste(text) => Event::Paste(text),
         event::Event::Resize(_, _) => Event::Ignored,
         event::Event::FocusGained | event::Event::FocusLost => Event::Ignored,

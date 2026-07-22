@@ -1,19 +1,21 @@
 use ratatui::{
     Frame,
     layout::{Rect, Size},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     widgets::{Block, BorderType, Borders, Paragraph},
 };
 use ratatui_image::{
     picker::Picker,
     sliced::{SignedPosition, SlicedImage, SlicedProtocol},
 };
+use typst_tui_compiler::PagePosition;
 use typst_tui_render::RenderedDocument;
 
 pub(crate) struct Preview {
     pages: Vec<SlicedProtocol>,
     scroll: usize,
     viewport: Size,
+    inner: Rect,
 }
 
 impl Preview {
@@ -22,6 +24,7 @@ impl Preview {
             pages: Vec::new(),
             scroll: 0,
             viewport: Size::new(40, 20),
+            inner: Rect::default(),
         }
     }
 
@@ -60,6 +63,67 @@ impl Preview {
 
     pub(crate) fn set_viewport(&mut self, area: Rect) {
         self.viewport = Size::new(area.width.saturating_sub(2), area.height.saturating_sub(2));
+        self.inner = Rect::new(
+            area.x.saturating_add(1),
+            area.y.saturating_add(1),
+            self.viewport.width,
+            self.viewport.height,
+        );
+        self.clamp_scroll();
+    }
+
+    pub(crate) fn hide(&mut self) {
+        self.inner = Rect::default();
+    }
+
+    pub(crate) fn contains(&self, column: u16, row: u16) -> bool {
+        column >= self.inner.x
+            && column < self.inner.right()
+            && row >= self.inner.y
+            && row < self.inner.bottom()
+    }
+
+    pub(crate) fn position_at(&self, column: u16, row: u16) -> Option<PagePosition> {
+        if !self.contains(column, row) {
+            return None;
+        }
+
+        let content_y = self.scroll + usize::from(row - self.inner.y);
+        let mut page_top = 0;
+        for (page_index, page) in self.pages.iter().enumerate() {
+            let size = page.size();
+            let page_bottom = page_top + usize::from(size.height);
+            if content_y < page_bottom {
+                let page_left = self.inner.x + self.inner.width.saturating_sub(size.width) / 2;
+                if column < page_left || column >= page_left.saturating_add(size.width) {
+                    return None;
+                }
+                return Some(PagePosition {
+                    page: page_index,
+                    x: (f64::from(column - page_left) + 0.5) / f64::from(size.width.max(1)),
+                    y: ((content_y - page_top) as f64 + 0.5) / f64::from(size.height.max(1)),
+                });
+            }
+            page_top = page_bottom + 1;
+        }
+
+        None
+    }
+
+    pub(crate) fn scroll_to(&mut self, position: PagePosition) {
+        if !position.y.is_finite() || !(0.0..=1.0).contains(&position.y) {
+            return;
+        }
+        let Some(page) = self.pages.get(position.page) else {
+            return;
+        };
+        let page_top = self.pages[..position.page]
+            .iter()
+            .map(|page| usize::from(page.size().height) + 1)
+            .sum::<usize>();
+        let offset = (f64::from(page.size().height) * position.y).round() as usize;
+        let target = page_top + offset;
+        self.scroll = target.saturating_sub(usize::from(self.viewport.height) / 2);
         self.clamp_scroll();
     }
 
@@ -73,7 +137,7 @@ impl Preview {
         self.scroll_lines(pages.saturating_mul(page_height));
     }
 
-    pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
+    pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect, focused: bool, dimmed: bool) {
         self.set_viewport(area);
         let border_color = if focused {
             Color::Cyan
@@ -129,6 +193,12 @@ impl Preview {
             }
             page_top += 1;
         }
+        if dimmed {
+            frame.render_widget(
+                Block::default().style(Style::default().add_modifier(Modifier::DIM)),
+                inner,
+            );
+        }
     }
 
     fn current_page(&self) -> usize {
@@ -162,9 +232,13 @@ impl Default for Preview {
 mod tests {
     use std::{convert::Infallible, error::Error, fs, io, path::PathBuf};
 
-    use ratatui::{Terminal, backend::TestBackend, style::Color};
+    use ratatui::{
+        Terminal,
+        backend::TestBackend,
+        style::{Color, Modifier},
+    };
     use ratatui_image::picker::Picker;
-    use typst_tui_compiler::{CompileOutcome, Compiler};
+    use typst_tui_compiler::{CompileOutcome, Compiler, PagePosition};
 
     use super::Preview;
 
@@ -174,7 +248,7 @@ mod tests {
         let mut terminal = Terminal::new(backend)?;
         let mut preview = Preview::new();
 
-        terminal.draw(|frame| preview.draw(frame, frame.area(), true))?;
+        terminal.draw(|frame| preview.draw(frame, frame.area(), true, false))?;
 
         let buffer = terminal.backend().buffer();
         let rendered = (0..buffer.area.height)
@@ -202,7 +276,7 @@ mod tests {
 
         let backend = TestBackend::new(32, 14);
         let mut terminal = Terminal::new(backend)?;
-        terminal.draw(|frame| preview.draw(frame, frame.area(), true))?;
+        terminal.draw(|frame| preview.draw(frame, frame.area(), true, false))?;
 
         let buffer = terminal.backend().buffer();
         let rendered = (0..buffer.area.height)
@@ -216,6 +290,25 @@ mod tests {
         });
         assert!(rendered.contains("Page 1 / 1"));
         assert!(has_raster_color);
+
+        let clicked = preview
+            .position_at(16, 2)
+            .ok_or_else(|| io::Error::other("preview click did not hit the page"))?;
+        assert_eq!(clicked.page, 0);
+        preview.scroll_to(PagePosition {
+            page: 0,
+            x: 0.5,
+            y: 1.0,
+        });
+        terminal.draw(|frame| preview.draw(frame, frame.area(), true, true))?;
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| cell.modifier.contains(Modifier::DIM))
+        );
 
         Ok(())
     }

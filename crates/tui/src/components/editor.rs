@@ -8,9 +8,12 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph},
 };
 use typst_syntax::{LinkedNode, Source, Tag, highlight};
+use typst_tui_compiler::Severity;
 use typst_tui_document::Document;
 
 use crate::action::Action;
+
+use super::Diagnostics;
 
 #[derive(Debug)]
 pub(crate) struct Editor {
@@ -46,6 +49,10 @@ impl Editor {
             | Action::CompileFinished(_)
             | Action::Tick
             | Action::SwitchFocus
+            | Action::ToggleDiagnostics
+            | Action::NavigateDiagnostic(_)
+            | Action::Click { .. }
+            | Action::ScrollAt { .. }
             | Action::ScrollPreviewPages(_)
             | Action::Save
             | Action::RequestQuit
@@ -68,6 +75,7 @@ impl Editor {
         frame: &mut Frame,
         area: Rect,
         document: &Document,
+        diagnostics: &Diagnostics,
         focused: bool,
     ) {
         let border_color = if focused {
@@ -87,7 +95,8 @@ impl Editor {
             return;
         }
 
-        let gutter_width = document.line_count().to_string().len() as u16 + 1;
+        let number_width = document.line_count().to_string().len() as u16;
+        let gutter_width = number_width + 2;
         let [gutter_area, text_area] = Layout::horizontal([
             Constraint::Length(gutter_width.min(inner.width)),
             Constraint::Fill(1),
@@ -100,14 +109,18 @@ impl Editor {
         let end_line = (self.vertical_scroll + visible_lines).min(document.line_count());
         let gutter = (self.vertical_scroll..end_line)
             .map(|line| {
-                Line::from(Span::styled(
-                    format!(
-                        "{:>width$} ",
-                        line + 1,
-                        width = usize::from(gutter_width - 1)
+                let (marker, color) = match diagnostics.severity_at(line) {
+                    Some(Severity::Error) => ("E", Color::Red),
+                    Some(Severity::Warning) => ("W", Color::Yellow),
+                    None => (" ", Color::Reset),
+                };
+                Line::from(vec![
+                    Span::styled(marker, Style::default().fg(color)),
+                    Span::styled(
+                        format!("{:>width$} ", line + 1, width = usize::from(number_width)),
+                        Style::default().fg(Color::DarkGray),
                     ),
-                    Style::default().fg(Color::DarkGray),
-                ))
+                ])
             })
             .collect::<Vec<_>>();
         let text = (self.vertical_scroll..end_line)
@@ -283,9 +296,10 @@ mod tests {
     use std::convert::Infallible;
 
     use ratatui::{Terminal, backend::TestBackend, style::Color};
+    use typst_tui_compiler::{Diagnostic, Severity};
     use typst_tui_document::{Document, Motion};
 
-    use super::Editor;
+    use super::{Diagnostics, Editor};
     use crate::action::Action;
 
     #[test]
@@ -294,8 +308,11 @@ mod tests {
         let mut terminal = Terminal::new(backend)?;
         let document = Document::new("first\nsecond");
         let mut editor = Editor::new("first\nsecond");
+        let diagnostics = Diagnostics::default();
 
-        terminal.draw(|frame| editor.draw(frame, frame.area(), &document, true))?;
+        terminal.draw(|frame| {
+            editor.draw(frame, frame.area(), &document, &diagnostics, true);
+        })?;
 
         let buffer = terminal.backend().buffer();
         let rendered = (0..buffer.area.height)
@@ -317,10 +334,13 @@ mod tests {
         let source = "= Heading\n#let answer = 42";
         let document = Document::new(source);
         let mut editor = Editor::new(source);
+        let diagnostics = Diagnostics::default();
         let backend = TestBackend::new(40, 6);
         let mut terminal = Terminal::new(backend)?;
 
-        terminal.draw(|frame| editor.draw(frame, frame.area(), &document, true))?;
+        terminal.draw(|frame| {
+            editor.draw(frame, frame.area(), &document, &diagnostics, true);
+        })?;
 
         let buffer = terminal.backend().buffer();
         assert!(buffer.content().iter().any(|cell| cell.fg == Color::Yellow));
@@ -346,5 +366,36 @@ mod tests {
 
         editor.update(&Action::Undo, &mut document);
         assert_eq!(editor.source.text(), source);
+    }
+
+    #[test]
+    fn draws_main_source_diagnostic_markers() -> Result<(), Infallible> {
+        let document = Document::new("first\nsecond");
+        let mut editor = Editor::new("first\nsecond");
+        let mut diagnostics = Diagnostics::default();
+        diagnostics.set_items(vec![Diagnostic {
+            severity: Severity::Error,
+            message: "broken".to_owned(),
+            path: Some("main.typ".to_owned()),
+            line: Some(1),
+            column: Some(0),
+            is_main: true,
+        }]);
+        let backend = TestBackend::new(30, 6);
+        let mut terminal = Terminal::new(backend)?;
+
+        terminal.draw(|frame| {
+            editor.draw(frame, frame.area(), &document, &diagnostics, true);
+        })?;
+
+        let buffer = terminal.backend().buffer();
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.symbol() == "E" && cell.fg == Color::Red)
+        );
+
+        Ok(())
     }
 }
