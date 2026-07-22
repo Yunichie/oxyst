@@ -27,6 +27,8 @@ pub enum Error {
     DocumentTooLarge,
     #[error("renderer returned invalid pixel data for page {page}")]
     InvalidPixelData { page: usize },
+    #[error("preview rendering was cancelled")]
+    Cancelled,
 }
 
 pub struct RenderedDocument {
@@ -78,6 +80,14 @@ impl PageImage {
 }
 
 pub fn render(document: &CompiledDocument, target_width: u32) -> Result<RenderedDocument, Error> {
+    render_cancellable(document, target_width, || false)
+}
+
+pub fn render_cancellable(
+    document: &CompiledDocument,
+    target_width: u32,
+    cancelled: impl Fn() -> bool,
+) -> Result<RenderedDocument, Error> {
     if target_width == 0 || target_width > MAX_TARGET_WIDTH {
         return Err(Error::InvalidTargetWidth);
     }
@@ -92,7 +102,7 @@ pub fn render(document: &CompiledDocument, target_width: u32) -> Result<Rendered
         .fold(0.0_f64, f64::max);
     let pixels_per_point =
         (f64::from(target_width) / widest_page).clamp(MIN_PIXELS_PER_POINT, MAX_PIXELS_PER_POINT);
-    let pages = render_at(document, pixels_per_point)?;
+    let pages = render_at_cancellable(document, pixels_per_point, &cancelled)?;
 
     Ok(RenderedDocument {
         pages,
@@ -101,6 +111,14 @@ pub fn render(document: &CompiledDocument, target_width: u32) -> Result<Rendered
 }
 
 fn render_at(document: &CompiledDocument, pixels_per_point: f64) -> Result<Vec<PageImage>, Error> {
+    render_at_cancellable(document, pixels_per_point, &|| false)
+}
+
+fn render_at_cancellable(
+    document: &CompiledDocument,
+    pixels_per_point: f64,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Vec<PageImage>, Error> {
     if document.pages().is_empty() {
         return Err(Error::EmptyDocument);
     }
@@ -109,20 +127,20 @@ fn render_at(document: &CompiledDocument, pixels_per_point: f64) -> Result<Vec<P
         pixel_per_pt: pixels_per_point.into(),
         render_bleed: false,
     };
-    document
-        .pages()
-        .iter()
-        .enumerate()
-        .map(|(index, page)| {
-            let pixmap = typst_render::render(page, &options);
-            let (width, height) = (pixmap.width(), pixmap.height());
-            let mut rgba = pixmap.data().to_vec();
-            unpremultiply(&mut rgba);
-            let image = RgbaImage::from_raw(width, height, rgba)
-                .ok_or(Error::InvalidPixelData { page: index + 1 })?;
-            Ok(PageImage { image })
-        })
-        .collect()
+    let mut pages = Vec::with_capacity(document.pages().len());
+    for (index, page) in document.pages().iter().enumerate() {
+        if cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let pixmap = typst_render::render(page, &options);
+        let (width, height) = (pixmap.width(), pixmap.height());
+        let mut rgba = pixmap.data().to_vec();
+        unpremultiply(&mut rgba);
+        let image = RgbaImage::from_raw(width, height, rgba)
+            .ok_or(Error::InvalidPixelData { page: index + 1 })?;
+        pages.push(PageImage { image });
+    }
+    Ok(pages)
 }
 
 fn validate_dimensions(document: &CompiledDocument, pixels_per_point: f64) -> Result<(), Error> {
