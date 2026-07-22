@@ -105,6 +105,11 @@ impl Document {
         self.state != self.saved_state
     }
 
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.state
+    }
+
     pub fn mark_saved(&mut self) {
         self.saved_state = self.state;
     }
