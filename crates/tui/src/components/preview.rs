@@ -101,10 +101,7 @@ impl Preview {
         if page == 0 || page > self.pages.len() {
             return false;
         }
-        self.scroll = self.pages[..page - 1]
-            .iter()
-            .map(|page| usize::from(page.size().height) + 1)
-            .sum();
+        self.scroll = self.page_top(page - 1);
         self.clamp_scroll();
         true
     }
@@ -181,8 +178,14 @@ impl Preview {
     }
 
     pub(crate) fn scroll_pages(&mut self, pages: isize) {
-        let page_height = isize::try_from(self.viewport.height.max(1)).unwrap_or(isize::MAX);
-        self.scroll_lines(pages.saturating_mul(page_height));
+        let Some(current) = self.current_page_index() else {
+            return;
+        };
+        let target = current
+            .saturating_add_signed(pages)
+            .min(self.pages.len() - 1);
+        self.scroll = self.page_top(target);
+        self.clamp_scroll();
     }
 
     pub(crate) fn draw(
@@ -267,21 +270,42 @@ impl Preview {
     }
 
     fn current_page(&self) -> usize {
+        self.current_page_index().map_or(1, |index| index + 1)
+    }
+
+    fn current_page_index(&self) -> Option<usize> {
+        if self.pages.is_empty() {
+            return None;
+        }
+        if self.scroll > 0 && self.scroll == self.max_scroll() {
+            return Some(self.pages.len() - 1);
+        }
+
         let mut top = 0;
         for (index, page) in self.pages.iter().enumerate() {
             let bottom = top + usize::from(page.size().height) + 1;
             if self.scroll < bottom {
-                return index + 1;
+                return Some(index);
             }
             top = bottom;
         }
-        self.pages.len().max(1)
+        Some(self.pages.len() - 1)
+    }
+
+    fn page_top(&self, page: usize) -> usize {
+        self.pages[..page]
+            .iter()
+            .map(|page| usize::from(page.size().height) + 1)
+            .sum()
+    }
+
+    fn max_scroll(&self) -> usize {
+        self.content_height()
+            .saturating_sub(usize::from(self.viewport.height))
     }
 
     fn clamp_scroll(&mut self) {
-        let content_height = self.content_height();
-        let max_scroll = content_height.saturating_sub(usize::from(self.viewport.height));
-        self.scroll = self.scroll.min(max_scroll);
+        self.scroll = self.scroll.min(self.max_scroll());
     }
 
     fn content_height(&self) -> usize {
@@ -391,6 +415,32 @@ mod tests {
                 .iter()
                 .any(|cell| cell.modifier.contains(Modifier::DIM))
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn page_navigation_moves_to_page_boundaries() -> Result<(), Box<dyn Error>> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        let source = fs::read_to_string(root.join("multi-page.typ"))?;
+        let mut compiler = Compiler::new(&root, root.join("multi-page.typ"))?;
+        let CompileOutcome::Success(document) = compiler.compile(&source) else {
+            return Err(io::Error::other("multi-page fixture did not compile").into());
+        };
+        let rendered = typst_tui_render::render(&document, 280)?;
+        let pages =
+            Preview::encode_pages(&Picker::halfblocks(), rendered, 28).map_err(io::Error::other)?;
+        let mut preview = Preview::new();
+        preview.replace_pages(pages);
+        preview.set_viewport(ratatui::layout::Rect::new(0, 0, 32, 8));
+
+        assert_eq!(preview.current_page(), 1);
+        preview.scroll_pages(1);
+        assert_eq!(preview.current_page(), 2);
+        preview.scroll_pages(1);
+        assert_eq!(preview.current_page(), 2);
+        preview.scroll_pages(-1);
+        assert_eq!(preview.current_page(), 1);
 
         Ok(())
     }
