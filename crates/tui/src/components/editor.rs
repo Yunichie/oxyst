@@ -1,4 +1,4 @@
-use std::{cmp, ops::Range};
+use std::{cmp, collections::BTreeMap, ops::Range};
 
 use ratatui::{
     Frame,
@@ -19,10 +19,11 @@ use crate::{
     style::{color, text_style},
 };
 
-use super::Diagnostics;
+use super::{Component, Diagnostics};
 
 #[derive(Debug)]
 pub(crate) struct Editor {
+    document: Document,
     vertical_scroll: usize,
     inner: Rect,
     text_area: Rect,
@@ -32,6 +33,7 @@ pub(crate) struct Editor {
     visual_rows: Vec<VisualRow>,
     layout_width: u16,
     preferred_visual_column: Option<usize>,
+    diagnostic_lines: BTreeMap<usize, Severity>,
     theme: Theme,
 }
 
@@ -41,6 +43,7 @@ impl Editor {
         let highlighted_lines = highlighted_lines(&source, theme);
         let non_code_ranges = non_code_ranges(&source);
         Self {
+            document: Document::new(text),
             vertical_scroll: 0,
             inner: Rect::default(),
             text_area: Rect::default(),
@@ -50,6 +53,7 @@ impl Editor {
             visual_rows: Vec::new(),
             layout_width: 0,
             preferred_visual_column: None,
+            diagnostic_lines: BTreeMap::new(),
             theme,
         }
     }
@@ -60,8 +64,8 @@ impl Editor {
         self.layout_width = 0;
     }
 
-    pub(crate) fn update(&mut self, action: &Action, document: &mut Document) {
-        let revision = document.revision();
+    fn apply_action(&mut self, action: &Action) {
+        let revision = self.document.revision();
         if !matches!(
             action,
             Action::Move(Motion::Up | Motion::Down) | Action::Select(Motion::Up | Motion::Down)
@@ -69,27 +73,27 @@ impl Editor {
             self.preferred_visual_column = None;
         }
         match action {
-            Action::Insert(character) => document.insert_char(*character),
-            Action::InsertText(text) => document.insert_text(text),
-            Action::Backspace => document.backspace(),
-            Action::Delete => document.delete(),
-            Action::Move(Motion::Up) => self.move_vertically(document, -1, false),
-            Action::Move(Motion::Down) => self.move_vertically(document, 1, false),
-            Action::Move(motion) => document.move_cursor(*motion),
-            Action::Select(Motion::Up) => self.move_vertically(document, -1, true),
-            Action::Select(Motion::Down) => self.move_vertically(document, 1, true),
-            Action::Select(motion) => document.move_cursor_selecting(*motion, true),
-            Action::SelectAll => document.select_all(),
-            Action::Undo => document.undo(),
-            Action::Redo => document.redo(),
+            Action::Insert(character) => self.document.insert_char(*character),
+            Action::InsertText(text) => self.document.insert_text(text),
+            Action::Backspace => self.document.backspace(),
+            Action::Delete => self.document.delete(),
+            Action::Move(Motion::Up) => self.move_vertically(-1, false),
+            Action::Move(Motion::Down) => self.move_vertically(1, false),
+            Action::Move(motion) => self.document.move_cursor(*motion),
+            Action::Select(Motion::Up) => self.move_vertically(-1, true),
+            Action::Select(Motion::Down) => self.move_vertically(1, true),
+            Action::Select(motion) => self.document.move_cursor_selecting(*motion, true),
+            Action::SelectAll => self.document.select_all(),
+            Action::Undo => self.document.undo(),
+            Action::Redo => self.document.redo(),
             _ => {}
         }
 
-        if document.revision() != revision {
-            if let Some(edit) = document.last_edit() {
+        if self.document.revision() != revision {
+            if let Some(edit) = self.document.last_edit() {
                 self.source.edit(edit.range(), edit.replacement());
             } else {
-                self.source.replace(&document.text());
+                self.source.replace(&self.document.text());
             }
             self.highlighted_lines = highlighted_lines(&self.source, self.theme);
             self.non_code_ranges = non_code_ranges(&self.source);
@@ -97,14 +101,7 @@ impl Editor {
         }
     }
 
-    pub(crate) fn draw(
-        &mut self,
-        frame: &mut Frame,
-        area: Rect,
-        document: &Document,
-        diagnostics: &Diagnostics,
-        focused: bool,
-    ) {
+    fn draw_editor(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
         let border_color = if focused {
             self.theme.accent
         } else {
@@ -123,7 +120,7 @@ impl Editor {
             return;
         }
 
-        let number_width = document.line_count().to_string().len() as u16;
+        let number_width = self.document.line_count().to_string().len() as u16;
         let gutter_width = number_width + 2;
         let [gutter_area, text_area] = Layout::horizontal([
             Constraint::Length(gutter_width.min(inner.width)),
@@ -131,7 +128,7 @@ impl Editor {
         ])
         .areas(inner);
         self.text_area = text_area;
-        let cursor = document.cursor_position();
+        let cursor = self.document.cursor_position();
         self.ensure_layout(text_area.width);
         let cursor_row = self.cursor_visual_row(cursor.line, cursor.visual_column);
         self.keep_cursor_visible(cursor_row, text_area);
@@ -144,7 +141,7 @@ impl Editor {
                 let (marker, marker_color) = if visual.continuation {
                     ("↪", self.theme.muted)
                 } else {
-                    match diagnostics.severity_at(visual.logical_line) {
+                    match self.diagnostic_lines.get(&visual.logical_line).copied() {
                         Some(Severity::Error) => ("E", self.theme.error),
                         Some(Severity::Warning) => ("W", self.theme.warning),
                         None => (" ", typst_tui_theme::Color::Reset),
@@ -164,10 +161,10 @@ impl Editor {
                 ])
             })
             .collect::<Vec<_>>();
-        let selection = document.selection_byte_range();
+        let selection = self.document.selection_byte_range();
         let brackets = matching_brackets(
             self.source.text(),
-            document.cursor_byte_index(),
+            self.document.cursor_byte_index(),
             &self.non_code_ranges,
         );
         let text = (self.vertical_scroll..end_line)
@@ -230,13 +227,7 @@ impl Editor {
         self.text_area = Rect::default();
     }
 
-    pub(crate) fn place_cursor(
-        &mut self,
-        document: &mut Document,
-        column: u16,
-        row: u16,
-        selecting: bool,
-    ) -> bool {
+    pub(crate) fn place_cursor(&mut self, column: u16, row: u16, selecting: bool) -> bool {
         if !self.contains(column, row) {
             return false;
         }
@@ -253,10 +244,11 @@ impl Editor {
                 .start_visual_column
                 .saturating_add(usize::from(column - self.text_area.x))
         };
-        document.set_cursor_visual_position(visual.logical_line, visual_column, selecting)
+        self.document
+            .set_cursor_visual_position(visual.logical_line, visual_column, selecting)
     }
 
-    pub(crate) fn scroll_lines(&mut self, lines: isize, _document: &Document) {
+    pub(crate) fn scroll_lines(&mut self, lines: isize) {
         self.vertical_scroll = self
             .vertical_scroll
             .saturating_add_signed(lines)
@@ -313,20 +305,21 @@ impl Editor {
             .unwrap_or(0)
     }
 
-    fn move_vertically(&mut self, document: &mut Document, direction: isize, selecting: bool) {
+    fn move_vertically(&mut self, direction: isize, selecting: bool) {
         let motion = if direction < 0 {
             Motion::Up
         } else {
             Motion::Down
         };
-        if self.visual_rows.is_empty() || (!selecting && document.selection_byte_range().is_some())
+        if self.visual_rows.is_empty()
+            || (!selecting && self.document.selection_byte_range().is_some())
         {
             self.preferred_visual_column = None;
-            document.move_cursor_selecting(motion, selecting);
+            self.document.move_cursor_selecting(motion, selecting);
             return;
         }
 
-        let cursor = document.cursor_position();
+        let cursor = self.document.cursor_position();
         let current = self.cursor_visual_row(cursor.line, cursor.visual_column);
         let target = current
             .saturating_add_signed(direction)
@@ -338,13 +331,103 @@ impl Editor {
                 .visual_column
                 .saturating_sub(current_row.start_visual_column)
         });
-        if document.set_cursor_visual_position(
+        if self.document.set_cursor_visual_position(
             target_row.logical_line,
             target_row.start_visual_column.saturating_add(column),
             selecting,
         ) {
             self.preferred_visual_column = Some(column);
         }
+    }
+
+    pub(crate) fn set_diagnostics(&mut self, diagnostics: &Diagnostics) {
+        self.diagnostic_lines = diagnostics.line_severities().collect();
+    }
+
+    pub(crate) fn replace_document(&mut self, text: &str) {
+        *self = Self::new(text, self.theme);
+    }
+
+    pub(crate) fn text(&self) -> String {
+        self.document.text()
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.document.revision()
+    }
+
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.document.is_dirty()
+    }
+
+    pub(crate) fn mark_saved(&mut self) {
+        self.document.mark_saved();
+    }
+
+    pub(crate) fn last_edit(&self) -> Option<&typst_tui_document::TextEdit> {
+        self.document.last_edit()
+    }
+
+    pub(crate) fn cursor_byte_index(&self) -> usize {
+        self.document.cursor_byte_index()
+    }
+
+    pub(crate) fn cursor_position(&self) -> typst_tui_document::CursorPosition {
+        self.document.cursor_position()
+    }
+
+    pub(crate) fn set_cursor_byte_index(&mut self, byte: usize) -> bool {
+        let placed = self.document.set_cursor_byte_index(byte);
+        if placed {
+            self.preferred_visual_column = None;
+        }
+        placed
+    }
+
+    pub(crate) fn set_cursor_line_char(&mut self, line: usize, column: usize) -> bool {
+        let placed = self.document.set_cursor_line_char(line, column);
+        if placed {
+            self.preferred_visual_column = None;
+        }
+        placed
+    }
+
+    pub(crate) fn selected_text(&self) -> Option<String> {
+        self.document.selected_text()
+    }
+
+    pub(crate) fn selection_byte_range(&self) -> Option<Range<usize>> {
+        self.document.selection_byte_range()
+    }
+
+    pub(crate) fn selection_graphemes(&self) -> usize {
+        self.document.selection_graphemes()
+    }
+
+    pub(crate) fn word_count(&self) -> usize {
+        self.document.word_count()
+    }
+
+    pub(crate) fn find(&self, query: &str, reverse: bool) -> Option<Range<usize>> {
+        self.document.find(query, reverse)
+    }
+
+    pub(crate) fn select_byte_range(&mut self, range: Range<usize>) -> bool {
+        let selected = self.document.select_byte_range(range);
+        if selected {
+            self.preferred_visual_column = None;
+        }
+        selected
+    }
+}
+
+impl Component for Editor {
+    fn update(&mut self, action: Action) {
+        self.apply_action(&action);
+    }
+
+    fn draw(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
+        self.draw_editor(frame, area, focused);
     }
 }
 
@@ -743,10 +826,10 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend, style::Color};
     use typst_syntax::Source;
     use typst_tui_compiler::{Diagnostic, Severity};
-    use typst_tui_document::{Document, Motion};
+    use typst_tui_document::Motion;
     use typst_tui_theme::{ColorDepth, Theme, ThemeName};
 
-    use super::{Diagnostics, Editor, matching_brackets, non_code_ranges};
+    use super::{Component, Diagnostics, Editor, matching_brackets, non_code_ranges};
     use crate::action::Action;
 
     fn theme() -> Theme {
@@ -757,12 +840,10 @@ mod tests {
     fn draws_line_numbers_and_buffer_text() -> Result<(), Infallible> {
         let backend = TestBackend::new(30, 6);
         let mut terminal = Terminal::new(backend)?;
-        let document = Document::new("first\nsecond");
         let mut editor = Editor::new("first\nsecond", theme());
-        let diagnostics = Diagnostics::default();
 
         terminal.draw(|frame| {
-            editor.draw(frame, frame.area(), &document, &diagnostics, true);
+            editor.draw(frame, frame.area(), true);
         })?;
 
         let buffer = terminal.backend().buffer();
@@ -783,14 +864,12 @@ mod tests {
     #[test]
     fn applies_typst_syntax_styles() -> Result<(), Infallible> {
         let source = "= Heading\n#let answer = 42";
-        let document = Document::new(source);
         let mut editor = Editor::new(source, theme());
-        let diagnostics = Diagnostics::default();
         let backend = TestBackend::new(40, 6);
         let mut terminal = Terminal::new(backend)?;
 
         terminal.draw(|frame| {
-            editor.draw(frame, frame.area(), &document, &diagnostics, true);
+            editor.draw(frame, frame.area(), true);
         })?;
 
         let buffer = terminal.backend().buffer();
@@ -803,20 +882,18 @@ mod tests {
     #[test]
     fn applies_document_edits_to_the_syntax_source() {
         let source = "#let value = 1";
-        let mut document = Document::new(source);
-        document.move_cursor(Motion::DocumentEnd);
         let mut editor = Editor::new(source, theme());
+        editor.update(Action::Move(Motion::DocumentEnd));
 
-        editor.update(&Action::Insert('0'), &mut document);
+        editor.update(Action::Insert('0'));
         assert_eq!(editor.source.text(), "#let value = 10");
 
-        editor.update(&Action::Undo, &mut document);
+        editor.update(Action::Undo);
         assert_eq!(editor.source.text(), source);
     }
 
     #[test]
     fn draws_main_source_diagnostic_markers() -> Result<(), Infallible> {
-        let document = Document::new("first\nsecond");
         let mut editor = Editor::new("first\nsecond", theme());
         let mut diagnostics = Diagnostics::default();
         diagnostics.set_items(vec![Diagnostic {
@@ -828,11 +905,12 @@ mod tests {
             is_main: true,
             notes: Vec::new(),
         }]);
+        editor.set_diagnostics(&diagnostics);
         let backend = TestBackend::new(30, 6);
         let mut terminal = Terminal::new(backend)?;
 
         terminal.draw(|frame| {
-            editor.draw(frame, frame.area(), &document, &diagnostics, true);
+            editor.draw(frame, frame.area(), true);
         })?;
 
         let buffer = terminal.backend().buffer();
@@ -848,15 +926,13 @@ mod tests {
 
     #[test]
     fn selection_background_preserves_the_editor_content() -> Result<(), Infallible> {
-        let mut document = Document::new("first");
-        document.move_cursor_selecting(Motion::Right, true);
-        document.move_cursor_selecting(Motion::Right, true);
         let mut editor = Editor::new("first", theme());
-        let diagnostics = Diagnostics::default();
+        editor.update(Action::Select(Motion::Right));
+        editor.update(Action::Select(Motion::Right));
         let backend = TestBackend::new(30, 5);
         let mut terminal = Terminal::new(backend)?;
 
-        terminal.draw(|frame| editor.draw(frame, frame.area(), &document, &diagnostics, true))?;
+        terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
 
         assert!(
             terminal
@@ -871,48 +947,33 @@ mod tests {
 
     #[test]
     fn mouse_position_uses_visual_columns_for_wide_text() -> Result<(), Infallible> {
-        let mut document = Document::new("one\n界two");
         let mut editor = Editor::new("one\n界two", theme());
-        let diagnostics = Diagnostics::default();
         let backend = TestBackend::new(30, 6);
         let mut terminal = Terminal::new(backend)?;
-        terminal.draw(|frame| editor.draw(frame, frame.area(), &document, &diagnostics, true))?;
+        terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
 
-        assert!(editor.place_cursor(&mut document, 6, 2, false));
-        assert_eq!(document.cursor_position().line, 1);
-        assert_eq!(document.cursor_position().visual_column, 2);
+        assert!(editor.place_cursor(6, 2, false));
+        assert_eq!(editor.cursor_position().line, 1);
+        assert_eq!(editor.cursor_position().visual_column, 2);
         Ok(())
     }
 
     #[test]
     fn soft_wraps_wide_text_and_maps_continuation_clicks() -> Result<(), Infallible> {
         let source = "ab\u{754c}cdefgh";
-        let mut document = Document::new(source);
         let mut editor = Editor::new(source, theme());
-        let diagnostics = Diagnostics::default();
         let backend = TestBackend::new(12, 6);
         let mut terminal = Terminal::new(backend)?;
-        terminal.draw(|frame| editor.draw(frame, frame.area(), &document, &diagnostics, true))?;
+        terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
 
         assert!(editor.visual_rows.len() > 1);
         assert!(editor.visual_rows[1].continuation);
         let continuation_column = editor.visual_rows[1].start_visual_column;
-        editor.update(&Action::Move(Motion::Down), &mut document);
-        assert_eq!(document.cursor_position().line, 0);
-        assert_eq!(
-            document.cursor_position().visual_column,
-            continuation_column
-        );
-        assert!(editor.place_cursor(
-            &mut document,
-            editor.text_area.x,
-            editor.text_area.y + 1,
-            false,
-        ));
-        assert_eq!(
-            document.cursor_position().visual_column,
-            continuation_column
-        );
+        editor.update(Action::Move(Motion::Down));
+        assert_eq!(editor.cursor_position().line, 0);
+        assert_eq!(editor.cursor_position().visual_column, continuation_column);
+        assert!(editor.place_cursor(editor.text_area.x, editor.text_area.y + 1, false,));
+        assert_eq!(editor.cursor_position().visual_column, continuation_column);
         assert!(
             terminal
                 .backend()
@@ -927,18 +988,16 @@ mod tests {
     #[test]
     fn vertical_motion_preserves_the_column_across_short_lines() -> Result<(), Infallible> {
         let source = "abcd\nx\nabcd";
-        let mut document = Document::new(source);
         let mut editor = Editor::new(source, theme());
-        let diagnostics = Diagnostics::default();
         let backend = TestBackend::new(30, 7);
         let mut terminal = Terminal::new(backend)?;
-        terminal.draw(|frame| editor.draw(frame, frame.area(), &document, &diagnostics, true))?;
-        assert!(document.set_cursor_line_char(0, 3));
+        terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
+        assert!(editor.set_cursor_line_char(0, 3));
 
-        editor.update(&Action::Move(Motion::Down), &mut document);
-        assert_eq!(document.cursor_position().visual_column, 1);
-        editor.update(&Action::Move(Motion::Down), &mut document);
-        assert_eq!(document.cursor_position().visual_column, 3);
+        editor.update(Action::Move(Motion::Down));
+        assert_eq!(editor.cursor_position().visual_column, 1);
+        editor.update(Action::Move(Motion::Down));
+        assert_eq!(editor.cursor_position().visual_column, 3);
 
         Ok(())
     }

@@ -10,6 +10,7 @@ mod export;
 mod input;
 mod style;
 mod watcher;
+mod workspace;
 
 use std::{io, path::PathBuf, time::Duration};
 
@@ -48,15 +49,15 @@ pub fn run(
         runtime.shutdown_timeout(Duration::from_millis(100));
         return Err(Error::Terminal(error));
     }
-    let mut app = match app::App::new(
+    let mut app = match app::App::new(app::AppInit {
         path,
         root,
         text,
         compiler,
         picker,
-        runtime.handle().clone(),
+        runtime: runtime.handle().clone(),
         config,
-    ) {
+    }) {
         Ok(app) => app,
         Err(error) => {
             let _ = execute!(io::stdout(), DisableMouseCapture);

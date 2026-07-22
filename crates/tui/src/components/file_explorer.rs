@@ -12,7 +12,9 @@ use ratatui::{
 };
 use typst_tui_theme::Theme;
 
-use crate::style::color;
+use crate::{action::Action, style::color};
+
+use super::Component;
 
 const MAX_FILES: usize = 512;
 const MAX_DEPTH: usize = 8;
@@ -26,10 +28,11 @@ pub(crate) struct FileExplorer {
     viewport_height: usize,
     visible: bool,
     dirty: bool,
+    theme: Theme,
 }
 
 impl FileExplorer {
-    pub(crate) fn new(root: PathBuf) -> Self {
+    pub(crate) fn new(root: PathBuf, theme: Theme) -> Self {
         let mut explorer = Self {
             root,
             files: Vec::new(),
@@ -38,6 +41,7 @@ impl FileExplorer {
             viewport_height: 0,
             visible: false,
             dirty: false,
+            theme,
         };
         explorer.refresh();
         explorer
@@ -48,6 +52,10 @@ impl FileExplorer {
         self.selected = 0;
         self.scroll = 0;
         self.refresh();
+    }
+
+    pub(crate) fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
     }
 
     pub(crate) fn toggle(&mut self) {
@@ -78,11 +86,15 @@ impl FileExplorer {
         self.dirty = true;
     }
 
-    pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect, focused: bool, theme: &Theme) {
+    fn draw_explorer(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
         if self.dirty {
             self.refresh();
         }
-        let border = if focused { theme.accent } else { theme.border };
+        let border = if focused {
+            self.theme.accent
+        } else {
+            self.theme.border
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -105,7 +117,7 @@ impl FileExplorer {
                     .to_string_lossy();
                 let line = Line::raw(format!(" {}", label));
                 if index == self.selected {
-                    line.style(Style::default().bg(color(theme.selection)))
+                    line.style(Style::default().bg(color(self.theme.selection)))
                 } else {
                     line
                 }
@@ -141,6 +153,21 @@ impl FileExplorer {
         }
         let max_scroll = self.files.len().saturating_sub(self.viewport_height.max(1));
         self.scroll = self.scroll.min(max_scroll);
+    }
+}
+
+impl Component for FileExplorer {
+    fn update(&mut self, action: Action) {
+        match action {
+            Action::Move(typst_tui_document::Motion::Up) => self.select(-1),
+            Action::Move(typst_tui_document::Motion::Down) => self.select(1),
+            Action::ToggleFileExplorer => self.toggle(),
+            _ => {}
+        }
+    }
+
+    fn draw(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
+        self.draw_explorer(frame, area, focused);
     }
 }
 
@@ -185,7 +212,7 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
     use typst_tui_theme::{ColorDepth, Theme, ThemeName};
 
-    use super::FileExplorer;
+    use super::{Component, FileExplorer};
 
     #[test]
     fn scrolls_to_keep_the_selection_visible_and_refreshes_changes() -> Result<(), Box<dyn Error>> {
@@ -198,13 +225,13 @@ mod tests {
         for index in 0..6 {
             fs::write(root.join(format!("file-{index}.typ")), "text")?;
         }
-        let mut explorer = FileExplorer::new(root.clone());
-        let mut terminal = Terminal::new(TestBackend::new(24, 4))?;
         let theme = Theme::new(ThemeName::Dark, ColorDepth::Ansi16);
-        terminal.draw(|frame| explorer.draw(frame, frame.area(), true, &theme))?;
+        let mut explorer = FileExplorer::new(root.clone(), theme);
+        let mut terminal = Terminal::new(TestBackend::new(24, 4))?;
+        terminal.draw(|frame| explorer.draw(frame, frame.area(), true))?;
 
         explorer.select(3);
-        terminal.draw(|frame| explorer.draw(frame, frame.area(), true, &theme))?;
+        terminal.draw(|frame| explorer.draw(frame, frame.area(), true))?;
         let rendered = terminal
             .backend()
             .buffer()
@@ -218,7 +245,7 @@ mod tests {
         let selected = explorer.selected_path();
         fs::write(root.join("file-new.typ"), "text")?;
         explorer.mark_dirty();
-        terminal.draw(|frame| explorer.draw(frame, frame.area(), true, &theme))?;
+        terminal.draw(|frame| explorer.draw(frame, frame.area(), true))?;
         assert!(
             explorer
                 .files

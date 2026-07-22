@@ -19,7 +19,7 @@ pub(crate) enum InputMode {
     QuitConfirmation,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Keymap {
     bindings: BTreeMap<String, Vec<KeyChord>>,
     labels: BTreeMap<String, Vec<String>>,

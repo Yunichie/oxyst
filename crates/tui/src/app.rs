@@ -1,6 +1,4 @@
 use std::{
-    fs,
-    io::ErrorKind,
     path::{Path, PathBuf},
     sync::mpsc::{Receiver, channel},
     time::{Duration, Instant},
@@ -9,15 +7,14 @@ use std::{
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph},
+    style::Style,
+    widgets::{Block, Paragraph},
 };
 use ratatui_image::picker::Picker;
 use tokio::runtime::Handle;
 use typst_tui_compiler::{CompiledDocument, Compiler, DocumentSync, Severity};
 use typst_tui_config::Config;
-use typst_tui_document::{Document, Motion};
+use typst_tui_document::Motion;
 use typst_tui_render::{ExportFormat, RenderCache};
 use typst_tui_theme::{Color, ColorDepth, Theme, ThemeName};
 
@@ -26,14 +23,16 @@ use crate::{
     clipboard::Clipboard,
     compile::{CompileResult, CompileResultKind, CompileWorker, WorldRebuild},
     components::{
-        Command, CommandPalette, Diagnostics, Editor, FileExplorer, Help, Preview, Prompt,
-        PromptKind, Search, SearchMode, Welcome, WelcomeChoice, format_diagnostic, modal_area,
+        Command, Component, ConfirmIntent, Diagnostics, Editor, FileExplorer, Header, HeaderState,
+        OverlayHost, OverlaySubmission, Preview, Prompt, PromptKind, SearchMode, StatusBar,
+        StatusBarState, Welcome, WelcomeChoice, format_diagnostic,
     },
     event::{self, Event},
     export::{ExportResult, ExportWorker},
     input::{self, InputMode, Keymap},
     style::{base, color},
     watcher::ProjectWatcher,
+    workspace::Workspace,
 };
 
 const NARROW_WIDTH: u16 = 80;
@@ -75,41 +74,16 @@ impl CompileDebounce {
     }
 }
 
-#[derive(Debug, Default)]
-enum Overlay {
-    #[default]
-    None,
-    Palette(CommandPalette),
-    Prompt(Prompt),
-    Search(Search),
-    Help(Help),
-    Confirm(Confirmation),
-}
-
-#[derive(Debug)]
-struct Confirmation {
-    message: String,
-    intent: ConfirmIntent,
-}
-
-#[derive(Debug)]
-enum ConfirmIntent {
-    Open(PathBuf),
-    SaveAs(PathBuf),
-    Export(ExportFormat, PathBuf),
-}
-
 pub(crate) struct App {
-    document: Document,
     editor: Editor,
+    header: Header,
+    status_bar: StatusBar,
     clipboard: Clipboard,
     preview: Preview,
     explorer: FileExplorer,
     focus: Pane,
     fullscreen: bool,
-    path: Option<PathBuf>,
-    root: PathBuf,
-    display_name: String,
+    workspace: Workspace,
     picker: Picker,
     compile_worker: CompileWorker,
     export_worker: ExportWorker,
@@ -131,41 +105,57 @@ pub(crate) struct App {
     color_depth: ColorDepth,
     theme: Theme,
     welcome: Option<Welcome>,
-    overlay: Overlay,
+    overlay: OverlayHost,
     quit_confirmation: bool,
     should_quit: bool,
     status: Option<String>,
 }
 
+pub(crate) struct AppInit<'a> {
+    pub(crate) path: Option<PathBuf>,
+    pub(crate) root: PathBuf,
+    pub(crate) text: &'a str,
+    pub(crate) compiler: Compiler,
+    pub(crate) picker: Picker,
+    pub(crate) runtime: Handle,
+    pub(crate) config: Config,
+}
+
 impl App {
-    pub(crate) fn new(
-        path: Option<PathBuf>,
-        root: PathBuf,
-        text: &str,
-        compiler: Compiler,
-        picker: Picker,
-        runtime: Handle,
-        config: Config,
-    ) -> Result<Self, String> {
-        let display_name = display_name(path.as_deref());
+    pub(crate) fn new(init: AppInit<'_>) -> Result<Self, String> {
+        let AppInit {
+            path,
+            root,
+            text,
+            compiler,
+            picker,
+            runtime,
+            config,
+        } = init;
         let color_depth = ColorDepth::detect();
         let theme = Theme::named(&config.theme, color_depth).map_err(|error| error.to_string())?;
         let keymap = Keymap::new(&config)?;
-        let welcome = path.is_none().then(Welcome::default);
+        let overlay = OverlayHost::new(keymap.clone(), theme);
+        let header = Header::new(theme, keymap.display("help"));
+        let status_bar = StatusBar::new(
+            theme,
+            keymap.display("confirm"),
+            keymap.display("cancel_confirmation"),
+        );
+        let welcome = path.is_none().then(|| Welcome::new(theme));
         let (sender, internal_events) = channel();
         let watcher = ProjectWatcher::new(&root, path.as_deref(), sender.clone())?;
 
         Ok(Self {
-            document: Document::new(text),
             editor: Editor::new(text, theme),
+            header,
+            status_bar,
             clipboard: Clipboard::new(),
-            preview: Preview::new(),
-            explorer: FileExplorer::new(root.clone()),
+            preview: Preview::new(theme),
+            explorer: FileExplorer::new(root.clone(), theme),
             focus: Pane::Editor,
             fullscreen: false,
-            path,
-            root,
-            display_name,
+            workspace: Workspace::new(path, root),
             picker,
             compile_worker: CompileWorker::new(compiler, text, sender.clone(), runtime.clone()),
             export_worker: ExportWorker::new(sender, runtime),
@@ -181,13 +171,13 @@ impl App {
             document_sync: None,
             cursor_sync_deadline: None,
             compile_state: CompileState::NotStarted,
-            diagnostics: Diagnostics::default(),
+            diagnostics: Diagnostics::new(theme),
             last_compile_time: None,
             keymap,
             color_depth,
             theme,
             welcome,
-            overlay: Overlay::None,
+            overlay,
             quit_confirmation: false,
             should_quit: false,
             status: None,
@@ -203,11 +193,17 @@ impl App {
                 self.start_compile();
                 initial_compile_requested = true;
             }
-            if let Some(action) = input::resolve(
-                event::read(&self.internal_events)?,
-                self.input_mode(),
-                &self.keymap,
-            ) {
+            let event = event::read(&self.internal_events)?;
+            let component_action = if self.overlay.is_open() {
+                self.overlay.handle_event(&event)
+            } else if self.input_mode() == InputMode::Normal && self.focus == Pane::Editor {
+                self.editor.handle_event(&event)
+            } else {
+                None
+            };
+            if let Some(action) =
+                component_action.or_else(|| input::resolve(event, self.input_mode(), &self.keymap))
+            {
                 self.update(action);
             }
         }
@@ -219,40 +215,33 @@ impl App {
         if self.quit_confirmation {
             return InputMode::QuitConfirmation;
         }
-        match self.overlay {
-            Overlay::Palette(_) | Overlay::Prompt(_) => InputMode::Overlay,
-            Overlay::Search(_) => InputMode::Search,
-            Overlay::Help(_) => InputMode::Help,
-            Overlay::Confirm(_) => InputMode::Confirmation,
-            Overlay::None if self.welcome.is_some() => InputMode::Welcome,
-            Overlay::None => InputMode::Normal,
+        if let Some(mode) = self.overlay.input_mode() {
+            mode
+        } else if self.welcome.is_some() {
+            InputMode::Welcome
+        } else {
+            InputMode::Normal
         }
     }
 
     fn update(&mut self, action: Action) {
         match action {
-            Action::CloseOverlay => self.overlay = Overlay::None,
+            Action::CloseOverlay => self.overlay.close(),
             Action::OverlayInput(_)
             | Action::OverlayInputText(_)
             | Action::OverlayBackspace
             | Action::OverlayMove(_)
             | Action::OverlaySubmit => self.update_overlay(action),
-            Action::OpenCommandPalette => {
-                self.overlay = Overlay::Palette(CommandPalette::default());
-            }
-            Action::OpenHelp => self.overlay = Overlay::Help(Help::default()),
-            Action::OpenGoToLine => {
-                self.overlay = Overlay::Prompt(Prompt::new(PromptKind::GoToLine, ""));
-            }
+            Action::OpenCommandPalette => self.overlay.open_palette(),
+            Action::OpenHelp => self.overlay.open_help(),
+            Action::OpenGoToLine => self.overlay.open_prompt(PromptKind::GoToLine, ""),
             Action::OpenFind => self.open_search(SearchMode::Find),
             Action::OpenReplace => self.open_search(SearchMode::Replace),
             Action::NewDocument => self.start_new_document(),
             Action::OpenFile => self.open_file_prompt(),
             Action::SearchNext(reverse) => self.search_next(reverse),
             Action::SearchToggleField => {
-                if let Overlay::Search(search) = &mut self.overlay {
-                    search.toggle_field();
-                }
+                self.overlay.toggle_search_field();
             }
             Action::ReplaceCurrent => self.replace_current(),
             Action::Copy => self.copy_selection(),
@@ -297,9 +286,9 @@ impl App {
             Action::Move(Motion::Down) if self.focus == Pane::Preview => {
                 self.preview.scroll_lines(1);
             }
-            Action::RequestQuit if self.document.is_dirty() => {
+            Action::RequestQuit if self.editor.is_dirty() => {
                 self.quit_confirmation = true;
-                self.overlay = Overlay::None;
+                self.overlay.close();
                 self.status = None;
             }
             Action::RequestQuit | Action::Quit => self.should_quit = true,
@@ -315,72 +304,23 @@ impl App {
             return;
         }
         if let Some(welcome) = &mut self.welcome
-            && matches!(self.overlay, Overlay::None)
+            && !self.overlay.is_open()
         {
-            if let Action::OverlayMove(direction) = action {
-                welcome.move_selection(direction);
-            }
+            welcome.update(action);
             return;
         }
-        let mut query_changed = false;
-        let mut query_origin = None;
-        match (&mut self.overlay, action) {
-            (Overlay::Palette(palette), Action::OverlayInput(character)) => {
-                palette.input(character);
-            }
-            (Overlay::Palette(palette), Action::OverlayInputText(text)) => {
-                palette.input_text(&text);
-            }
-            (Overlay::Palette(palette), Action::OverlayBackspace) => palette.backspace(),
-            (Overlay::Palette(palette), Action::OverlayMove(direction)) => {
-                palette.move_selection(direction);
-            }
-            (Overlay::Prompt(prompt), Action::OverlayInput(character)) => {
-                prompt.input(character);
-            }
-            (Overlay::Prompt(prompt), Action::OverlayInputText(text)) => {
-                prompt.input_text(&text);
-            }
-            (Overlay::Prompt(prompt), Action::OverlayBackspace) => prompt.backspace(),
-            (Overlay::Search(search), Action::OverlayInput(character)) => {
-                query_changed = search.query_is_active();
-                query_origin = query_changed
-                    .then(|| {
-                        self.document
-                            .selection_byte_range()
-                            .map(|range| range.start)
-                    })
-                    .flatten();
-                search.input(character);
-            }
-            (Overlay::Search(search), Action::OverlayInputText(text)) => {
-                query_changed = search.query_is_active();
-                query_origin = query_changed
-                    .then(|| {
-                        self.document
-                            .selection_byte_range()
-                            .map(|range| range.start)
-                    })
-                    .flatten();
-                search.input_text(&text);
-            }
-            (Overlay::Search(search), Action::OverlayBackspace) => {
-                query_changed = search.query_is_active();
-                query_origin = query_changed
-                    .then(|| {
-                        self.document
-                            .selection_byte_range()
-                            .map(|range| range.start)
-                    })
-                    .flatten();
-                search.backspace();
-            }
-            (Overlay::Help(help), Action::OverlayMove(direction)) => help.scroll(direction),
-            _ => {}
-        }
+        let query_changed = self.overlay.search_query_is_active()
+            && matches!(
+                action,
+                Action::OverlayInput(_) | Action::OverlayInputText(_) | Action::OverlayBackspace
+            );
+        let query_origin = query_changed
+            .then(|| self.editor.selection_byte_range().map(|range| range.start))
+            .flatten();
+        self.overlay.update(action);
         if query_changed {
             if let Some(origin) = query_origin {
-                let _ = self.document.set_cursor_byte_index(origin);
+                let _ = self.editor.set_cursor_byte_index(origin);
                 self.editor.reset_preferred_visual_column();
             }
             self.search_next(false);
@@ -389,27 +329,23 @@ impl App {
 
     fn submit_overlay(&mut self) {
         if let Some(welcome) = &self.welcome
-            && matches!(self.overlay, Overlay::None)
+            && !self.overlay.is_open()
         {
             match welcome.selected() {
                 WelcomeChoice::NewDocument => self.start_new_document(),
                 WelcomeChoice::OpenFile => self.open_file_prompt(),
                 WelcomeChoice::OpenRecent => {
-                    self.status = Some("No recent files".to_owned());
+                    self.status = Some("Recent files are not available yet".to_owned());
                 }
             }
             return;
         }
 
-        match std::mem::take(&mut self.overlay) {
-            Overlay::Palette(palette) => {
-                if let Some(command) = palette.selected() {
-                    self.execute_command(command);
-                }
-            }
-            Overlay::Prompt(prompt) => self.submit_prompt(prompt),
-            Overlay::Confirm(confirmation) => self.confirm(confirmation.intent),
-            Overlay::Search(_) | Overlay::Help(_) | Overlay::None => {}
+        match self.overlay.submit() {
+            Some(OverlaySubmission::Command(command)) => self.execute_command(command),
+            Some(OverlaySubmission::Prompt(prompt)) => self.submit_prompt(prompt),
+            Some(OverlaySubmission::Confirm(intent)) => self.confirm(intent),
+            None => {}
         }
     }
 
@@ -418,17 +354,11 @@ impl App {
             Command::OpenFile => self.open_file_prompt(),
             Command::Export(format) => {
                 let path = self.default_export_path(format);
-                self.overlay = Overlay::Prompt(Prompt::new(
-                    PromptKind::Export(format),
-                    path.to_string_lossy(),
-                ));
+                self.overlay
+                    .open_prompt(PromptKind::Export(format), path.to_string_lossy());
             }
-            Command::GoToLine => {
-                self.overlay = Overlay::Prompt(Prompt::new(PromptKind::GoToLine, ""));
-            }
-            Command::GoToPage => {
-                self.overlay = Overlay::Prompt(Prompt::new(PromptKind::GoToPage, ""));
-            }
+            Command::GoToLine => self.overlay.open_prompt(PromptKind::GoToLine, ""),
+            Command::GoToPage => self.overlay.open_prompt(PromptKind::GoToPage, ""),
             Command::ToggleDiagnostics => self.diagnostics.toggle(),
             Command::ToggleFileExplorer => self.toggle_explorer(),
             Command::UseDarkTheme => self.set_theme(ThemeName::Dark),
@@ -488,50 +418,39 @@ impl App {
             ConfirmIntent::Open(path) | ConfirmIntent::SaveAs(path) => path,
             ConfirmIntent::Export(_, path) => path,
         };
-        self.overlay = Overlay::Confirm(Confirmation {
-            message: format!("Overwrite {}?", path.display()),
-            intent,
-        });
+        self.overlay
+            .confirm(format!("Overwrite {}?", path.display()), intent);
     }
 
     fn request_open(&mut self, path: PathBuf) {
-        if self.document.is_dirty() {
-            self.overlay = Overlay::Confirm(Confirmation {
-                message: "Discard unsaved changes and open file?".to_owned(),
-                intent: ConfirmIntent::Open(path),
-            });
+        if self.editor.is_dirty() {
+            self.overlay.confirm(
+                "Discard unsaved changes and open file?".to_owned(),
+                ConfirmIntent::Open(path),
+            );
         } else {
             self.open_path(path);
         }
     }
 
     fn open_path(&mut self, path: PathBuf) {
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+        let opened = match Workspace::read_source(&path) {
+            Ok(opened) => opened,
             Err(error) => {
-                self.status = Some(format!("Open failed: {error}"));
+                self.status = Some(error);
                 return;
             }
         };
-        let root = if path.starts_with(&self.root) {
-            self.root.clone()
-        } else {
-            path.parent()
-                .map_or_else(|| self.root.clone(), Path::to_owned)
-        };
+        let root = self.workspace.root_for_open(&path);
         let watch_error = self.watcher.retarget(&root, Some(&path)).err();
-        self.document = Document::new(&text);
-        self.editor = Editor::new(&text, self.theme);
+        self.editor.replace_document(&opened.text);
         self.preview.clear();
         self.preview_render_cache = RenderCache::default();
         self.preview_stale = false;
-        self.diagnostics = Diagnostics::default();
+        self.diagnostics = Diagnostics::new(self.theme);
         self.document_sync = None;
         self.compiled_document = None;
-        self.path = Some(path.clone());
-        self.root = root.clone();
-        self.display_name = display_name(Some(&path));
+        self.workspace.opened(path, root.clone());
         self.explorer.set_root(root);
         self.welcome = None;
         self.focus = Pane::Editor;
@@ -550,12 +469,12 @@ impl App {
     }
 
     fn open_file_prompt(&mut self) {
-        self.overlay = Overlay::Prompt(Prompt::new(PromptKind::OpenFile, ""));
+        self.overlay.open_prompt(PromptKind::OpenFile, "");
     }
 
     fn save(&mut self) {
-        let Some(path) = self.path.clone() else {
-            self.overlay = Overlay::Prompt(Prompt::new(PromptKind::SaveAs, ""));
+        let Some(path) = self.workspace.path().map(Path::to_owned) else {
+            self.overlay.open_prompt(PromptKind::SaveAs, "");
             return;
         };
         self.write_document(&path);
@@ -565,13 +484,12 @@ impl App {
         if !self.write_document(&path) {
             return;
         }
-        self.path = Some(path.clone());
-        self.root = path
-            .parent()
-            .map_or_else(|| self.root.clone(), Path::to_owned);
-        let watch_error = self.watcher.retarget(&self.root, Some(&path)).err();
-        self.display_name = display_name(Some(&path));
-        self.explorer.set_root(self.root.clone());
+        self.workspace.saved_as(path.clone());
+        let watch_error = self
+            .watcher
+            .retarget(self.workspace.root(), Some(&path))
+            .err();
+        self.explorer.set_root(self.workspace.root().to_owned());
         self.start_compile_with_world();
         if let Some(error) = watch_error {
             self.status = Some(format!("File watch failed: {error}"));
@@ -579,52 +497,38 @@ impl App {
     }
 
     fn write_document(&mut self, path: &Path) -> bool {
-        match fs::write(path, self.document.text()) {
+        match Workspace::write_source(path, &self.editor.text()) {
             Ok(()) => {
-                self.document.mark_saved();
+                self.editor.mark_saved();
                 self.status = Some(format!("Saved {}", path.display()));
                 true
             }
             Err(error) => {
-                self.status = Some(format!("Save failed: {error}"));
+                self.status = Some(error);
                 false
             }
         }
     }
 
     fn resolve_path(&mut self, value: &str) -> Option<PathBuf> {
-        if value.is_empty() {
-            self.status = Some("A path is required".to_owned());
-            return None;
-        }
-        let path = PathBuf::from(value);
-        if path.is_absolute() {
-            Some(path)
-        } else {
-            match std::env::current_dir() {
-                Ok(current) => Some(current.join(path)),
-                Err(error) => {
-                    self.status = Some(format!("Could not resolve path: {error}"));
-                    None
-                }
+        match self.workspace.resolve_path(value) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                self.status = Some(error);
+                None
             }
         }
     }
 
     fn default_export_path(&self, format: ExportFormat) -> PathBuf {
-        let mut path = self
-            .path
-            .clone()
-            .unwrap_or_else(|| self.root.join("untitled.typ"));
-        path.set_extension(format.extension());
-        path
+        self.workspace.default_export_path(format)
     }
 
     fn start_export(&mut self, format: ExportFormat, path: PathBuf) {
         let Some((_, document)) = self
             .compiled_document
             .as_ref()
-            .filter(|(revision, _)| *revision == self.document.revision() && !self.preview_stale)
+            .filter(|(revision, _)| *revision == self.editor.revision() && !self.preview_stale)
         else {
             self.status = Some("Current document is not compiled yet".to_owned());
             return;
@@ -647,7 +551,7 @@ impl App {
     fn go_to_line(&mut self, value: &str) {
         let line = value.parse::<usize>().ok().filter(|line| *line > 0);
         if let Some(line) = line
-            && self.document.set_cursor_line_char(line - 1, 0)
+            && self.editor.set_cursor_line_char(line - 1, 0)
         {
             self.editor.reset_preferred_visual_column();
             self.focus = Pane::Editor;
@@ -670,6 +574,15 @@ impl App {
     fn set_theme(&mut self, name: ThemeName) {
         self.theme = Theme::new(name, self.color_depth);
         self.editor.set_theme(self.theme);
+        self.preview.set_theme(self.theme);
+        self.diagnostics.set_theme(self.theme);
+        self.explorer.set_theme(self.theme);
+        if let Some(welcome) = &mut self.welcome {
+            welcome.set_theme(self.theme);
+        }
+        self.header.set_theme(self.theme);
+        self.status_bar.set_theme(self.theme);
+        self.overlay.set_theme(self.theme);
         self.status = Some(format!("Theme: {}", name.as_str()));
     }
 
@@ -692,13 +605,13 @@ impl App {
     }
 
     fn update_editor(&mut self, action: Action) {
-        let revision = self.document.revision();
-        let cursor = self.document.cursor_byte_index();
-        self.editor.update(&action, &mut self.document);
-        if self.document.revision() != revision {
+        let revision = self.editor.revision();
+        let cursor = self.editor.cursor_byte_index();
+        self.editor.update(action);
+        if self.editor.revision() != revision {
             let generation = if self.world_rebuild_pending {
                 self.compile_worker.invalidate()
-            } else if let Some(edit) = self.document.last_edit() {
+            } else if let Some(edit) = self.editor.last_edit() {
                 self.compile_worker.apply_edit(edit)
             } else {
                 self.compile_worker.invalidate()
@@ -715,30 +628,29 @@ impl App {
             self.cursor_sync_deadline = None;
             self.compile_state = CompileState::Stale;
             self.preview_stale = true;
-        } else if self.document.cursor_byte_index() != cursor {
+        } else if self.editor.cursor_byte_index() != cursor {
             self.cursor_sync_deadline = Some(Instant::now() + CURSOR_SYNC_DELAY);
         }
         self.status = None;
     }
 
     fn open_search(&mut self, mode: SearchMode) {
-        let query = self.document.selected_text().unwrap_or_default();
-        self.overlay = Overlay::Search(Search::new(mode, query));
+        let query = self.editor.selected_text().unwrap_or_default();
+        self.overlay.open_search(mode, query);
     }
 
     fn search_next(&mut self, reverse: bool) {
-        let query = match &self.overlay {
-            Overlay::Search(search) => search.query().to_owned(),
-            _ => return,
+        let Some(query) = self.overlay.search_query().map(str::to_owned) else {
+            return;
         };
         if query.is_empty() {
             return;
         }
-        let Some(range) = self.document.find(&query, reverse) else {
+        let Some(range) = self.editor.find(&query, reverse) else {
             self.status = Some(format!("No matches for {query}"));
             return;
         };
-        if self.document.select_byte_range(range) {
+        if self.editor.select_byte_range(range) {
             self.editor.reset_preferred_visual_column();
             self.cursor_sync_deadline = Some(Instant::now() + CURSOR_SYNC_DELAY);
             self.status = None;
@@ -746,21 +658,22 @@ impl App {
     }
 
     fn replace_current(&mut self) {
-        let (query, replacement, can_replace) = match &self.overlay {
-            Overlay::Search(search) => (
-                search.query().to_owned(),
-                search.replacement().to_owned(),
-                search.can_replace(),
-            ),
-            _ => return,
+        let Some((query, replacement, can_replace)) =
+            self.overlay
+                .search_replace()
+                .map(|(query, replacement, can_replace)| {
+                    (query.to_owned(), replacement.to_owned(), can_replace)
+                })
+        else {
+            return;
         };
         if !can_replace || query.is_empty() {
             return;
         }
-        if self.document.selected_text().as_deref() != Some(query.as_str()) {
+        if self.editor.selected_text().as_deref() != Some(query.as_str()) {
             self.search_next(false);
         }
-        if self.document.selected_text().as_deref() != Some(query.as_str()) {
+        if self.editor.selected_text().as_deref() != Some(query.as_str()) {
             return;
         }
         if replacement.is_empty() {
@@ -772,7 +685,7 @@ impl App {
     }
 
     fn copy_selection(&mut self) {
-        let Some(text) = self.document.selected_text() else {
+        let Some(text) = self.editor.selected_text() else {
             self.status = Some("No selection to copy".to_owned());
             return;
         };
@@ -785,7 +698,7 @@ impl App {
     }
 
     fn cut_selection(&mut self) {
-        let Some(text) = self.document.selected_text() else {
+        let Some(text) = self.editor.selected_text() else {
             self.status = Some("No selection to cut".to_owned());
             return;
         };
@@ -812,10 +725,7 @@ impl App {
     fn mouse_down(&mut self, column: u16, row: u16) {
         if self.preview.contains(column, row) {
             self.click_preview(column, row);
-        } else if self
-            .editor
-            .place_cursor(&mut self.document, column, row, false)
-        {
+        } else if self.editor.place_cursor(column, row, false) {
             self.focus = Pane::Editor;
             self.cursor_sync_deadline = Some(Instant::now() + CURSOR_SYNC_DELAY);
             self.status = None;
@@ -823,10 +733,7 @@ impl App {
     }
 
     fn mouse_drag(&mut self, column: u16, row: u16) {
-        if self
-            .editor
-            .place_cursor(&mut self.document, column, row, true)
-        {
+        if self.editor.place_cursor(column, row, true) {
             self.focus = Pane::Editor;
             self.cursor_sync_deadline = Some(Instant::now() + CURSOR_SYNC_DELAY);
             self.status = None;
@@ -838,7 +745,7 @@ impl App {
             self.preview.scroll_lines(lines);
             self.focus = Pane::Preview;
         } else if self.editor.contains(column, row) {
-            self.editor.scroll_lines(lines, &self.document);
+            self.editor.scroll_lines(lines);
             self.focus = Pane::Editor;
         }
     }
@@ -897,7 +804,7 @@ impl App {
         self.compile_debounce.cancel();
         self.preview_target_width = self.preview.target_width();
         self.compile_generation = self.compile_worker.spawn(
-            self.document.revision(),
+            self.editor.revision(),
             self.picker.clone(),
             self.preview.target_width(),
             self.preview_render_cache.clone(),
@@ -910,19 +817,16 @@ impl App {
         self.compile_debounce.cancel();
         self.world_rebuild_pending = true;
         self.preview_target_width = self.preview.target_width();
-        let main = self
-            .path
-            .clone()
-            .unwrap_or_else(|| self.root.join("untitled.typ"));
+        let main = self.workspace.main_path();
         self.compile_generation = self.compile_worker.spawn_with_world(
-            self.document.revision(),
+            self.editor.revision(),
             self.picker.clone(),
             self.preview.target_width(),
             self.preview_render_cache.clone(),
             WorldRebuild {
-                root: self.root.clone(),
+                root: self.workspace.root().to_owned(),
                 main,
-                source: self.document.text(),
+                source: self.editor.text(),
             },
         );
         self.compile_state = CompileState::Compiling;
@@ -933,7 +837,7 @@ impl App {
         if result.generation != self.compile_generation {
             return;
         }
-        if result.revision != self.document.revision() {
+        if result.revision != self.editor.revision() {
             self.compile_state = CompileState::Stale;
             self.status = None;
             return;
@@ -961,6 +865,7 @@ impl App {
             } => {
                 self.preview.replace_pages(pages);
                 self.diagnostics.set_items(diagnostics);
+                self.editor.set_diagnostics(&self.diagnostics);
                 self.document_sync = Some((result.revision, sync));
                 self.compiled_document = Some((result.revision, *document));
                 self.preview_render_cache = render_cache;
@@ -976,6 +881,7 @@ impl App {
                     .count();
                 self.status = diagnostics.first().map(format_diagnostic);
                 self.diagnostics.set_items(diagnostics);
+                self.editor.set_diagnostics(&self.diagnostics);
                 self.compile_state = CompileState::Failed(errors);
             }
             CompileResultKind::Error(error) => {
@@ -995,7 +901,7 @@ impl App {
         if diagnostic.is_main
             && let Some(line) = diagnostic.line
             && self
-                .document
+                .editor
                 .set_cursor_line_char(line, diagnostic.column.unwrap_or(0))
         {
             self.editor.reset_preferred_visual_column();
@@ -1014,12 +920,12 @@ impl App {
         let Some(byte) = self
             .document_sync
             .as_ref()
-            .filter(|(revision, _)| *revision == self.document.revision())
+            .filter(|(revision, _)| *revision == self.editor.revision())
             .and_then(|(_, sync)| sync.source_from_click(position))
         else {
             return;
         };
-        if self.document.set_cursor_byte_index(byte) {
+        if self.editor.set_cursor_byte_index(byte) {
             self.editor.reset_preferred_visual_column();
             self.focus = Pane::Editor;
             self.cursor_sync_deadline = None;
@@ -1034,8 +940,8 @@ impl App {
         let position = self
             .document_sync
             .as_ref()
-            .filter(|(revision, _)| *revision == self.document.revision())
-            .and_then(|(_, sync)| sync.position_from_cursor(self.document.cursor_byte_index()));
+            .filter(|(revision, _)| *revision == self.editor.revision())
+            .and_then(|(_, sync)| sync.position_from_cursor(self.editor.cursor_byte_index()));
         if let Some(position) = position {
             self.preview.scroll_to(position);
         }
@@ -1044,10 +950,10 @@ impl App {
     fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
         frame.render_widget(Block::default().style(base(&self.theme)), area);
-        if let Some(welcome) = &self.welcome {
+        if let Some(welcome) = &mut self.welcome {
             self.editor.hide();
             self.preview.hide();
-            welcome.draw(frame, area, &self.theme);
+            welcome.draw(frame, area, true);
             if let Some(status) = &self.status {
                 frame.render_widget(
                     Paragraph::new(status.as_str())
@@ -1070,24 +976,14 @@ impl App {
         ])
         .areas(frame.area());
 
-        let dirty_marker = if self.document.is_dirty() { " ●" } else { "" };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    " typst-tui ",
-                    Style::default()
-                        .fg(color(self.theme.accent))
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format!("{}{}", self.display_name, dirty_marker)),
-                Span::styled(
-                    format!(" | {}", self.compile_label()),
-                    Style::default().fg(color(self.compile_color())),
-                ),
-                Span::styled(" | ? help", Style::default().fg(color(self.theme.muted))),
-            ])),
-            header_area,
-        );
+        let header_state = HeaderState {
+            display_name: self.workspace.display_name().to_owned(),
+            dirty: self.editor.is_dirty(),
+            compile_label: self.compile_label(),
+            compile_color: self.compile_color(),
+        };
+        self.header.set_state(header_state);
+        self.header.draw(frame, header_area, false);
 
         let (workspace_area, diagnostics_area) = if self.diagnostics.is_visible() {
             let height = self.diagnostics.drawer_height(content_area.height);
@@ -1100,7 +996,7 @@ impl App {
         };
         self.draw_workspace(frame, workspace_area);
         if let Some(area) = diagnostics_area {
-            self.diagnostics.draw(frame, area, &self.theme);
+            self.diagnostics.draw(frame, area, false);
         }
         self.draw_status(frame, status_area);
     }
@@ -1110,23 +1006,21 @@ impl App {
             || self
                 .document_sync
                 .as_ref()
-                .is_some_and(|(revision, _)| *revision != self.document.revision());
+                .is_some_and(|(revision, _)| *revision != self.editor.revision());
         if self.fullscreen {
             match self.focus {
                 Pane::Explorer => {
                     self.editor.hide();
                     self.preview.hide();
-                    self.explorer.draw(frame, area, true, &self.theme);
+                    self.explorer.draw(frame, area, true);
                 }
                 Pane::Editor => {
                     self.preview.hide();
-                    self.editor
-                        .draw(frame, area, &self.document, &self.diagnostics, true)
+                    self.editor.draw(frame, area, true)
                 }
                 Pane::Preview => {
                     self.editor.hide();
-                    self.preview
-                        .draw(frame, area, true, preview_dimmed, &self.theme);
+                    self.preview.draw_preview(frame, area, true, preview_dimmed);
                 }
             }
             return;
@@ -1141,146 +1035,57 @@ impl App {
             (None, area)
         };
         if let Some(explorer_area) = explorer_area {
-            self.explorer.draw(
-                frame,
-                explorer_area,
-                self.focus == Pane::Explorer,
-                &self.theme,
-            );
+            self.explorer
+                .draw(frame, explorer_area, self.focus == Pane::Explorer);
         }
         if area.width < NARROW_WIDTH && self.focus == Pane::Explorer {
             self.editor.hide();
             self.preview.hide();
-            self.explorer.draw(frame, main_area, true, &self.theme);
+            self.explorer.draw(frame, main_area, true);
         } else if main_area.width < NARROW_WIDTH {
             self.preview.set_viewport(main_area);
             match self.focus {
                 Pane::Preview => {
                     self.editor.hide();
                     self.preview
-                        .draw(frame, main_area, true, preview_dimmed, &self.theme);
+                        .draw_preview(frame, main_area, true, preview_dimmed);
                 }
                 Pane::Explorer | Pane::Editor => {
                     self.preview.hide();
-                    self.editor
-                        .draw(frame, main_area, &self.document, &self.diagnostics, true);
+                    self.editor.draw(frame, main_area, true);
                 }
             }
         } else {
             let [editor_area, preview_area] =
                 Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
                     .areas(main_area);
-            self.editor.draw(
-                frame,
-                editor_area,
-                &self.document,
-                &self.diagnostics,
-                self.focus == Pane::Editor,
-            );
-            self.preview.draw(
+            self.editor
+                .draw(frame, editor_area, self.focus == Pane::Editor);
+            self.preview.draw_preview(
                 frame,
                 preview_area,
                 self.focus == Pane::Preview,
                 preview_dimmed,
-                &self.theme,
             );
         }
     }
 
-    fn draw_status(&self, frame: &mut Frame, area: Rect) {
-        let cursor = self.document.cursor_position();
-        let errors = self.diagnostics.errors();
-        let warnings = self.diagnostics.warnings();
-        let compile_time = self.last_compile_time.map_or_else(
-            || "--".to_owned(),
-            |time| format!("{} ms", time.as_millis()),
-        );
-        let (status, foreground) = if self.quit_confirmation {
-            (
-                format!(
-                    "Unsaved changes. {} quit, {} cancel",
-                    self.keymap.display("confirm"),
-                    self.keymap.display("cancel_confirmation")
-                ),
-                self.theme.warning,
-            )
-        } else if let Some(status) = &self.status {
-            (status.clone(), self.theme.foreground)
-        } else {
-            (
-                if self.document.selection_graphemes() == 0 {
-                    format!("Ln {}, Col {}", cursor.line + 1, cursor.column + 1)
-                } else {
-                    format!(
-                        "Ln {}, Col {} | {} selected",
-                        cursor.line + 1,
-                        cursor.column + 1,
-                        self.document.selection_graphemes()
-                    )
-                },
-                self.theme.muted,
-            )
-        };
-        let diagnostic_color = if errors > 0 {
-            self.theme.error
-        } else if warnings > 0 {
-            self.theme.warning
-        } else {
-            self.theme.muted
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    format!(" {status} | "),
-                    Style::default().fg(color(foreground)),
-                ),
-                Span::styled(
-                    format!(
-                        "{} words | {errors} errors, {warnings} warnings",
-                        self.document.word_count()
-                    ),
-                    Style::default().fg(color(diagnostic_color)),
-                ),
-                Span::styled(
-                    format!(" | {compile_time}"),
-                    Style::default().fg(color(self.theme.muted)),
-                ),
-            ]))
-            .style(Style::default().bg(color(self.theme.surface))),
-            area,
-        );
+    fn draw_status(&mut self, frame: &mut Frame, area: Rect) {
+        self.status_bar.set_state(StatusBarState {
+            cursor: self.editor.cursor_position(),
+            selection_graphemes: self.editor.selection_graphemes(),
+            word_count: self.editor.word_count(),
+            errors: self.diagnostics.errors(),
+            warnings: self.diagnostics.warnings(),
+            compile_time: self.last_compile_time,
+            message: self.status.clone(),
+            quit_confirmation: self.quit_confirmation,
+        });
+        self.status_bar.draw(frame, area, false);
     }
 
-    fn draw_overlay(&self, frame: &mut Frame) {
-        match &self.overlay {
-            Overlay::None => {}
-            Overlay::Palette(palette) => palette.draw(frame, &self.theme),
-            Overlay::Prompt(prompt) => prompt.draw(frame, &self.theme),
-            Overlay::Search(search) => search.draw(frame, &self.theme),
-            Overlay::Help(help) => help.draw(frame, frame.area(), &self.keymap, &self.theme),
-            Overlay::Confirm(confirmation) => {
-                let area = modal_area(frame.area(), 72, 5);
-                frame.render_widget(Clear, area);
-                frame.render_widget(
-                    Paragraph::new(format!(
-                        "{}\n{} confirm | {} cancel",
-                        confirmation.message,
-                        self.keymap.display("confirm"),
-                        self.keymap.display("cancel_confirmation")
-                    ))
-                    .centered()
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_type(BorderType::Rounded)
-                            .border_style(Style::default().fg(color(self.theme.warning)))
-                            .style(base(&self.theme))
-                            .title(" Confirm "),
-                    ),
-                    area,
-                );
-            }
-        }
+    fn draw_overlay(&mut self, frame: &mut Frame) {
+        self.overlay.draw(frame, frame.area(), true);
     }
 
     fn compile_label(&self) -> String {
@@ -1304,13 +1109,6 @@ impl App {
     }
 }
 
-fn display_name(path: Option<&Path>) -> String {
-    path.and_then(Path::file_name).map_or_else(
-        || "Untitled".to_owned(),
-        |name| name.to_string_lossy().into_owned(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1325,7 +1123,7 @@ mod tests {
     use typst_tui_compiler::Compiler;
     use typst_tui_config::Config;
 
-    use super::{App, CompileDebounce, CompileState};
+    use super::{App, AppInit, CompileDebounce, CompileState};
 
     #[test]
     fn compile_debounce_restarts_after_each_edit() {
@@ -1348,15 +1146,15 @@ mod tests {
         let source = fs::read_to_string(&main)?;
         let compiler = Compiler::new(&root, &main)?;
         let runtime = tokio::runtime::Builder::new_multi_thread().build()?;
-        let mut app = App::new(
-            Some(main),
+        let mut app = App::new(AppInit {
+            path: Some(main),
             root,
-            &source,
+            text: &source,
             compiler,
-            Picker::halfblocks(),
-            runtime.handle().clone(),
-            Config::default(),
-        )
+            picker: Picker::halfblocks(),
+            runtime: runtime.handle().clone(),
+            config: Config::default(),
+        })
         .map_err(std::io::Error::other)?;
 
         app.preview.set_viewport(Rect::new(0, 0, 42, 20));
@@ -1393,17 +1191,17 @@ mod tests {
         config
             .keys
             .insert("cancel_confirmation".to_owned(), vec!["alt+n".to_owned()]);
-        let mut app = App::new(
-            Some(main),
+        let mut app = App::new(AppInit {
+            path: Some(main),
             root,
-            "one two",
+            text: "one two",
             compiler,
-            Picker::halfblocks(),
-            runtime.handle().clone(),
+            picker: Picker::halfblocks(),
+            runtime: runtime.handle().clone(),
             config,
-        )
+        })
         .map_err(std::io::Error::other)?;
-        app.document.insert_char('x');
+        crate::components::Component::update(&mut app.editor, crate::action::Action::Insert('x'));
         app.compile_state = CompileState::Ready;
         let mut terminal = Terminal::new(TestBackend::new(100, 20))?;
         terminal.draw(|frame| app.draw(frame))?;

@@ -14,7 +14,9 @@ use typst_tui_compiler::PagePosition;
 use typst_tui_render::RenderedDocument;
 use typst_tui_theme::Theme;
 
-use crate::style::color;
+use crate::{action::Action, style::color};
+
+use super::Component;
 
 pub(crate) struct Preview {
     pages: Vec<SlicedProtocol>,
@@ -22,16 +24,18 @@ pub(crate) struct Preview {
     viewport: Size,
     inner: Rect,
     zoom: u16,
+    theme: Theme,
 }
 
 impl Preview {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(theme: Theme) -> Self {
         Self {
             pages: Vec::new(),
             scroll: 0,
             viewport: Size::new(40, 20),
             inner: Rect::default(),
             zoom: 100,
+            theme,
         }
     }
 
@@ -188,16 +192,23 @@ impl Preview {
         self.clamp_scroll();
     }
 
-    pub(crate) fn draw(
+    pub(crate) fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+    }
+
+    pub(crate) fn draw_preview(
         &mut self,
         frame: &mut Frame,
         area: Rect,
         focused: bool,
         dimmed: bool,
-        theme: &Theme,
     ) {
         self.set_viewport(area);
-        let border_color = if focused { theme.accent } else { theme.border };
+        let border_color = if focused {
+            self.theme.accent
+        } else {
+            self.theme.border
+        };
         let title = if self.pages.is_empty() {
             " Preview ".to_owned()
         } else {
@@ -242,7 +253,7 @@ impl Preview {
             if divider_y >= 0 && divider_y < i64::from(inner.height) {
                 frame.render_widget(
                     Paragraph::new("-".repeat(usize::from(inner.width)))
-                        .style(Style::default().fg(color(theme.border))),
+                        .style(Style::default().fg(color(self.theme.border))),
                     Rect::new(inner.x, inner.y + divider_y as u16, inner.width, 1),
                 );
             }
@@ -261,8 +272,8 @@ impl Preview {
                 .viewport_content_length(usize::from(inner.height));
             frame.render_stateful_widget(
                 Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                    .thumb_style(Style::default().fg(color(theme.muted)))
-                    .track_style(Style::default().fg(color(theme.border))),
+                    .thumb_style(Style::default().fg(color(self.theme.muted)))
+                    .track_style(Style::default().fg(color(self.theme.border))),
                 inner,
                 &mut state,
             );
@@ -317,7 +328,25 @@ impl Preview {
 
 impl Default for Preview {
     fn default() -> Self {
-        Self::new()
+        Self::new(Theme::new(
+            typst_tui_theme::ThemeName::Dark,
+            typst_tui_theme::ColorDepth::Ansi16,
+        ))
+    }
+}
+
+impl Component for Preview {
+    fn update(&mut self, action: Action) {
+        match action {
+            Action::ScrollPreviewPages(pages) => self.scroll_pages(pages),
+            Action::Move(typst_tui_document::Motion::Up) => self.scroll_lines(-1),
+            Action::Move(typst_tui_document::Motion::Down) => self.scroll_lines(1),
+            _ => {}
+        }
+    }
+
+    fn draw(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
+        self.draw_preview(frame, area, focused, false);
     }
 }
 
@@ -344,9 +373,9 @@ mod tests {
     fn draws_empty_preview_state() -> Result<(), Infallible> {
         let backend = TestBackend::new(30, 6);
         let mut terminal = Terminal::new(backend)?;
-        let mut preview = Preview::new();
+        let mut preview = Preview::new(theme());
 
-        terminal.draw(|frame| preview.draw(frame, frame.area(), true, false, &theme()))?;
+        terminal.draw(|frame| preview.draw_preview(frame, frame.area(), true, false))?;
 
         let buffer = terminal.backend().buffer();
         let rendered = (0..buffer.area.height)
@@ -369,12 +398,12 @@ mod tests {
         let rendered = typst_tui_render::render(&document, 280)?;
         let pages =
             Preview::encode_pages(&Picker::halfblocks(), rendered, 28).map_err(io::Error::other)?;
-        let mut preview = Preview::new();
+        let mut preview = Preview::new(theme());
         preview.replace_pages(pages);
 
         let backend = TestBackend::new(32, 8);
         let mut terminal = Terminal::new(backend)?;
-        terminal.draw(|frame| preview.draw(frame, frame.area(), true, false, &theme()))?;
+        terminal.draw(|frame| preview.draw_preview(frame, frame.area(), true, false))?;
 
         let buffer = terminal.backend().buffer();
         let rendered = (0..buffer.area.height)
@@ -406,7 +435,7 @@ mod tests {
             x: 0.5,
             y: 1.0,
         });
-        terminal.draw(|frame| preview.draw(frame, frame.area(), true, true, &theme()))?;
+        terminal.draw(|frame| preview.draw_preview(frame, frame.area(), true, true))?;
         assert!(
             terminal
                 .backend()
@@ -430,7 +459,7 @@ mod tests {
         let rendered = typst_tui_render::render(&document, 280)?;
         let pages =
             Preview::encode_pages(&Picker::halfblocks(), rendered, 28).map_err(io::Error::other)?;
-        let mut preview = Preview::new();
+        let mut preview = Preview::new(theme());
         preview.replace_pages(pages);
         preview.set_viewport(ratatui::layout::Rect::new(0, 0, 32, 8));
 

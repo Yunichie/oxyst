@@ -10,9 +10,11 @@ use ratatui::{
 use typst_tui_compiler::{Diagnostic, DiagnosticNote, DiagnosticNoteKind, Severity};
 use typst_tui_theme::Theme;
 
-use crate::style::color;
+use crate::{action::Action, style::color};
 
-#[derive(Debug, Default)]
+use super::Component;
+
+#[derive(Debug)]
 pub(crate) struct Diagnostics {
     items: Vec<Diagnostic>,
     line_severity: BTreeMap<usize, Severity>,
@@ -23,9 +25,29 @@ pub(crate) struct Diagnostics {
     row_count: usize,
     error_count: usize,
     warning_count: usize,
+    theme: Theme,
 }
 
 impl Diagnostics {
+    pub(crate) fn new(theme: Theme) -> Self {
+        Self {
+            items: Vec::new(),
+            line_severity: BTreeMap::new(),
+            selected: None,
+            scroll: 0,
+            visible: false,
+            row_offsets: Vec::new(),
+            row_count: 0,
+            error_count: 0,
+            warning_count: 0,
+            theme,
+        }
+    }
+
+    pub(crate) fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+    }
+
     pub(crate) fn set_items(&mut self, items: Vec<Diagnostic>) {
         self.items = items;
         self.selected = self.selected.filter(|index| *index < self.items.len());
@@ -67,16 +89,18 @@ impl Diagnostics {
         available.min(8).min(available.div_ceil(3).max(3))
     }
 
-    pub(crate) fn severity_at(&self, line: usize) -> Option<Severity> {
-        self.line_severity.get(&line).copied()
-    }
-
     pub(crate) fn errors(&self) -> usize {
         self.error_count
     }
 
     pub(crate) fn warnings(&self) -> usize {
         self.warning_count
+    }
+
+    pub(crate) fn line_severities(&self) -> impl Iterator<Item = (usize, Severity)> + '_ {
+        self.line_severity
+            .iter()
+            .map(|(line, severity)| (*line, *severity))
     }
 
     pub(crate) fn select(&mut self, direction: isize) -> Option<&Diagnostic> {
@@ -95,7 +119,7 @@ impl Diagnostics {
         self.selected.and_then(|index| self.items.get(index))
     }
 
-    pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    fn draw_diagnostics(&mut self, frame: &mut Frame, area: Rect) {
         let title = format!(
             " Diagnostics | {} errors, {} warnings ",
             self.errors(),
@@ -104,7 +128,7 @@ impl Diagnostics {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(color(theme.accent)))
+            .border_style(Style::default().fg(color(self.theme.accent)))
             .title(title);
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -124,8 +148,8 @@ impl Diagnostics {
                 let diagnostic = &self.items[item_index];
                 if let Some(note) = note {
                     let note_color = match note.kind {
-                        DiagnosticNoteKind::Hint => theme.info,
-                        DiagnosticNoteKind::Trace => theme.muted,
+                        DiagnosticNoteKind::Hint => self.theme.info,
+                        DiagnosticNoteKind::Trace => self.theme.muted,
                     };
                     let line = Line::from(vec![
                         Span::styled(
@@ -138,14 +162,14 @@ impl Diagnostics {
                         Span::raw(format_note(note)),
                     ]);
                     return if self.selected == Some(item_index) {
-                        line.style(Style::default().bg(color(theme.selection)))
+                        line.style(Style::default().bg(color(self.theme.selection)))
                     } else {
                         line
                     };
                 }
                 let severity_color = match diagnostic.severity {
-                    Severity::Error => theme.error,
-                    Severity::Warning => theme.warning,
+                    Severity::Error => self.theme.error,
+                    Severity::Warning => self.theme.warning,
                 };
                 let severity = match diagnostic.severity {
                     Severity::Error => "E ",
@@ -156,7 +180,7 @@ impl Diagnostics {
                     Span::raw(format_diagnostic(diagnostic)),
                 ]);
                 if self.selected == Some(item_index) {
-                    line.style(Style::default().bg(color(theme.selection)))
+                    line.style(Style::default().bg(color(self.theme.selection)))
                 } else {
                     line
                 }
@@ -188,6 +212,27 @@ impl Diagnostics {
     }
 }
 
+impl Default for Diagnostics {
+    fn default() -> Self {
+        Self::new(Theme::new(
+            typst_tui_theme::ThemeName::Dark,
+            typst_tui_theme::ColorDepth::Ansi16,
+        ))
+    }
+}
+
+impl Component for Diagnostics {
+    fn update(&mut self, action: Action) {
+        if matches!(action, Action::ToggleDiagnostics) {
+            self.toggle();
+        }
+    }
+
+    fn draw(&mut self, frame: &mut Frame, area: Rect, _focused: bool) {
+        self.draw_diagnostics(frame, area);
+    }
+}
+
 pub(crate) fn format_diagnostic(diagnostic: &Diagnostic) -> String {
     let message = diagnostic.message.replace(['\r', '\n'], " ");
     match (&diagnostic.path, diagnostic.line, diagnostic.column) {
@@ -216,7 +261,7 @@ mod tests {
     use typst_tui_compiler::{Diagnostic, DiagnosticNote, DiagnosticNoteKind, Severity};
     use typst_tui_theme::{ColorDepth, Theme, ThemeName};
 
-    use super::Diagnostics;
+    use super::{Component, Diagnostics};
 
     fn diagnostic(severity: Severity, line: usize, message: &str) -> Diagnostic {
         Diagnostic {
@@ -258,7 +303,12 @@ mod tests {
         ]);
         diagnostics.toggle();
 
-        assert_eq!(diagnostics.severity_at(1), Some(Severity::Error));
+        assert_eq!(
+            diagnostics
+                .line_severities()
+                .find_map(|(line, severity)| (line == 1).then_some(severity)),
+            Some(Severity::Error)
+        );
         assert_eq!(
             diagnostics.select(1).map(|item| item.message.as_str()),
             Some("first warning")
@@ -271,7 +321,8 @@ mod tests {
         let backend = TestBackend::new(50, 6);
         let mut terminal = Terminal::new(backend)?;
         let theme = Theme::new(ThemeName::Dark, ColorDepth::Ansi16);
-        terminal.draw(|frame| diagnostics.draw(frame, frame.area(), &theme))?;
+        diagnostics.set_theme(theme);
+        terminal.draw(|frame| diagnostics.draw(frame, frame.area(), false))?;
 
         let rendered = terminal
             .backend()
