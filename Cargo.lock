@@ -3911,6 +3911,7 @@ dependencies = [
  "typst-tui-document",
  "typst-tui-render",
  "typst-tui-theme",
+ "unicode-segmentation",
  "unicode-width",
 ]
 

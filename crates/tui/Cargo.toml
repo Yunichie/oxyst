@@ -20,6 +20,7 @@ typst-tui-document.workspace = true
 typst-tui-render.workspace = true
 typst-tui-theme.workspace = true
 typst-syntax.workspace = true
+unicode-segmentation.workspace = true
 unicode-width.workspace = true
 
 [lints]
