@@ -1,4 +1,4 @@
-use std::{error::Error, fs, path::PathBuf};
+use std::{error::Error, fs, io, path::PathBuf};
 
 use typst_tui_compiler::{CompileOutcome, Compiler, Error as CompilerError, Severity};
 
@@ -57,4 +57,28 @@ fn rejects_a_main_file_outside_the_project_root() {
     let result = Compiler::new(&root, outside);
 
     assert!(matches!(result, Err(CompilerError::MainOutsideRoot { .. })));
+}
+
+#[test]
+fn maps_between_source_and_preview_positions() -> Result<(), Box<dyn Error>> {
+    let root = fixtures();
+    let source = read("simple.typ")?;
+    let cursor = source
+        .find("Hello from")
+        .ok_or_else(|| io::Error::other("fixture text is missing"))?;
+    let mut compiler = Compiler::new(&root, root.join("simple.typ"))?;
+    let CompileOutcome::Success(document) = compiler.compile(&source) else {
+        return Err("simple fixture failed to compile".into());
+    };
+
+    let sync = document.sync();
+    let position = sync
+        .position_from_cursor(cursor)
+        .ok_or_else(|| io::Error::other("cursor did not map to the preview"))?;
+    assert_eq!(position.page, 0);
+    assert!((0.0..=1.0).contains(&position.x));
+    assert!((0.0..=1.0).contains(&position.y));
+    assert!(sync.source_from_click(position).is_some());
+
+    Ok(())
 }

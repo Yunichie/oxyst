@@ -66,6 +66,10 @@ impl TypstWorld {
         self.files.reset();
         self.now.reset();
     }
+
+    pub(crate) fn main_source(&self) -> Source {
+        self.main_source.clone()
+    }
 }
 
 impl World for TypstWorld {

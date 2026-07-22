@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 
 mod diagnostics;
+mod sync;
 mod world;
 
 use std::path::{Path, PathBuf};
 
 pub use diagnostics::{Diagnostic, Severity};
+pub use sync::{DocumentSync, PagePosition};
 use thiserror::Error;
 use typst::diag::Warned;
 use typst_layout::{Page, PagedDocument};
@@ -54,7 +56,14 @@ impl Compiler {
         let warnings = convert_diagnostics(&self.world, warnings);
 
         match output {
-            Ok(document) => CompileOutcome::Success(CompiledDocument { document, warnings }),
+            Ok(document) => {
+                let sync = DocumentSync::new(document.clone(), self.world.main_source());
+                CompileOutcome::Success(CompiledDocument {
+                    document,
+                    warnings,
+                    sync,
+                })
+            }
             Err(errors) => {
                 let mut diagnostics = convert_diagnostics(&self.world, errors);
                 diagnostics.extend(warnings);
@@ -72,6 +81,7 @@ pub enum CompileOutcome {
 pub struct CompiledDocument {
     document: PagedDocument,
     warnings: Vec<Diagnostic>,
+    sync: DocumentSync,
 }
 
 impl CompiledDocument {
@@ -88,5 +98,10 @@ impl CompiledDocument {
     #[must_use]
     pub fn warnings(&self) -> &[Diagnostic] {
         &self.warnings
+    }
+
+    #[must_use]
+    pub fn sync(&self) -> DocumentSync {
+        self.sync.clone()
     }
 }
