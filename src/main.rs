@@ -10,13 +10,29 @@ use clap::Parser;
 struct Cli {
     /// Typst source file to edit
     file: Option<PathBuf>,
+    /// Project root used to resolve imports and assets
+    #[arg(long)]
+    root: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let text = load(&cli.file)?;
-    typst_tui_app::run(cli.file, &text)?;
+    let root = project_root(cli.root, cli.file.as_deref())?;
+    typst_tui_app::run(cli.file, root, &text)?;
     Ok(())
+}
+
+fn project_root(root: Option<PathBuf>, file: Option<&std::path::Path>) -> Result<PathBuf> {
+    if let Some(root) = root {
+        return Ok(root);
+    }
+    if let Some(parent) = file.and_then(std::path::Path::parent)
+        && !parent.as_os_str().is_empty()
+    {
+        return Ok(parent.to_owned());
+    }
+    std::env::current_dir().context("failed to determine current directory")
 }
 
 fn load(path: &Option<PathBuf>) -> Result<String> {

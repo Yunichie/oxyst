@@ -1,6 +1,13 @@
 use typst_tui_document::Motion;
 
-#[derive(Debug)]
+use crate::compile::CompileResult;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Pane {
+    Editor,
+    Preview,
+}
+
 pub(crate) enum Action {
     Insert(char),
     InsertText(String),
@@ -9,6 +16,10 @@ pub(crate) enum Action {
     Move(Motion),
     Undo,
     Redo,
+    Recompile,
+    CompileFinished(CompileResult),
+    SwitchFocus,
+    ScrollPreviewPages(isize),
     Save,
     RequestQuit,
     Quit,

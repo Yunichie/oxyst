@@ -1,22 +1,36 @@
-use std::io;
+use std::{
+    io,
+    sync::mpsc::{Receiver, TryRecvError},
+    time::Duration,
+};
 
-use crossterm::event::{self, KeyEvent, MouseEvent};
+use crossterm::event::{self, KeyEvent};
 
-#[derive(Debug)]
+use crate::compile::CompileResult;
+
 pub(crate) enum Event {
     Key(KeyEvent),
-    Mouse(MouseEvent),
     Paste(String),
-    Resize(u16, u16),
+    CompileFinished(CompileResult),
+    Tick,
     Ignored,
 }
 
-pub(crate) fn read() -> io::Result<Event> {
+pub(crate) fn read(internal: &Receiver<Event>) -> io::Result<Event> {
+    match internal.try_recv() {
+        Ok(event) => return Ok(event),
+        Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
+    }
+
+    if !event::poll(Duration::from_millis(50))? {
+        return Ok(Event::Tick);
+    }
+
     Ok(match event::read()? {
         event::Event::Key(key) => Event::Key(key),
-        event::Event::Mouse(mouse) => Event::Mouse(mouse),
+        event::Event::Mouse(_) => Event::Ignored,
         event::Event::Paste(text) => Event::Paste(text),
-        event::Event::Resize(width, height) => Event::Resize(width, height),
+        event::Event::Resize(_, _) => Event::Ignored,
         event::Event::FocusGained | event::Event::FocusLost => Event::Ignored,
     })
 }

@@ -6,16 +6,9 @@ use crate::{action::Action, event::Event};
 pub(crate) fn resolve(event: Event, confirming_quit: bool) -> Option<Action> {
     match event {
         Event::Paste(text) if !confirming_quit => Some(Action::InsertText(text)),
+        Event::CompileFinished(result) => Some(Action::CompileFinished(result)),
         Event::Key(key) if is_press(key) => resolve_key(key, confirming_quit),
-        Event::Mouse(mouse) => {
-            let _ = mouse;
-            None
-        }
-        Event::Resize(width, height) => {
-            let _ = (width, height);
-            None
-        }
-        Event::Paste(_) | Event::Key(_) | Event::Ignored => None,
+        Event::Paste(_) | Event::Key(_) | Event::Tick | Event::Ignored => None,
     }
 }
 
@@ -33,6 +26,7 @@ fn resolve_key(key: KeyEvent, confirming_quit: bool) -> Option<Action> {
 
     match key.code {
         KeyCode::Char('q' | 'Q') if control => Some(Action::RequestQuit),
+        KeyCode::Char('r' | 'R') if control => Some(Action::Recompile),
         KeyCode::Char('s' | 'S') if control => Some(Action::Save),
         KeyCode::Char('z' | 'Z') if control && shift => Some(Action::Redo),
         KeyCode::Char('z' | 'Z') if control => Some(Action::Undo),
@@ -43,6 +37,9 @@ fn resolve_key(key: KeyEvent, confirming_quit: bool) -> Option<Action> {
         KeyCode::Right => Some(Action::Move(Motion::Right)),
         KeyCode::Up => Some(Action::Move(Motion::Up)),
         KeyCode::Down => Some(Action::Move(Motion::Down)),
+        KeyCode::PageUp if control => Some(Action::ScrollPreviewPages(-1)),
+        KeyCode::PageDown if control => Some(Action::ScrollPreviewPages(1)),
+        KeyCode::Tab | KeyCode::F(6) => Some(Action::SwitchFocus),
         KeyCode::Home if control => Some(Action::Move(Motion::DocumentStart)),
         KeyCode::End if control => Some(Action::Move(Motion::DocumentEnd)),
         KeyCode::Home => Some(Action::Move(Motion::LineStart)),

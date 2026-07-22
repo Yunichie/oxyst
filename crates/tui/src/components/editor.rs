@@ -25,7 +25,14 @@ impl Editor {
             Action::Move(motion) => document.move_cursor(*motion),
             Action::Undo => document.undo(),
             Action::Redo => document.redo(),
-            Action::Save | Action::RequestQuit | Action::Quit | Action::CancelQuit => {}
+            Action::Recompile
+            | Action::CompileFinished(_)
+            | Action::SwitchFocus
+            | Action::ScrollPreviewPages(_)
+            | Action::Save
+            | Action::RequestQuit
+            | Action::Quit
+            | Action::CancelQuit => {}
         }
     }
 
