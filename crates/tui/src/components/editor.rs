@@ -25,6 +25,7 @@ use super::{Component, Diagnostics};
 pub(crate) struct Editor {
     document: Document,
     vertical_scroll: usize,
+    follow_cursor: bool,
     inner: Rect,
     text_area: Rect,
     source: Source,
@@ -45,6 +46,7 @@ impl Editor {
         Self {
             document: Document::new(text),
             vertical_scroll: 0,
+            follow_cursor: true,
             inner: Rect::default(),
             text_area: Rect::default(),
             source,
@@ -66,6 +68,7 @@ impl Editor {
 
     fn apply_action(&mut self, action: &Action) {
         let revision = self.document.revision();
+        let cursor = self.document.cursor_char_index();
         if !matches!(
             action,
             Action::Move(Motion::Up | Motion::Down) | Action::Select(Motion::Up | Motion::Down)
@@ -99,6 +102,9 @@ impl Editor {
             self.non_code_ranges = non_code_ranges(&self.source);
             self.layout_width = 0;
         }
+        if self.document.revision() != revision || self.document.cursor_char_index() != cursor {
+            self.follow_cursor = true;
+        }
     }
 
     fn draw_editor(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
@@ -131,7 +137,11 @@ impl Editor {
         let cursor = self.document.cursor_position();
         self.ensure_layout(text_area.width);
         let cursor_row = self.cursor_visual_row(cursor.line, cursor.visual_column);
-        self.keep_cursor_visible(cursor_row, text_area);
+        if self.follow_cursor {
+            self.keep_cursor_visible(cursor_row, text_area);
+        } else {
+            self.clamp_scroll(text_area.height);
+        }
 
         let visible_lines = usize::from(text_area.height);
         let end_line = (self.vertical_scroll + visible_lines).min(self.visual_rows.len());
@@ -244,15 +254,21 @@ impl Editor {
                 .start_visual_column
                 .saturating_add(usize::from(column - self.text_area.x))
         };
-        self.document
-            .set_cursor_visual_position(visual.logical_line, visual_column, selecting)
+        let placed =
+            self.document
+                .set_cursor_visual_position(visual.logical_line, visual_column, selecting);
+        if placed {
+            self.follow_cursor = true;
+        }
+        placed
     }
 
     pub(crate) fn scroll_lines(&mut self, lines: isize) {
+        self.follow_cursor = false;
         self.vertical_scroll = self
             .vertical_scroll
             .saturating_add_signed(lines)
-            .min(self.visual_rows.len().saturating_sub(1));
+            .min(self.max_scroll());
     }
 
     pub(crate) fn reset_preferred_visual_column(&mut self) {
@@ -380,6 +396,7 @@ impl Editor {
         let placed = self.document.set_cursor_byte_index(byte);
         if placed {
             self.preferred_visual_column = None;
+            self.follow_cursor = true;
         }
         placed
     }
@@ -388,6 +405,7 @@ impl Editor {
         let placed = self.document.set_cursor_line_char(line, column);
         if placed {
             self.preferred_visual_column = None;
+            self.follow_cursor = true;
         }
         placed
     }
@@ -416,8 +434,23 @@ impl Editor {
         let selected = self.document.select_byte_range(range);
         if selected {
             self.preferred_visual_column = None;
+            self.follow_cursor = true;
         }
         selected
+    }
+
+    fn max_scroll(&self) -> usize {
+        self.visual_rows
+            .len()
+            .saturating_sub(usize::from(self.text_area.height.max(1)))
+    }
+
+    fn clamp_scroll(&mut self, height: u16) {
+        self.vertical_scroll = self.vertical_scroll.min(
+            self.visual_rows
+                .len()
+                .saturating_sub(usize::from(height.max(1))),
+        );
     }
 }
 
@@ -999,6 +1032,35 @@ mod tests {
         editor.update(Action::Move(Motion::Down));
         assert_eq!(editor.cursor_position().visual_column, 3);
 
+        Ok(())
+    }
+
+    #[test]
+    fn manual_scroll_stays_put_until_the_cursor_moves() -> Result<(), Infallible> {
+        let source = (0..12)
+            .map(|line| format!("line-{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut editor = Editor::new(&source, theme());
+        let mut terminal = Terminal::new(TestBackend::new(24, 6))?;
+        terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
+
+        editor.scroll_lines(3);
+        terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
+        assert_eq!(editor.vertical_scroll, 3);
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!rendered.contains("line-0"));
+        assert!(rendered.contains("line-3"));
+
+        editor.update(Action::Move(Motion::DocumentEnd));
+        terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
+        assert_eq!(editor.vertical_scroll, editor.max_scroll());
         Ok(())
     }
 
