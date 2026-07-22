@@ -78,6 +78,7 @@ pub enum CompileOutcome {
     Failure(Vec<Diagnostic>),
 }
 
+#[derive(Clone)]
 pub struct CompiledDocument {
     document: PagedDocument,
     warnings: Vec<Diagnostic>,
@@ -103,5 +104,10 @@ impl CompiledDocument {
     #[must_use]
     pub fn sync(&self) -> DocumentSync {
         self.sync.clone()
+    }
+
+    #[must_use]
+    pub fn paged_document(&self) -> &PagedDocument {
+        &self.document
     }
 }

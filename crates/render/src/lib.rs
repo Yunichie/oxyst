@@ -1,5 +1,9 @@
 #![forbid(unsafe_code)]
 
+mod export;
+
+pub use export::{ExportFormat, export};
+
 use image::{DynamicImage, RgbaImage};
 use thiserror::Error;
 use typst_render::RenderOptions;
@@ -88,13 +92,24 @@ pub fn render(document: &CompiledDocument, target_width: u32) -> Result<Rendered
         .fold(0.0_f64, f64::max);
     let pixels_per_point =
         (f64::from(target_width) / widest_page).clamp(MIN_PIXELS_PER_POINT, MAX_PIXELS_PER_POINT);
-    validate_dimensions(document, pixels_per_point)?;
+    let pages = render_at(document, pixels_per_point)?;
 
+    Ok(RenderedDocument {
+        pages,
+        pixels_per_point,
+    })
+}
+
+fn render_at(document: &CompiledDocument, pixels_per_point: f64) -> Result<Vec<PageImage>, Error> {
+    if document.pages().is_empty() {
+        return Err(Error::EmptyDocument);
+    }
+    validate_dimensions(document, pixels_per_point)?;
     let options = RenderOptions {
         pixel_per_pt: pixels_per_point.into(),
         render_bleed: false,
     };
-    let pages = document
+    document
         .pages()
         .iter()
         .enumerate()
@@ -107,12 +122,7 @@ pub fn render(document: &CompiledDocument, target_width: u32) -> Result<Rendered
                 .ok_or(Error::InvalidPixelData { page: index + 1 })?;
             Ok(PageImage { image })
         })
-        .collect::<Result<Vec<_>, Error>>()?;
-
-    Ok(RenderedDocument {
-        pages,
-        pixels_per_point,
-    })
+        .collect()
 }
 
 fn validate_dimensions(document: &CompiledDocument, pixels_per_point: f64) -> Result<(), Error> {
