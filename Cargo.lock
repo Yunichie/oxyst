@@ -3490,6 +3490,7 @@ dependencies = [
  "ratatui-image",
  "thiserror 2.0.19",
  "tokio",
+ "typst-syntax",
  "typst-tui-compiler",
  "typst-tui-document",
  "typst-tui-render",

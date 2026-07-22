@@ -37,6 +37,7 @@ typst = "0.15.1"
 typst-kit = { version = "0.15.1", features = ["datetime", "embedded-fonts", "scan-fonts", "system-downloader", "system-packages"] }
 typst-layout = "0.15.1"
 typst-render = "0.15.1"
+typst-syntax = "0.15.1"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
 typst-tui-app = { path = "crates/tui" }

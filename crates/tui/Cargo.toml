@@ -15,6 +15,7 @@ tokio.workspace = true
 typst-tui-compiler.workspace = true
 typst-tui-document.workspace = true
 typst-tui-render.workspace = true
+typst-syntax.workspace = true
 unicode-width.workspace = true
 
 [lints]
