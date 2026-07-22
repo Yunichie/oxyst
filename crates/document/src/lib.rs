@@ -62,6 +62,7 @@ struct Edit {
 pub struct Document {
     text: Rope,
     cursor: usize,
+    selection_anchor: Option<usize>,
     preferred_visual_column: Option<usize>,
     undo: VecDeque<Edit>,
     redo: Vec<Edit>,
@@ -77,6 +78,7 @@ impl Document {
         Self {
             text: Rope::from_str(text),
             cursor: 0,
+            selection_anchor: None,
             preferred_visual_column: None,
             undo: VecDeque::new(),
             redo: Vec::new(),
@@ -126,6 +128,30 @@ impl Document {
     }
 
     #[must_use]
+    pub fn selection_char_range(&self) -> Option<Range<usize>> {
+        let anchor = self.selection_anchor?;
+        (anchor != self.cursor).then(|| anchor.min(self.cursor)..anchor.max(self.cursor))
+    }
+
+    #[must_use]
+    pub fn selection_byte_range(&self) -> Option<Range<usize>> {
+        self.selection_char_range()
+            .map(|range| self.text.char_to_byte(range.start)..self.text.char_to_byte(range.end))
+    }
+
+    #[must_use]
+    pub fn selected_text(&self) -> Option<String> {
+        self.selection_char_range()
+            .map(|range| self.text.slice(range).to_string())
+    }
+
+    #[must_use]
+    pub fn selection_graphemes(&self) -> usize {
+        self.selected_text()
+            .map_or(0, |text| text.graphemes(true).count())
+    }
+
+    #[must_use]
     pub fn is_dirty(&self) -> bool {
         self.state != self.saved_state
     }
@@ -150,6 +176,7 @@ impl Document {
         }
 
         self.cursor = cursor;
+        self.selection_anchor = None;
         self.preferred_visual_column = None;
         true
     }
@@ -162,8 +189,59 @@ impl Document {
         let line_start = self.text.line_to_char(line);
         let line_length = self.line_without_ending(line).chars().count();
         self.cursor = line_start + column.min(line_length);
+        self.selection_anchor = None;
         self.preferred_visual_column = None;
         true
+    }
+
+    pub fn set_cursor_visual_position(
+        &mut self,
+        line: usize,
+        visual_column: usize,
+        selecting: bool,
+    ) -> bool {
+        if line >= self.line_count() {
+            return false;
+        }
+
+        let anchor = selecting.then_some(self.selection_anchor.unwrap_or(self.cursor));
+        let text = self.line_without_ending(line);
+        self.cursor =
+            self.text.line_to_char(line) + char_offset_at_visual_column(&text, visual_column);
+        self.selection_anchor = anchor.filter(|anchor| *anchor != self.cursor);
+        self.preferred_visual_column = None;
+        true
+    }
+
+    pub fn select_all(&mut self) {
+        if self.text.len_chars() == 0 {
+            self.selection_anchor = None;
+            return;
+        }
+        self.selection_anchor = Some(0);
+        self.cursor = self.text.len_chars();
+        self.preferred_visual_column = None;
+    }
+
+    pub fn select_byte_range(&mut self, range: Range<usize>) -> bool {
+        if range.start > range.end || range.end > self.text.len_bytes() {
+            return false;
+        }
+        let start = self.text.byte_to_char(range.start);
+        let end = self.text.byte_to_char(range.end);
+        if self.text.char_to_byte(start) != range.start || self.text.char_to_byte(end) != range.end
+        {
+            return false;
+        }
+
+        self.selection_anchor = (start != end).then_some(start);
+        self.cursor = end;
+        self.preferred_visual_column = None;
+        true
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection_anchor = None;
     }
 
     pub fn mark_saved(&mut self) {
@@ -180,10 +258,16 @@ impl Document {
             return;
         }
 
-        self.record_edit(self.cursor, self.cursor, text);
+        let range = self
+            .selection_char_range()
+            .unwrap_or(self.cursor..self.cursor);
+        self.record_edit(range.start, range.end, text);
     }
 
     pub fn backspace(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if self.cursor == 0 {
             return;
         }
@@ -200,6 +284,9 @@ impl Document {
     }
 
     pub fn delete(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if self.cursor == self.text.len_chars() {
             return;
         }
@@ -216,17 +303,31 @@ impl Document {
     }
 
     pub fn move_cursor(&mut self, motion: Motion) {
+        self.move_cursor_selecting(motion, false);
+    }
+
+    pub fn move_cursor_selecting(&mut self, motion: Motion, selecting: bool) {
+        if !selecting && let Some(range) = self.selection_char_range() {
+            self.cursor = match motion {
+                Motion::Left | Motion::Up | Motion::WordLeft => range.start,
+                Motion::Right | Motion::Down | Motion::WordRight => range.end,
+                Motion::LineStart => self.text.line_to_char(self.text.char_to_line(self.cursor)),
+                Motion::LineEnd => self.line_content_end(self.text.char_to_line(self.cursor)),
+                Motion::DocumentStart => 0,
+                Motion::DocumentEnd => self.text.len_chars(),
+            };
+            self.selection_anchor = None;
+            self.preferred_visual_column = None;
+            return;
+        }
+
+        let anchor = selecting.then_some(self.selection_anchor.unwrap_or(self.cursor));
+        let vertical = matches!(motion, Motion::Up | Motion::Down);
         match motion {
             Motion::Left => self.cursor = self.cursor_left(),
             Motion::Right => self.cursor = self.cursor_right(),
-            Motion::Up => {
-                self.move_vertically(-1);
-                return;
-            }
-            Motion::Down => {
-                self.move_vertically(1);
-                return;
-            }
+            Motion::Up => self.move_vertically(-1),
+            Motion::Down => self.move_vertically(1),
             Motion::WordLeft => self.cursor = self.word_left(),
             Motion::WordRight => self.cursor = self.word_right(),
             Motion::LineStart => {
@@ -241,7 +342,46 @@ impl Document {
             Motion::DocumentEnd => self.cursor = self.text.len_chars(),
         }
 
-        self.preferred_visual_column = None;
+        self.selection_anchor = anchor.filter(|anchor| *anchor != self.cursor);
+        if !vertical {
+            self.preferred_visual_column = None;
+        }
+    }
+
+    #[must_use]
+    pub fn find(&self, query: &str, reverse: bool) -> Option<Range<usize>> {
+        if query.is_empty() {
+            return None;
+        }
+
+        let text = self.text.to_string();
+        let cursor = if reverse {
+            self.selection_byte_range()
+                .map_or_else(|| self.cursor_byte_index(), |range| range.start)
+        } else {
+            self.selection_byte_range()
+                .map_or_else(|| self.cursor_byte_index(), |range| range.end)
+        };
+
+        if reverse {
+            text[..cursor]
+                .rfind(query)
+                .or_else(|| text[cursor..].rfind(query).map(|offset| cursor + offset))
+        } else {
+            text[cursor..]
+                .find(query)
+                .map(|offset| cursor + offset)
+                .or_else(|| text[..cursor].find(query))
+        }
+        .map(|start| start..start + query.len())
+    }
+
+    pub fn delete_selection(&mut self) -> bool {
+        let Some(range) = self.selection_char_range() else {
+            return false;
+        };
+        self.record_edit(range.start, range.end, "");
+        true
     }
 
     pub fn undo(&mut self) {
@@ -254,6 +394,7 @@ impl Document {
         self.text.remove(edit.start..inserted_end);
         self.text.insert(edit.start, &edit.removed);
         self.cursor = edit.cursor_before;
+        self.selection_anchor = None;
         self.state = edit.state_before;
         self.preferred_visual_column = None;
         self.last_edit = Some(TextEdit {
@@ -273,6 +414,7 @@ impl Document {
         self.text.remove(edit.start..removed_end);
         self.text.insert(edit.start, &edit.inserted);
         self.cursor = edit.cursor_after;
+        self.selection_anchor = None;
         self.state = edit.state_after;
         self.preferred_visual_column = None;
         self.last_edit = Some(TextEdit {
@@ -294,6 +436,7 @@ impl Document {
         self.text.remove(start..end);
         self.text.insert(start, inserted);
         self.cursor = cursor_after;
+        self.selection_anchor = None;
         self.state = state_after;
         self.preferred_visual_column = None;
         self.redo.clear();
@@ -571,5 +714,65 @@ mod tests {
         assert_eq!(document.cursor_position().line, 1);
         assert_eq!(document.cursor_position().column, 1);
         assert!(!document.set_cursor_line_char(2, 0));
+    }
+
+    #[test]
+    fn selection_is_grapheme_correct_and_replaced_as_one_edit() {
+        let mut document = Document::new("a\u{301}界z");
+        document.move_cursor_selecting(Motion::Right, true);
+        document.move_cursor_selecting(Motion::Right, true);
+
+        assert_eq!(document.selected_text().as_deref(), Some("a\u{301}界"));
+        assert_eq!(document.selection_graphemes(), 2);
+
+        document.insert_text("X");
+        assert_eq!(document.text(), "Xz");
+        document.undo();
+        assert_eq!(document.text(), "a\u{301}界z");
+    }
+
+    #[test]
+    fn vertical_selection_keeps_its_anchor_and_preferred_column() {
+        let mut document = Document::new("abcd\nx\nabcd");
+        assert!(document.set_cursor_line_char(0, 3));
+
+        document.move_cursor_selecting(Motion::Down, true);
+        document.move_cursor_selecting(Motion::Down, true);
+
+        assert_eq!(document.cursor_position().line, 2);
+        assert_eq!(document.cursor_position().visual_column, 3);
+        assert_eq!(document.selected_text().as_deref(), Some("d\nx\nabc"));
+    }
+
+    #[test]
+    fn select_all_and_delete_are_undoable() {
+        let mut document = Document::new("one\ntwo");
+        document.select_all();
+        assert_eq!(document.selected_text().as_deref(), Some("one\ntwo"));
+        assert!(document.delete_selection());
+        assert_eq!(document.text(), "");
+
+        document.undo();
+        assert_eq!(document.text(), "one\ntwo");
+    }
+
+    #[test]
+    fn search_wraps_and_selects_unicode_matches() -> Result<(), &'static str> {
+        let mut document = Document::new("α界 beta α界");
+        let first = document
+            .find("α界", false)
+            .ok_or("fixture contains no match")?;
+        assert!(document.select_byte_range(first));
+        assert_eq!(document.selected_text().as_deref(), Some("α界"));
+
+        let second = document
+            .find("α界", false)
+            .ok_or("fixture contains no second match")?;
+        assert!(document.select_byte_range(second));
+        assert_eq!(document.selected_text().as_deref(), Some("α界"));
+
+        let wrapped = document.find("α界", false).ok_or("search did not wrap")?;
+        assert_eq!(wrapped.start, 0);
+        Ok(())
     }
 }
