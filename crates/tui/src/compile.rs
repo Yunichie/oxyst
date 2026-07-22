@@ -14,6 +14,7 @@ use typst_tui_compiler::{
     CompileOutcome, CompileSnapshot, CompiledDocument, Compiler, Diagnostic, DocumentSync,
 };
 use typst_tui_document::TextEdit;
+use typst_tui_render::RenderCache;
 
 use crate::{components::Preview, event::Event};
 
@@ -23,6 +24,8 @@ pub(crate) struct CompileResult {
     pub(crate) generation: u64,
     pub(crate) revision: u64,
     pub(crate) elapsed: Duration,
+    pub(crate) rebuilt_compiler: Option<Compiler>,
+    pub(crate) rebuild_attempted: bool,
     pub(crate) outcome: CompileResultKind,
 }
 
@@ -32,6 +35,7 @@ pub(crate) enum CompileResultKind {
         diagnostics: Vec<Diagnostic>,
         sync: DocumentSync,
         document: Box<CompiledDocument>,
+        render_cache: RenderCache,
     },
     Diagnostics(Vec<Diagnostic>),
     Error(String),
@@ -40,9 +44,21 @@ pub(crate) enum CompileResultKind {
 struct CompileRequest {
     generation: u64,
     revision: u64,
-    snapshot: CompileSnapshot,
+    input: CompileInput,
     picker: Picker,
     width: u16,
+    render_cache: RenderCache,
+}
+
+enum CompileInput {
+    Snapshot(CompileSnapshot),
+    Rebuild(WorldRebuild),
+}
+
+pub(crate) struct WorldRebuild {
+    pub(crate) root: PathBuf,
+    pub(crate) main: PathBuf,
+    pub(crate) source: String,
 }
 
 #[derive(Default)]
@@ -120,7 +136,23 @@ impl CompileWorker {
         self.advance_and_cancel_pending()
     }
 
-    pub(crate) fn spawn(&self, revision: u64, picker: Picker, width: u16) -> u64 {
+    pub(crate) fn invalidate_files(&self) -> Result<u64, String> {
+        let generation = self.advance_and_cancel_pending()?;
+        let mut compiler = self
+            .compiler
+            .lock()
+            .map_err(|_| "compiler coordinator is unavailable".to_owned())?;
+        compiler.invalidate_files();
+        Ok(generation)
+    }
+
+    pub(crate) fn spawn(
+        &self,
+        revision: u64,
+        picker: Picker,
+        width: u16,
+        render_cache: RenderCache,
+    ) -> u64 {
         let generation = match self.advance_and_cancel_pending() {
             Ok(generation) => generation,
             Err(error) => return self.report_preparation_error(revision, error),
@@ -135,9 +167,10 @@ impl CompileWorker {
         self.enqueue(CompileRequest {
             generation,
             revision,
-            snapshot,
+            input: CompileInput::Snapshot(snapshot),
             picker,
             width,
+            render_cache,
         });
         generation
     }
@@ -145,40 +178,33 @@ impl CompileWorker {
     pub(crate) fn spawn_with_world(
         &self,
         revision: u64,
-        source: &str,
         picker: Picker,
         width: u16,
-        root: PathBuf,
-        main: PathBuf,
+        render_cache: RenderCache,
+        rebuild: WorldRebuild,
     ) -> u64 {
         let generation = match self.advance_and_cancel_pending() {
             Ok(generation) => generation,
             Err(error) => return self.report_preparation_error(revision, error),
         };
-        let mut compiler = match Compiler::new(root, main) {
-            Ok(compiler) => compiler,
-            Err(error) => {
-                self.send_error(revision, generation, &error.to_string());
-                return generation;
-            }
-        };
-        compiler.replace_source(source);
-        let snapshot = compiler.snapshot();
-        match self.compiler.lock() {
-            Ok(mut coordinator) => *coordinator = compiler,
-            Err(_) => {
-                self.send_error(revision, generation, "compiler coordinator is unavailable");
-                return generation;
-            }
-        }
         self.enqueue(CompileRequest {
             generation,
             revision,
-            snapshot,
+            input: CompileInput::Rebuild(rebuild),
             picker,
             width,
+            render_cache,
         });
         generation
+    }
+
+    pub(crate) fn install(&self, compiler: Compiler) -> Result<(), String> {
+        let mut coordinator = self
+            .compiler
+            .lock()
+            .map_err(|_| "compiler coordinator is unavailable".to_owned())?;
+        *coordinator = compiler;
+        Ok(())
     }
 
     fn advance_and_cancel_pending(&self) -> Result<u64, String> {
@@ -223,6 +249,8 @@ impl CompileWorker {
                 generation,
                 revision,
                 elapsed: Duration::ZERO,
+                rebuilt_compiler: None,
+                rebuild_attempted: false,
                 outcome: CompileResultKind::Error(error.to_owned()),
             }));
     }
@@ -260,13 +288,36 @@ fn compile(
     if !is_current(generations, request.generation) {
         return None;
     }
-    let compiled = match request.snapshot.compile() {
+    let (snapshot, rebuilt_compiler, rebuild_attempted) = match request.input {
+        CompileInput::Snapshot(snapshot) => (snapshot, None, false),
+        CompileInput::Rebuild(rebuild) => {
+            let mut compiler = match Compiler::new(rebuild.root, rebuild.main) {
+                Ok(compiler) => compiler,
+                Err(error) => {
+                    return Some(CompileResult {
+                        generation: request.generation,
+                        revision: request.revision,
+                        elapsed: started.elapsed(),
+                        rebuilt_compiler: None,
+                        rebuild_attempted: true,
+                        outcome: CompileResultKind::Error(error.to_string()),
+                    });
+                }
+            };
+            compiler.replace_source(&rebuild.source);
+            let snapshot = compiler.snapshot();
+            (snapshot, Some(compiler), true)
+        }
+    };
+    let compiled = match snapshot.compile() {
         CompileOutcome::Success(compiled) => compiled,
         CompileOutcome::Failure(diagnostics) => {
             return is_current(generations, request.generation).then_some(CompileResult {
                 generation: request.generation,
                 revision: request.revision,
                 elapsed: started.elapsed(),
+                rebuilt_compiler,
+                rebuild_attempted,
                 outcome: CompileResultKind::Diagnostics(diagnostics),
             });
         }
@@ -279,9 +330,12 @@ fn compile(
     let max_columns = (2_048 / font_width).max(1);
     let width = request.width.clamp(1, max_columns);
     let target_pixels = u32::from(width) * u32::from(font_width);
-    let rendered = match typst_tui_render::render_cancellable(&compiled, target_pixels, || {
-        !is_current(generations, request.generation)
-    }) {
+    let (rendered, render_cache) = match typst_tui_render::render_cached_cancellable(
+        &compiled,
+        target_pixels,
+        &request.render_cache,
+        || !is_current(generations, request.generation),
+    ) {
         Ok(rendered) => rendered,
         Err(typst_tui_render::Error::Cancelled) => return None,
         Err(error) => {
@@ -289,6 +343,8 @@ fn compile(
                 generation: request.generation,
                 revision: request.revision,
                 elapsed: started.elapsed(),
+                rebuilt_compiler,
+                rebuild_attempted,
                 outcome: CompileResultKind::Error(error.to_string()),
             });
         }
@@ -303,6 +359,8 @@ fn compile(
                 generation: request.generation,
                 revision: request.revision,
                 elapsed: started.elapsed(),
+                rebuilt_compiler,
+                rebuild_attempted,
                 outcome: CompileResultKind::Error(error),
             });
         }
@@ -312,11 +370,14 @@ fn compile(
         generation: request.generation,
         revision: request.revision,
         elapsed: started.elapsed(),
+        rebuilt_compiler,
+        rebuild_attempted,
         outcome: CompileResultKind::Success {
             pages,
             diagnostics: compiled.warnings().to_vec(),
             sync,
             document: Box::new(compiled),
+            render_cache,
         },
     })
 }
@@ -331,12 +392,21 @@ fn is_current(generations: &AtomicU64, generation: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, path::PathBuf, sync::atomic::AtomicU64};
+    use std::{
+        error::Error,
+        path::PathBuf,
+        sync::{atomic::AtomicU64, mpsc::channel},
+        time::Duration,
+    };
 
     use ratatui_image::picker::Picker;
     use typst_tui_compiler::Compiler;
+    use typst_tui_render::RenderCache;
 
-    use super::{CompileRequest, Scheduler, advance, is_current};
+    use super::{
+        CompileInput, CompileRequest, CompileWorker, Scheduler, WorldRebuild, advance, is_current,
+    };
+    use crate::event::Event;
 
     #[test]
     fn advancing_the_generation_invalidates_older_work() {
@@ -370,6 +440,41 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn rebuild_requests_return_a_replacement_compiler() -> Result<(), Box<dyn Error>> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        let compiler = Compiler::new(&root, root.join("simple.typ"))?;
+        let runtime = tokio::runtime::Builder::new_multi_thread().build()?;
+        let (sender, receiver) = channel();
+        let worker = CompileWorker::new(compiler, "= old world", sender, runtime.handle().clone());
+
+        worker.spawn_with_world(
+            0,
+            Picker::halfblocks(),
+            40,
+            RenderCache::default(),
+            WorldRebuild {
+                root: root.clone(),
+                main: root.join("simple.typ"),
+                source: "= rebuilt world".to_owned(),
+            },
+        );
+        let Event::CompileFinished(mut result) = receiver.recv_timeout(Duration::from_secs(30))?
+        else {
+            return Err("worker returned an unexpected event".into());
+        };
+        assert!(result.rebuild_attempted);
+        let rebuilt = result
+            .rebuilt_compiler
+            .take()
+            .ok_or("worker did not return the rebuilt compiler")?;
+        worker.install(rebuilt).map_err(std::io::Error::other)?;
+
+        drop(worker);
+        runtime.shutdown_timeout(Duration::from_millis(100));
+        Ok(())
+    }
+
     fn request(generation: u64) -> Result<CompileRequest, Box<dyn Error>> {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
         let mut compiler = Compiler::new(&root, root.join("simple.typ"))?;
@@ -377,9 +482,10 @@ mod tests {
         Ok(CompileRequest {
             generation,
             revision: generation,
-            snapshot: compiler.snapshot(),
+            input: CompileInput::Snapshot(compiler.snapshot()),
             picker: Picker::halfblocks(),
             width: 40,
+            render_cache: RenderCache::default(),
         })
     }
 }

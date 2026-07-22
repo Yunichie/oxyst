@@ -18,13 +18,13 @@ use tokio::runtime::Handle;
 use typst_tui_compiler::{CompiledDocument, Compiler, DocumentSync, Severity};
 use typst_tui_config::Config;
 use typst_tui_document::{Document, Motion};
-use typst_tui_render::ExportFormat;
+use typst_tui_render::{ExportFormat, RenderCache};
 use typst_tui_theme::{Color, ColorDepth, Theme, ThemeName};
 
 use crate::{
     action::{Action, Pane},
     clipboard::Clipboard,
-    compile::{CompileResult, CompileResultKind, CompileWorker},
+    compile::{CompileResult, CompileResultKind, CompileWorker, WorldRebuild},
     components::{
         Command, CommandPalette, Diagnostics, Editor, FileExplorer, Help, Preview, Prompt,
         PromptKind, Search, SearchMode, Welcome, WelcomeChoice, format_diagnostic, modal_area,
@@ -117,7 +117,9 @@ pub(crate) struct App {
     internal_events: Receiver<Event>,
     compile_debounce: CompileDebounce,
     compile_generation: u64,
+    world_rebuild_pending: bool,
     preview_target_width: u16,
+    preview_render_cache: RenderCache,
     preview_stale: bool,
     compiled_document: Option<(u64, CompiledDocument)>,
     document_sync: Option<(u64, DocumentSync)>,
@@ -171,7 +173,9 @@ impl App {
             internal_events,
             compile_debounce: CompileDebounce::default(),
             compile_generation: 0,
+            world_rebuild_pending: false,
             preview_target_width: 0,
+            preview_render_cache: RenderCache::default(),
             preview_stale: false,
             compiled_document: None,
             document_sync: None,
@@ -257,7 +261,7 @@ impl App {
             Action::CompileFinished(result) => self.finish_compile(result),
             Action::ExportFinished(result) => self.finish_export(result),
             Action::Resize => {}
-            Action::ProjectFilesChanged => self.schedule_resource_compile(true),
+            Action::ProjectFilesChanged => self.schedule_compile(true, true),
             Action::FileWatchFailed(error) => {
                 self.status = Some(format!("File watch failed: {error}"));
             }
@@ -517,6 +521,7 @@ impl App {
         self.document = Document::new(&text);
         self.editor = Editor::new(&text, self.theme);
         self.preview.clear();
+        self.preview_render_cache = RenderCache::default();
         self.preview_stale = false;
         self.diagnostics = Diagnostics::default();
         self.document_sync = None;
@@ -687,14 +692,19 @@ impl App {
         let cursor = self.document.cursor_byte_index();
         self.editor.update(&action, &mut self.document);
         if self.document.revision() != revision {
-            if let Some(edit) = self.document.last_edit() {
-                match self.compile_worker.apply_edit(edit) {
-                    Ok(generation) => self.compile_generation = generation,
-                    Err(error) => {
-                        self.compile_state = CompileState::Error;
-                        self.status = Some(error);
-                        return;
-                    }
+            let generation = if self.world_rebuild_pending {
+                self.compile_worker.invalidate()
+            } else if let Some(edit) = self.document.last_edit() {
+                self.compile_worker.apply_edit(edit)
+            } else {
+                self.compile_worker.invalidate()
+            };
+            match generation {
+                Ok(generation) => self.compile_generation = generation,
+                Err(error) => {
+                    self.compile_state = CompileState::Error;
+                    self.status = Some(error);
+                    return;
                 }
             }
             self.compile_debounce.schedule(Instant::now());
@@ -848,15 +858,20 @@ impl App {
         }
         self.preview_target_width = width;
         if self.welcome.is_none() {
-            self.schedule_resource_compile(false);
+            self.schedule_compile(false, false);
         }
     }
 
-    fn schedule_resource_compile(&mut self, mark_preview_stale: bool) {
+    fn schedule_compile(&mut self, files_changed: bool, mark_preview_stale: bool) {
         if self.welcome.is_some() {
             return;
         }
-        match self.compile_worker.invalidate() {
+        let invalidated = if files_changed && !self.world_rebuild_pending {
+            self.compile_worker.invalidate_files()
+        } else {
+            self.compile_worker.invalidate()
+        };
+        match invalidated {
             Ok(generation) => self.compile_generation = generation,
             Err(error) => {
                 self.compile_state = CompileState::Error;
@@ -870,12 +885,17 @@ impl App {
     }
 
     fn start_compile(&mut self) {
+        if self.world_rebuild_pending {
+            self.start_compile_with_world();
+            return;
+        }
         self.compile_debounce.cancel();
         self.preview_target_width = self.preview.target_width();
         self.compile_generation = self.compile_worker.spawn(
             self.document.revision(),
             self.picker.clone(),
             self.preview.target_width(),
+            self.preview_render_cache.clone(),
         );
         self.compile_state = CompileState::Compiling;
         self.status = None;
@@ -883,6 +903,7 @@ impl App {
 
     fn start_compile_with_world(&mut self) {
         self.compile_debounce.cancel();
+        self.world_rebuild_pending = true;
         self.preview_target_width = self.preview.target_width();
         let main = self
             .path
@@ -890,17 +911,20 @@ impl App {
             .unwrap_or_else(|| self.root.join("untitled.typ"));
         self.compile_generation = self.compile_worker.spawn_with_world(
             self.document.revision(),
-            &self.document.text(),
             self.picker.clone(),
             self.preview.target_width(),
-            self.root.clone(),
-            main,
+            self.preview_render_cache.clone(),
+            WorldRebuild {
+                root: self.root.clone(),
+                main,
+                source: self.document.text(),
+            },
         );
         self.compile_state = CompileState::Compiling;
         self.status = None;
     }
 
-    fn finish_compile(&mut self, result: CompileResult) {
+    fn finish_compile(&mut self, mut result: CompileResult) {
         if result.generation != self.compile_generation {
             return;
         }
@@ -910,6 +934,17 @@ impl App {
             return;
         }
 
+        if let Some(compiler) = result.rebuilt_compiler.take() {
+            if let Err(error) = self.compile_worker.install(compiler) {
+                self.compile_state = CompileState::Error;
+                self.status = Some(error);
+                return;
+            }
+            self.world_rebuild_pending = false;
+        } else if result.rebuild_attempted {
+            self.world_rebuild_pending = true;
+        }
+
         self.last_compile_time = Some(result.elapsed);
         match result.outcome {
             CompileResultKind::Success {
@@ -917,11 +952,13 @@ impl App {
                 diagnostics,
                 sync,
                 document,
+                render_cache,
             } => {
                 self.preview.replace_pages(pages);
                 self.diagnostics.set_items(diagnostics);
                 self.document_sync = Some((result.revision, sync));
                 self.compiled_document = Some((result.revision, *document));
+                self.preview_render_cache = render_cache;
                 self.compile_state = CompileState::Ready;
                 self.preview_stale = false;
                 self.status = None;
@@ -1026,7 +1063,7 @@ impl App {
         ])
         .areas(frame.area());
 
-        let dirty_marker = if self.document.is_dirty() { " *" } else { "" };
+        let dirty_marker = if self.document.is_dirty() { " ●" } else { "" };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(
@@ -1187,7 +1224,10 @@ impl App {
                     Style::default().fg(color(foreground)),
                 ),
                 Span::styled(
-                    format!("{errors} errors, {warnings} warnings"),
+                    format!(
+                        "{} words | {errors} errors, {warnings} warnings",
+                        self.document.word_count()
+                    ),
                     Style::default().fg(color(diagnostic_color)),
                 ),
                 Span::styled(
@@ -1230,11 +1270,11 @@ impl App {
     fn compile_label(&self) -> String {
         match self.compile_state {
             CompileState::NotStarted => "not compiled".to_owned(),
-            CompileState::Compiling => "compiling".to_owned(),
-            CompileState::Ready => "up to date".to_owned(),
-            CompileState::Stale => "preview stale".to_owned(),
-            CompileState::Failed(errors) => format!("{errors} errors"),
-            CompileState::Error => "preview error".to_owned(),
+            CompileState::Compiling => "● compiling".to_owned(),
+            CompileState::Ready => "✓ up to date".to_owned(),
+            CompileState::Stale => "● preview stale".to_owned(),
+            CompileState::Failed(errors) => format!("✕ {errors} errors"),
+            CompileState::Error => "✕ preview error".to_owned(),
         }
     }
 
@@ -1264,12 +1304,12 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use ratatui::layout::Rect;
+    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
     use ratatui_image::picker::Picker;
     use typst_tui_compiler::Compiler;
     use typst_tui_config::Config;
 
-    use super::{App, CompileDebounce};
+    use super::{App, CompileDebounce, CompileState};
 
     #[test]
     fn compile_debounce_restarts_after_each_edit() {
@@ -1306,7 +1346,7 @@ mod tests {
         app.preview.set_viewport(Rect::new(0, 0, 42, 20));
         app.preview_target_width = app.preview.target_width();
         let initial_generation = app.compile_generation;
-        app.schedule_resource_compile(true);
+        app.schedule_compile(true, true);
         assert!(app.compile_generation > initial_generation);
         assert!(app.compile_debounce.deadline.is_some());
         assert!(app.preview_stale);
@@ -1318,6 +1358,42 @@ mod tests {
         assert!(app.compile_generation > resource_generation);
         assert!(app.compile_debounce.deadline.is_some());
         assert!(!app.preview_stale);
+
+        drop(app);
+        runtime.shutdown_timeout(Duration::from_millis(100));
+        Ok(())
+    }
+
+    #[test]
+    fn header_and_status_show_glyphs_and_word_count() -> Result<(), Box<dyn Error>> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        let main = root.join("simple.typ");
+        let compiler = Compiler::new(&root, &main)?;
+        let runtime = tokio::runtime::Builder::new_multi_thread().build()?;
+        let mut app = App::new(
+            Some(main),
+            root,
+            "one two",
+            compiler,
+            Picker::halfblocks(),
+            runtime.handle().clone(),
+            Config::default(),
+        )
+        .map_err(std::io::Error::other)?;
+        app.document.insert_char('x');
+        app.compile_state = CompileState::Ready;
+        let mut terminal = Terminal::new(TestBackend::new(100, 20))?;
+        terminal.draw(|frame| app.draw(frame))?;
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("●"));
+        assert!(rendered.contains("✓ up to date"));
+        assert!(rendered.contains("2 words"));
 
         drop(app);
         runtime.shutdown_timeout(Duration::from_millis(100));
