@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::VecDeque;
+use std::{collections::VecDeque, ops::Range};
 
 use ropey::Rope;
 use unicode_segmentation::UnicodeSegmentation;
@@ -29,6 +29,24 @@ pub struct CursorPosition {
     pub visual_column: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextEdit {
+    range: Range<usize>,
+    replacement: String,
+}
+
+impl TextEdit {
+    #[must_use]
+    pub fn range(&self) -> Range<usize> {
+        self.range.clone()
+    }
+
+    #[must_use]
+    pub fn replacement(&self) -> &str {
+        &self.replacement
+    }
+}
+
 #[derive(Debug)]
 struct Edit {
     start: usize,
@@ -50,6 +68,7 @@ pub struct Document {
     state: u64,
     saved_state: u64,
     next_state: u64,
+    last_edit: Option<TextEdit>,
 }
 
 impl Document {
@@ -64,6 +83,7 @@ impl Document {
             state: 0,
             saved_state: 0,
             next_state: 1,
+            last_edit: None,
         }
     }
 
@@ -108,6 +128,11 @@ impl Document {
     #[must_use]
     pub fn revision(&self) -> u64 {
         self.state
+    }
+
+    #[must_use]
+    pub fn last_edit(&self) -> Option<&TextEdit> {
+        self.last_edit.as_ref()
     }
 
     pub fn mark_saved(&mut self) {
@@ -194,11 +219,16 @@ impl Document {
         };
 
         let inserted_end = edit.start + edit.inserted.chars().count();
+        let range = self.text.char_to_byte(edit.start)..self.text.char_to_byte(inserted_end);
         self.text.remove(edit.start..inserted_end);
         self.text.insert(edit.start, &edit.removed);
         self.cursor = edit.cursor_before;
         self.state = edit.state_before;
         self.preferred_visual_column = None;
+        self.last_edit = Some(TextEdit {
+            range,
+            replacement: edit.removed.clone(),
+        });
         self.redo.push(edit);
     }
 
@@ -208,15 +238,21 @@ impl Document {
         };
 
         let removed_end = edit.start + edit.removed.chars().count();
+        let range = self.text.char_to_byte(edit.start)..self.text.char_to_byte(removed_end);
         self.text.remove(edit.start..removed_end);
         self.text.insert(edit.start, &edit.inserted);
         self.cursor = edit.cursor_after;
         self.state = edit.state_after;
         self.preferred_visual_column = None;
+        self.last_edit = Some(TextEdit {
+            range,
+            replacement: edit.inserted.clone(),
+        });
         self.push_undo(edit);
     }
 
     fn record_edit(&mut self, start: usize, end: usize, inserted: &str) {
+        let range = self.text.char_to_byte(start)..self.text.char_to_byte(end);
         let removed = self.text.slice(start..end).to_string();
         let cursor_before = self.cursor;
         let cursor_after = start + inserted.chars().count();
@@ -230,6 +266,10 @@ impl Document {
         self.state = state_after;
         self.preferred_visual_column = None;
         self.redo.clear();
+        self.last_edit = Some(TextEdit {
+            range,
+            replacement: inserted.to_owned(),
+        });
         self.push_undo(Edit {
             start,
             removed,
@@ -379,7 +419,7 @@ fn char_offset_at_visual_column(text: &str, target: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{CursorPosition, Document, Motion};
+    use super::{CursorPosition, Document, Motion, TextEdit};
 
     #[test]
     fn edits_undo_and_redo() {
@@ -466,5 +506,23 @@ mod tests {
         }
 
         assert_eq!(document.text().chars().count(), 44);
+    }
+
+    #[test]
+    fn edit_deltas_use_utf8_byte_ranges() {
+        let mut document = Document::new("aé");
+        document.move_cursor(Motion::DocumentEnd);
+        document.insert_char('界');
+
+        assert_eq!(document.last_edit().map(TextEdit::range), Some(3..3));
+        assert_eq!(document.last_edit().map(TextEdit::replacement), Some("界"));
+
+        document.backspace();
+        assert_eq!(document.last_edit().map(TextEdit::range), Some(3..6));
+        assert_eq!(document.last_edit().map(TextEdit::replacement), Some(""));
+
+        document.undo();
+        assert_eq!(document.last_edit().map(TextEdit::range), Some(3..3));
+        assert_eq!(document.last_edit().map(TextEdit::replacement), Some("界"));
     }
 }
