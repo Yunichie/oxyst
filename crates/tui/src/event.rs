@@ -12,6 +12,9 @@ pub(crate) enum Event {
     Key(KeyEvent),
     Mouse(MouseEvent),
     Paste(String),
+    Resize,
+    ProjectFilesChanged,
+    FileWatchFailed(String),
     CompileFinished(CompileResult),
     ExportFinished(ExportResult),
     Tick,
@@ -32,7 +35,7 @@ pub(crate) fn read(internal: &Receiver<Event>) -> io::Result<Event> {
         event::Event::Key(key) => Event::Key(key),
         event::Event::Mouse(mouse) => Event::Mouse(mouse),
         event::Event::Paste(text) => Event::Paste(text),
-        event::Event::Resize(_, _) => Event::Ignored,
+        event::Event::Resize(_, _) => Event::Resize,
         event::Event::FocusGained | event::Event::FocusLost => Event::Ignored,
     })
 }

@@ -33,6 +33,7 @@ use crate::{
     export::{ExportResult, ExportWorker},
     input::{self, InputMode, Keymap},
     style::{base, color},
+    watcher::ProjectWatcher,
 };
 
 const NARROW_WIDTH: u16 = 80;
@@ -112,9 +113,12 @@ pub(crate) struct App {
     picker: Picker,
     compile_worker: CompileWorker,
     export_worker: ExportWorker,
+    watcher: ProjectWatcher,
     internal_events: Receiver<Event>,
     compile_debounce: CompileDebounce,
     compile_generation: u64,
+    preview_target_width: u16,
+    preview_stale: bool,
     compiled_document: Option<(u64, CompiledDocument)>,
     document_sync: Option<(u64, DocumentSync)>,
     cursor_sync_deadline: Option<Instant>,
@@ -147,6 +151,7 @@ impl App {
         let keymap = Keymap::new(&config)?;
         let welcome = path.is_none().then(Welcome::default);
         let (sender, internal_events) = channel();
+        let watcher = ProjectWatcher::new(&root, path.as_deref(), sender.clone())?;
 
         Ok(Self {
             document: Document::new(text),
@@ -162,9 +167,12 @@ impl App {
             picker,
             compile_worker: CompileWorker::new(compiler, text, sender.clone(), runtime.clone()),
             export_worker: ExportWorker::new(sender, runtime),
+            watcher,
             internal_events,
             compile_debounce: CompileDebounce::default(),
             compile_generation: 0,
+            preview_target_width: 0,
+            preview_stale: false,
             compiled_document: None,
             document_sync: None,
             cursor_sync_deadline: None,
@@ -186,6 +194,7 @@ impl App {
         let mut initial_compile_requested = self.welcome.is_some();
         while !self.should_quit {
             terminal.draw(|frame| self.draw(frame))?;
+            self.observe_preview_width();
             if !initial_compile_requested {
                 self.start_compile();
                 initial_compile_requested = true;
@@ -247,6 +256,11 @@ impl App {
             Action::Recompile => self.start_compile(),
             Action::CompileFinished(result) => self.finish_compile(result),
             Action::ExportFinished(result) => self.finish_export(result),
+            Action::Resize => {}
+            Action::ProjectFilesChanged => self.schedule_resource_compile(true),
+            Action::FileWatchFailed(error) => {
+                self.status = Some(format!("File watch failed: {error}"));
+            }
             Action::Tick => self.tick(),
             Action::ToggleDiagnostics => self.diagnostics.toggle(),
             Action::ToggleFileExplorer => self.toggle_explorer(),
@@ -499,9 +513,11 @@ impl App {
             path.parent()
                 .map_or_else(|| self.root.clone(), Path::to_owned)
         };
+        let watch_error = self.watcher.retarget(&root, Some(&path)).err();
         self.document = Document::new(&text);
         self.editor = Editor::new(&text, self.theme);
         self.preview.clear();
+        self.preview_stale = false;
         self.diagnostics = Diagnostics::default();
         self.document_sync = None;
         self.compiled_document = None;
@@ -514,6 +530,9 @@ impl App {
         self.fullscreen = false;
         self.status = None;
         self.start_compile_with_world();
+        if let Some(error) = watch_error {
+            self.status = Some(format!("File watch failed: {error}"));
+        }
     }
 
     fn start_new_document(&mut self) {
@@ -542,9 +561,13 @@ impl App {
         self.root = path
             .parent()
             .map_or_else(|| self.root.clone(), Path::to_owned);
+        let watch_error = self.watcher.retarget(&self.root, Some(&path)).err();
         self.display_name = display_name(Some(&path));
         self.explorer.set_root(self.root.clone());
         self.start_compile_with_world();
+        if let Some(error) = watch_error {
+            self.status = Some(format!("File watch failed: {error}"));
+        }
     }
 
     fn write_document(&mut self, path: &Path) -> bool {
@@ -593,7 +616,7 @@ impl App {
         let Some((_, document)) = self
             .compiled_document
             .as_ref()
-            .filter(|(revision, _)| *revision == self.document.revision())
+            .filter(|(revision, _)| *revision == self.document.revision() && !self.preview_stale)
         else {
             self.status = Some("Current document is not compiled yet".to_owned());
             return;
@@ -677,6 +700,7 @@ impl App {
             self.compile_debounce.schedule(Instant::now());
             self.cursor_sync_deadline = None;
             self.compile_state = CompileState::Stale;
+            self.preview_stale = true;
         } else if self.document.cursor_byte_index() != cursor {
             self.cursor_sync_deadline = Some(Instant::now() + CURSOR_SYNC_DELAY);
         }
@@ -817,8 +841,37 @@ impl App {
         }
     }
 
+    fn observe_preview_width(&mut self) {
+        let width = self.preview.target_width();
+        if width == self.preview_target_width {
+            return;
+        }
+        self.preview_target_width = width;
+        if self.welcome.is_none() {
+            self.schedule_resource_compile(false);
+        }
+    }
+
+    fn schedule_resource_compile(&mut self, mark_preview_stale: bool) {
+        if self.welcome.is_some() {
+            return;
+        }
+        match self.compile_worker.invalidate() {
+            Ok(generation) => self.compile_generation = generation,
+            Err(error) => {
+                self.compile_state = CompileState::Error;
+                self.status = Some(error);
+                return;
+            }
+        }
+        self.compile_debounce.schedule(Instant::now());
+        self.compile_state = CompileState::Stale;
+        self.preview_stale |= mark_preview_stale;
+    }
+
     fn start_compile(&mut self) {
         self.compile_debounce.cancel();
+        self.preview_target_width = self.preview.target_width();
         self.compile_generation = self.compile_worker.spawn(
             self.document.revision(),
             self.picker.clone(),
@@ -830,6 +883,7 @@ impl App {
 
     fn start_compile_with_world(&mut self) {
         self.compile_debounce.cancel();
+        self.preview_target_width = self.preview.target_width();
         let main = self
             .path
             .clone()
@@ -869,6 +923,7 @@ impl App {
                 self.document_sync = Some((result.revision, sync));
                 self.compiled_document = Some((result.revision, *document));
                 self.compile_state = CompileState::Ready;
+                self.preview_stale = false;
                 self.status = None;
                 self.sync_cursor_to_preview();
             }
@@ -907,6 +962,9 @@ impl App {
     }
 
     fn click_preview(&mut self, column: u16, row: u16) {
+        if self.preview_stale {
+            return;
+        }
         let Some(position) = self.preview.position_at(column, row) else {
             return;
         };
@@ -926,6 +984,9 @@ impl App {
     }
 
     fn sync_cursor_to_preview(&mut self) {
+        if self.preview_stale {
+            return;
+        }
         let position = self
             .document_sync
             .as_ref()
@@ -1001,10 +1062,11 @@ impl App {
     }
 
     fn draw_workspace(&mut self, frame: &mut Frame, area: Rect) {
-        let preview_dimmed = self
-            .document_sync
-            .as_ref()
-            .is_some_and(|(revision, _)| *revision != self.document.revision());
+        let preview_dimmed = self.preview_stale
+            || self
+                .document_sync
+                .as_ref()
+                .is_some_and(|(revision, _)| *revision != self.document.revision());
         if self.fullscreen {
             match self.focus {
                 Pane::Explorer => {
@@ -1195,9 +1257,19 @@ fn display_name(path: Option<&Path>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        error::Error,
+        fs,
+        path::PathBuf,
+        time::{Duration, Instant},
+    };
 
-    use super::CompileDebounce;
+    use ratatui::layout::Rect;
+    use ratatui_image::picker::Picker;
+    use typst_tui_compiler::Compiler;
+    use typst_tui_config::Config;
+
+    use super::{App, CompileDebounce};
 
     #[test]
     fn compile_debounce_restarts_after_each_edit() {
@@ -1211,5 +1283,44 @@ mod tests {
         assert!(!debounce.take_due(start + Duration::from_millis(249)));
         assert!(debounce.take_due(start + Duration::from_millis(250)));
         assert!(!debounce.take_due(start + Duration::from_millis(300)));
+    }
+
+    #[test]
+    fn resource_and_width_changes_invalidate_and_debounce() -> Result<(), Box<dyn Error>> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        let main = root.join("simple.typ");
+        let source = fs::read_to_string(&main)?;
+        let compiler = Compiler::new(&root, &main)?;
+        let runtime = tokio::runtime::Builder::new_multi_thread().build()?;
+        let mut app = App::new(
+            Some(main),
+            root,
+            &source,
+            compiler,
+            Picker::halfblocks(),
+            runtime.handle().clone(),
+            Config::default(),
+        )
+        .map_err(std::io::Error::other)?;
+
+        app.preview.set_viewport(Rect::new(0, 0, 42, 20));
+        app.preview_target_width = app.preview.target_width();
+        let initial_generation = app.compile_generation;
+        app.schedule_resource_compile(true);
+        assert!(app.compile_generation > initial_generation);
+        assert!(app.compile_debounce.deadline.is_some());
+        assert!(app.preview_stale);
+
+        app.preview_stale = false;
+        app.preview.set_viewport(Rect::new(0, 0, 62, 20));
+        let resource_generation = app.compile_generation;
+        app.observe_preview_width();
+        assert!(app.compile_generation > resource_generation);
+        assert!(app.compile_debounce.deadline.is_some());
+        assert!(!app.preview_stale);
+
+        drop(app);
+        runtime.shutdown_timeout(Duration::from_millis(100));
+        Ok(())
     }
 }

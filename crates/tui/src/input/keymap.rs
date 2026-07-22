@@ -65,6 +65,9 @@ pub(crate) fn resolve(event: Event, mode: InputMode, keymap: &Keymap) -> Option<
     match event {
         Event::CompileFinished(result) => Some(Action::CompileFinished(result)),
         Event::ExportFinished(result) => Some(Action::ExportFinished(result)),
+        Event::Resize => Some(Action::Resize),
+        Event::ProjectFilesChanged => Some(Action::ProjectFilesChanged),
+        Event::FileWatchFailed(error) => Some(Action::FileWatchFailed(error)),
         Event::Tick => Some(Action::Tick),
         Event::Paste(text) if matches!(mode, InputMode::Normal) => Some(Action::InsertText(text)),
         Event::Paste(text) if matches!(mode, InputMode::Overlay | InputMode::Search) => {
@@ -468,6 +471,24 @@ mod tests {
 
         assert!(matches!(replace, Some(Action::ReplaceCurrent)));
         assert!(matches!(previous, Some(Action::SearchNext(true))));
+        Ok(())
+    }
+
+    #[test]
+    fn internal_layout_and_file_events_bypass_input_modes() -> Result<(), String> {
+        let keymap = Keymap::new(&Config::default())?;
+        assert!(matches!(
+            super::resolve(super::Event::Resize, InputMode::Help, &keymap),
+            Some(Action::Resize)
+        ));
+        assert!(matches!(
+            super::resolve(
+                super::Event::ProjectFilesChanged,
+                InputMode::Confirmation,
+                &keymap
+            ),
+            Some(Action::ProjectFilesChanged)
+        ));
         Ok(())
     }
 }
