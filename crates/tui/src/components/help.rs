@@ -114,8 +114,16 @@ impl Help {
             ("Go to line", keymap.display("go_to_line")),
             ("Help", keymap.display("help")),
             ("Quit", keymap.display("quit")),
-            ("Choose / confirm", "Enter / Y".to_owned()),
-            ("Cancel", keymap.display("close_overlay")),
+            ("Choose", keymap.display("newline")),
+            (
+                "Confirm / cancel",
+                pair(keymap, "confirm", "cancel_confirmation"),
+            ),
+            (
+                "Welcome: new / open",
+                pair(keymap, "welcome_new", "welcome_open"),
+            ),
+            ("Close overlay", keymap.display("close_overlay")),
             ("Preview to source", "Left click rendered text".to_owned()),
             ("Scroll preview", "Mouse wheel".to_owned()),
         ];

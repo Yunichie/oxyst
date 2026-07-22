@@ -63,6 +63,10 @@ const ACTIONS: &[(&str, &[&str])] = &[
     ("go_to_line", &["ctrl+g"]),
     ("help", &["?", "f1"]),
     ("close_overlay", &["esc"]),
+    ("confirm", &["y"]),
+    ("cancel_confirmation", &["n", "esc"]),
+    ("welcome_new", &["n"]),
+    ("welcome_open", &["o"]),
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]

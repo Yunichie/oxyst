@@ -45,6 +45,8 @@ pub(crate) enum Action {
     OpenGoToLine,
     OpenFind,
     OpenReplace,
+    NewDocument,
+    OpenFile,
     CloseOverlay,
     OverlayInput(char),
     OverlayInputText(String),

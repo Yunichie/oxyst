@@ -81,17 +81,24 @@ pub(crate) fn resolve(event: Event, mode: InputMode, keymap: &Keymap) -> Option<
 
 fn resolve_key(key: KeyEvent, mode: InputMode, keymap: &Keymap) -> Option<Action> {
     match mode {
-        InputMode::QuitConfirmation => match key.code {
-            KeyCode::Char('y' | 'Y') => Some(Action::Quit),
-            KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(Action::CancelQuit),
-            _ => None,
-        },
-        InputMode::Confirmation => match key.code {
-            KeyCode::Char('y' | 'Y') => Some(Action::OverlaySubmit),
-            KeyCode::Char('n' | 'N') => Some(Action::CloseOverlay),
-            _ if keymap.matches("close_overlay", key) => Some(Action::CloseOverlay),
-            _ => None,
-        },
+        InputMode::QuitConfirmation => {
+            if keymap.matches("confirm", key) {
+                Some(Action::Quit)
+            } else if keymap.matches("cancel_confirmation", key) {
+                Some(Action::CancelQuit)
+            } else {
+                None
+            }
+        }
+        InputMode::Confirmation => {
+            if keymap.matches("confirm", key) {
+                Some(Action::OverlaySubmit)
+            } else if keymap.matches("cancel_confirmation", key) {
+                Some(Action::CloseOverlay)
+            } else {
+                None
+            }
+        }
         InputMode::Help => {
             if keymap.matches("close_overlay", key) {
                 Some(Action::CloseOverlay)
@@ -110,6 +117,10 @@ fn resolve_key(key: KeyEvent, mode: InputMode, keymap: &Keymap) -> Option<Action
                 Some(Action::OpenHelp)
             } else if keymap.matches("quit", key) {
                 Some(Action::RequestQuit)
+            } else if keymap.matches("welcome_new", key) {
+                Some(Action::NewDocument)
+            } else if keymap.matches("welcome_open", key) {
+                Some(Action::OpenFile)
             } else {
                 resolve_overlay_key(key, keymap)
             }
@@ -489,6 +500,66 @@ mod tests {
             ),
             Some(Action::ProjectFilesChanged)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn contextual_bindings_are_configurable() -> Result<(), String> {
+        let mut config = Config::default();
+        config
+            .keys
+            .insert("confirm".to_owned(), vec!["alt+y".to_owned()]);
+        config
+            .keys
+            .insert("cancel_confirmation".to_owned(), vec!["alt+n".to_owned()]);
+        config
+            .keys
+            .insert("welcome_new".to_owned(), vec!["alt+n".to_owned()]);
+        config
+            .keys
+            .insert("welcome_open".to_owned(), vec!["alt+o".to_owned()]);
+        let keymap = Keymap::new(&config)?;
+
+        assert!(matches!(
+            resolve_key(
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT),
+                InputMode::QuitConfirmation,
+                &keymap
+            ),
+            Some(Action::Quit)
+        ));
+        assert!(matches!(
+            resolve_key(
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT),
+                InputMode::Confirmation,
+                &keymap
+            ),
+            Some(Action::CloseOverlay)
+        ));
+        assert!(matches!(
+            resolve_key(
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT),
+                InputMode::Welcome,
+                &keymap
+            ),
+            Some(Action::NewDocument)
+        ));
+        assert!(matches!(
+            resolve_key(
+                KeyEvent::new(KeyCode::Char('o'), KeyModifiers::ALT),
+                InputMode::Welcome,
+                &keymap
+            ),
+            Some(Action::OpenFile)
+        ));
+        assert!(
+            resolve_key(
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+                InputMode::Confirmation,
+                &keymap
+            )
+            .is_none()
+        );
         Ok(())
     }
 }
