@@ -34,6 +34,7 @@ ropey = "1.6.1"
 thiserror = "2.0.19"
 tokio = { version = "1.53.1", features = ["rt-multi-thread"] }
 typst = "0.15.1"
+typst-ide = "0.15.1"
 typst-kit = { version = "0.15.1", features = ["datetime", "embedded-fonts", "scan-fonts", "system-downloader", "system-packages"] }
 typst-layout = "0.15.1"
 typst-render = "0.15.1"

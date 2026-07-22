@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 thiserror.workspace = true
 typst.workspace = true
+typst-ide.workspace = true
 typst-kit.workspace = true
 typst-layout.workspace = true
 
