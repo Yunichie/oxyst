@@ -5,6 +5,7 @@ mod file_explorer;
 mod help;
 mod preview;
 mod prompt;
+mod search;
 mod welcome;
 
 pub(crate) use command_palette::{Command, CommandPalette};
@@ -14,6 +15,7 @@ pub(crate) use file_explorer::FileExplorer;
 pub(crate) use help::Help;
 pub(crate) use preview::Preview;
 pub(crate) use prompt::{Prompt, PromptKind};
+pub(crate) use search::{Search, SearchMode};
 pub(crate) use welcome::{Welcome, WelcomeChoice};
 
 pub(crate) fn modal_area(

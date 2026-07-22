@@ -2,6 +2,7 @@
 
 mod action;
 mod app;
+mod clipboard;
 mod compile;
 mod components;
 mod event;

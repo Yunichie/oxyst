@@ -41,16 +41,59 @@ impl Help {
                 "Move cursor",
                 four(keymap, "move_left", "move_right", "move_up", "move_down"),
             ),
+            (
+                "Select",
+                four(
+                    keymap,
+                    "select_left",
+                    "select_right",
+                    "select_up",
+                    "select_down",
+                ),
+            ),
             ("Move by word", pair(keymap, "word_left", "word_right")),
+            (
+                "Select by word",
+                pair(keymap, "select_word_left", "select_word_right"),
+            ),
             ("Line start / end", pair(keymap, "line_start", "line_end")),
+            (
+                "Select to line start / end",
+                pair(keymap, "select_line_start", "select_line_end"),
+            ),
             (
                 "Document start / end",
                 pair(keymap, "document_start", "document_end"),
             ),
             (
+                "Select to document start / end",
+                pair(keymap, "select_document_start", "select_document_end"),
+            ),
+            ("Select all", keymap.display("select_all")),
+            (
+                "Copy / cut / paste",
+                format!(
+                    "{} / {} / {}",
+                    keymap.display("copy"),
+                    keymap.display("cut"),
+                    keymap.display("paste")
+                ),
+            ),
+            (
+                "Find / find and replace",
+                pair(keymap, "find", "find_replace"),
+            ),
+            (
+                "Find next / previous",
+                pair(keymap, "find_next", "find_previous"),
+            ),
+            ("Switch find field", keymap.display("search_toggle_field")),
+            ("Replace current", keymap.display("replace_current")),
+            (
                 "Delete backward / forward",
                 pair(keymap, "backspace", "delete"),
             ),
+            ("New line", keymap.display("newline")),
             ("Undo / redo", pair(keymap, "undo", "redo")),
             ("Save", keymap.display("save")),
             ("Recompile", keymap.display("recompile")),

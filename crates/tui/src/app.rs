@@ -23,10 +23,11 @@ use typst_tui_theme::{Color, ColorDepth, Theme, ThemeName};
 
 use crate::{
     action::{Action, Pane},
+    clipboard::Clipboard,
     compile::{CompileResult, CompileResultKind, CompileWorker},
     components::{
         Command, CommandPalette, Diagnostics, Editor, FileExplorer, Help, Preview, Prompt,
-        PromptKind, Welcome, WelcomeChoice, format_diagnostic, modal_area,
+        PromptKind, Search, SearchMode, Welcome, WelcomeChoice, format_diagnostic, modal_area,
     },
     event::{self, Event},
     export::{ExportResult, ExportWorker},
@@ -79,6 +80,7 @@ enum Overlay {
     None,
     Palette(CommandPalette),
     Prompt(Prompt),
+    Search(Search),
     Help(Help),
     Confirm(Confirmation),
 }
@@ -99,6 +101,7 @@ enum ConfirmIntent {
 pub(crate) struct App {
     document: Document,
     editor: Editor,
+    clipboard: Clipboard,
     preview: Preview,
     explorer: FileExplorer,
     focus: Pane,
@@ -148,6 +151,7 @@ impl App {
         Ok(Self {
             document: Document::new(text),
             editor: Editor::new(text, theme),
+            clipboard: Clipboard::new(),
             preview: Preview::new(),
             explorer: FileExplorer::new(root.clone()),
             focus: Pane::Editor,
@@ -204,6 +208,7 @@ impl App {
         }
         match self.overlay {
             Overlay::Palette(_) | Overlay::Prompt(_) => InputMode::Overlay,
+            Overlay::Search(_) => InputMode::Search,
             Overlay::Help(_) => InputMode::Help,
             Overlay::Confirm(_) => InputMode::Confirmation,
             Overlay::None if self.welcome.is_some() => InputMode::Welcome,
@@ -226,6 +231,18 @@ impl App {
             Action::OpenGoToLine => {
                 self.overlay = Overlay::Prompt(Prompt::new(PromptKind::GoToLine, ""));
             }
+            Action::OpenFind => self.open_search(SearchMode::Find),
+            Action::OpenReplace => self.open_search(SearchMode::Replace),
+            Action::SearchNext(reverse) => self.search_next(reverse),
+            Action::SearchToggleField => {
+                if let Overlay::Search(search) = &mut self.overlay {
+                    search.toggle_field();
+                }
+            }
+            Action::ReplaceCurrent => self.replace_current(),
+            Action::Copy => self.copy_selection(),
+            Action::Cut if self.focus == Pane::Editor => self.cut_selection(),
+            Action::PasteClipboard if self.focus == Pane::Editor => self.paste_clipboard(),
             Action::Save => self.save(),
             Action::Recompile => self.start_compile(),
             Action::CompileFinished(result) => self.finish_compile(result),
@@ -239,11 +256,9 @@ impl App {
                 self.start_compile();
             }
             Action::NavigateDiagnostic(direction) => self.navigate_diagnostic(direction),
-            Action::Click { column, row } => self.click_preview(column, row),
-            Action::ScrollAt { column, row, lines } if self.preview.contains(column, row) => {
-                self.preview.scroll_lines(lines);
-                self.focus = Pane::Preview;
-            }
+            Action::MouseDown { column, row } => self.mouse_down(column, row),
+            Action::MouseDrag { column, row } => self.mouse_drag(column, row),
+            Action::ScrollAt { column, row, lines } => self.scroll_at(column, row, lines),
             Action::SwitchFocus => self.switch_focus(),
             Action::ScrollPreviewPages(pages) => self.preview.scroll_pages(pages),
             Action::Move(Motion::Up) if self.focus == Pane::Explorer => self.explorer.select(-1),
@@ -287,6 +302,8 @@ impl App {
             }
             return;
         }
+        let mut query_changed = false;
+        let mut query_origin = None;
         match (&mut self.overlay, action) {
             (Overlay::Palette(palette), Action::OverlayInput(character)) => {
                 palette.input(character);
@@ -305,8 +322,47 @@ impl App {
                 prompt.input_text(&text);
             }
             (Overlay::Prompt(prompt), Action::OverlayBackspace) => prompt.backspace(),
+            (Overlay::Search(search), Action::OverlayInput(character)) => {
+                query_changed = search.query_is_active();
+                query_origin = query_changed
+                    .then(|| {
+                        self.document
+                            .selection_byte_range()
+                            .map(|range| range.start)
+                    })
+                    .flatten();
+                search.input(character);
+            }
+            (Overlay::Search(search), Action::OverlayInputText(text)) => {
+                query_changed = search.query_is_active();
+                query_origin = query_changed
+                    .then(|| {
+                        self.document
+                            .selection_byte_range()
+                            .map(|range| range.start)
+                    })
+                    .flatten();
+                search.input_text(&text);
+            }
+            (Overlay::Search(search), Action::OverlayBackspace) => {
+                query_changed = search.query_is_active();
+                query_origin = query_changed
+                    .then(|| {
+                        self.document
+                            .selection_byte_range()
+                            .map(|range| range.start)
+                    })
+                    .flatten();
+                search.backspace();
+            }
             (Overlay::Help(help), Action::OverlayMove(direction)) => help.scroll(direction),
             _ => {}
+        }
+        if query_changed {
+            if let Some(origin) = query_origin {
+                let _ = self.document.set_cursor_byte_index(origin);
+            }
+            self.search_next(false);
         }
     }
 
@@ -332,7 +388,7 @@ impl App {
             }
             Overlay::Prompt(prompt) => self.submit_prompt(prompt),
             Overlay::Confirm(confirmation) => self.confirm(confirmation.intent),
-            Overlay::Help(_) | Overlay::None => {}
+            Overlay::Search(_) | Overlay::Help(_) | Overlay::None => {}
         }
     }
 
@@ -618,6 +674,127 @@ impl App {
         self.status = None;
     }
 
+    fn open_search(&mut self, mode: SearchMode) {
+        let query = self.document.selected_text().unwrap_or_default();
+        self.overlay = Overlay::Search(Search::new(mode, query));
+    }
+
+    fn search_next(&mut self, reverse: bool) {
+        let query = match &self.overlay {
+            Overlay::Search(search) => search.query().to_owned(),
+            _ => return,
+        };
+        if query.is_empty() {
+            return;
+        }
+        let Some(range) = self.document.find(&query, reverse) else {
+            self.status = Some(format!("No matches for {query}"));
+            return;
+        };
+        if self.document.select_byte_range(range) {
+            self.cursor_sync_deadline = Some(Instant::now() + CURSOR_SYNC_DELAY);
+            self.status = None;
+        }
+    }
+
+    fn replace_current(&mut self) {
+        let (query, replacement, can_replace) = match &self.overlay {
+            Overlay::Search(search) => (
+                search.query().to_owned(),
+                search.replacement().to_owned(),
+                search.can_replace(),
+            ),
+            _ => return,
+        };
+        if !can_replace || query.is_empty() {
+            return;
+        }
+        if self.document.selected_text().as_deref() != Some(query.as_str()) {
+            self.search_next(false);
+        }
+        if self.document.selected_text().as_deref() != Some(query.as_str()) {
+            return;
+        }
+        if replacement.is_empty() {
+            self.update_editor(Action::Delete);
+        } else {
+            self.update_editor(Action::InsertText(replacement));
+        }
+        self.search_next(false);
+    }
+
+    fn copy_selection(&mut self) {
+        let Some(text) = self.document.selected_text() else {
+            self.status = Some("No selection to copy".to_owned());
+            return;
+        };
+        let system = self.clipboard.copy(&text);
+        self.status = Some(if system {
+            "Copied selection".to_owned()
+        } else {
+            "Copied selection to internal register".to_owned()
+        });
+    }
+
+    fn cut_selection(&mut self) {
+        let Some(text) = self.document.selected_text() else {
+            self.status = Some("No selection to cut".to_owned());
+            return;
+        };
+        let system = self.clipboard.copy(&text);
+        self.update_editor(Action::Delete);
+        self.status = Some(if system {
+            "Cut selection".to_owned()
+        } else {
+            "Cut selection to internal register".to_owned()
+        });
+    }
+
+    fn paste_clipboard(&mut self) {
+        let Some((text, system)) = self.clipboard.paste() else {
+            self.status = Some("Clipboard is empty or unavailable".to_owned());
+            return;
+        };
+        self.update_editor(Action::InsertText(text));
+        if !system {
+            self.status = Some("Pasted from internal register".to_owned());
+        }
+    }
+
+    fn mouse_down(&mut self, column: u16, row: u16) {
+        if self.preview.contains(column, row) {
+            self.click_preview(column, row);
+        } else if self
+            .editor
+            .place_cursor(&mut self.document, column, row, false)
+        {
+            self.focus = Pane::Editor;
+            self.cursor_sync_deadline = Some(Instant::now() + CURSOR_SYNC_DELAY);
+            self.status = None;
+        }
+    }
+
+    fn mouse_drag(&mut self, column: u16, row: u16) {
+        if self
+            .editor
+            .place_cursor(&mut self.document, column, row, true)
+        {
+            self.focus = Pane::Editor;
+            self.cursor_sync_deadline = Some(Instant::now() + CURSOR_SYNC_DELAY);
+            self.status = None;
+        }
+    }
+
+    fn scroll_at(&mut self, column: u16, row: u16, lines: isize) {
+        if self.preview.contains(column, row) {
+            self.preview.scroll_lines(lines);
+            self.focus = Pane::Preview;
+        } else if self.editor.contains(column, row) {
+            self.editor.scroll_lines(lines, &self.document);
+            self.focus = Pane::Editor;
+        }
+    }
+
     fn tick(&mut self) {
         if self.compile_debounce.take_due(Instant::now()) {
             self.start_compile();
@@ -635,7 +812,6 @@ impl App {
         self.compile_debounce.cancel();
         self.compile_generation = self.compile_worker.spawn(
             self.document.revision(),
-            self.document.text(),
             self.picker.clone(),
             self.preview.target_width(),
         );
@@ -755,6 +931,8 @@ impl App {
         let area = frame.area();
         frame.render_widget(Block::default().style(base(&self.theme)), area);
         if let Some(welcome) = &self.welcome {
+            self.editor.hide();
+            self.preview.hide();
             welcome.draw(frame, area, &self.theme);
             if let Some(status) = &self.status {
                 frame.render_widget(
@@ -820,14 +998,21 @@ impl App {
             .is_some_and(|(revision, _)| *revision != self.document.revision());
         if self.fullscreen {
             match self.focus {
-                Pane::Explorer => self.explorer.draw(frame, area, true, &self.theme),
+                Pane::Explorer => {
+                    self.editor.hide();
+                    self.preview.hide();
+                    self.explorer.draw(frame, area, true, &self.theme);
+                }
                 Pane::Editor => {
+                    self.preview.hide();
                     self.editor
                         .draw(frame, area, &self.document, &self.diagnostics, true)
                 }
-                Pane::Preview => self
-                    .preview
-                    .draw(frame, area, true, preview_dimmed, &self.theme),
+                Pane::Preview => {
+                    self.editor.hide();
+                    self.preview
+                        .draw(frame, area, true, preview_dimmed, &self.theme);
+                }
             }
             return;
         }
@@ -849,12 +1034,14 @@ impl App {
             );
         }
         if area.width < NARROW_WIDTH && self.focus == Pane::Explorer {
+            self.editor.hide();
             self.preview.hide();
             self.explorer.draw(frame, main_area, true, &self.theme);
         } else if main_area.width < NARROW_WIDTH {
             self.preview.set_viewport(main_area);
             match self.focus {
                 Pane::Preview => {
+                    self.editor.hide();
                     self.preview
                         .draw(frame, main_area, true, preview_dimmed, &self.theme);
                 }
@@ -902,7 +1089,16 @@ impl App {
             (status.clone(), self.theme.foreground)
         } else {
             (
-                format!("Ln {}, Col {}", cursor.line + 1, cursor.column + 1),
+                if self.document.selection_graphemes() == 0 {
+                    format!("Ln {}, Col {}", cursor.line + 1, cursor.column + 1)
+                } else {
+                    format!(
+                        "Ln {}, Col {} | {} selected",
+                        cursor.line + 1,
+                        cursor.column + 1,
+                        self.document.selection_graphemes()
+                    )
+                },
                 self.theme.muted,
             )
         };
@@ -938,6 +1134,7 @@ impl App {
             Overlay::None => {}
             Overlay::Palette(palette) => palette.draw(frame, &self.theme),
             Overlay::Prompt(prompt) => prompt.draw(frame, &self.theme),
+            Overlay::Search(search) => search.draw(frame, &self.theme),
             Overlay::Help(help) => help.draw(frame, frame.area(), &self.keymap, &self.theme),
             Overlay::Confirm(confirmation) => {
                 let area = modal_area(frame.area(), 72, 5);

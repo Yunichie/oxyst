@@ -23,6 +23,8 @@ use super::Diagnostics;
 pub(crate) struct Editor {
     vertical_scroll: usize,
     horizontal_scroll: usize,
+    inner: Rect,
+    text_area: Rect,
     source: Source,
     highlighted_lines: Vec<Line<'static>>,
     theme: Theme,
@@ -35,6 +37,8 @@ impl Editor {
         Self {
             vertical_scroll: 0,
             horizontal_scroll: 0,
+            inner: Rect::default(),
+            text_area: Rect::default(),
             source,
             highlighted_lines,
             theme,
@@ -54,6 +58,8 @@ impl Editor {
             Action::Backspace => document.backspace(),
             Action::Delete => document.delete(),
             Action::Move(motion) => document.move_cursor(*motion),
+            Action::Select(motion) => document.move_cursor_selecting(*motion, true),
+            Action::SelectAll => document.select_all(),
             Action::Undo => document.undo(),
             Action::Redo => document.redo(),
             _ => {}
@@ -88,6 +94,7 @@ impl Editor {
             .border_style(Style::default().fg(color(border_color)))
             .title(" Editor ");
         let inner = block.inner(area);
+        self.inner = inner;
         frame.render_widget(block, area);
 
         if inner.width == 0 || inner.height == 0 {
@@ -101,6 +108,7 @@ impl Editor {
             Constraint::Fill(1),
         ])
         .areas(inner);
+        self.text_area = text_area;
         let cursor = document.cursor_position();
         self.keep_cursor_visible(cursor.line, cursor.visual_column, text_area);
 
@@ -122,6 +130,7 @@ impl Editor {
                 ])
             })
             .collect::<Vec<_>>();
+        let selection = document.selection_byte_range();
         let text = (self.vertical_scroll..end_line)
             .map(|line| {
                 let style = if line == cursor.line {
@@ -129,10 +138,16 @@ impl Editor {
                 } else {
                     Style::default()
                 };
-                self.highlighted_lines.get(line).cloned().map_or_else(
+                let content = self.highlighted_lines.get(line).cloned().map_or_else(
                     || Line::from(document.line(line).unwrap_or_default()).style(style),
                     |content| content.style(style),
-                )
+                );
+                let line_start = self
+                    .source
+                    .lines()
+                    .line_to_range(line)
+                    .map_or(0, |range| range.start);
+                apply_selection(content, line_start, selection.as_ref(), self.theme)
             })
             .collect::<Vec<_>>();
 
@@ -168,6 +183,48 @@ impl Editor {
         } else if visual_column >= self.horizontal_scroll + width {
             self.horizontal_scroll = visual_column + 1 - width;
         }
+    }
+
+    pub(crate) fn contains(&self, column: u16, row: u16) -> bool {
+        column >= self.inner.x
+            && column < self.inner.right()
+            && row >= self.inner.y
+            && row < self.inner.bottom()
+    }
+
+    pub(crate) fn hide(&mut self) {
+        self.inner = Rect::default();
+        self.text_area = Rect::default();
+    }
+
+    pub(crate) fn place_cursor(
+        &self,
+        document: &mut Document,
+        column: u16,
+        row: u16,
+        selecting: bool,
+    ) -> bool {
+        if !self.contains(column, row) {
+            return false;
+        }
+        let line = self
+            .vertical_scroll
+            .saturating_add(usize::from(row.saturating_sub(self.text_area.y)))
+            .min(document.line_count().saturating_sub(1));
+        let visual_column = if column < self.text_area.x {
+            0
+        } else {
+            self.horizontal_scroll
+                .saturating_add(usize::from(column - self.text_area.x))
+        };
+        document.set_cursor_visual_position(line, visual_column, selecting)
+    }
+
+    pub(crate) fn scroll_lines(&mut self, lines: isize, document: &Document) {
+        self.vertical_scroll = self
+            .vertical_scroll
+            .saturating_add_signed(lines)
+            .min(document.line_count().saturating_sub(1));
     }
 }
 
@@ -267,6 +324,45 @@ fn highlighted_line(
     }
 
     Line::from(spans)
+}
+
+fn apply_selection(
+    line: Line<'static>,
+    line_start: usize,
+    selection: Option<&Range<usize>>,
+    theme: Theme,
+) -> Line<'static> {
+    let Some(selection) = selection else {
+        return line;
+    };
+    let mut offset = line_start;
+    let mut spans = Vec::new();
+    for span in line.spans {
+        let content = span.content.into_owned();
+        let end = offset + content.len();
+        let selected_start = selection.start.clamp(offset, end);
+        let selected_end = selection.end.clamp(offset, end);
+        if offset < selected_start {
+            spans.push(Span::styled(
+                content[..selected_start - offset].to_owned(),
+                span.style,
+            ));
+        }
+        if selected_start < selected_end {
+            spans.push(Span::styled(
+                content[selected_start - offset..selected_end - offset].to_owned(),
+                span.style.bg(color(theme.selection)),
+            ));
+        }
+        if selected_end < end {
+            spans.push(Span::styled(
+                content[selected_end - offset..].to_owned(),
+                span.style,
+            ));
+        }
+        offset = end;
+    }
+    Line::from(spans).style(line.style)
 }
 
 fn scroll_as_u16(value: usize) -> u16 {
@@ -378,6 +474,44 @@ mod tests {
                 .any(|cell| cell.symbol() == "E" && cell.fg == Color::Red)
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn selection_background_preserves_the_editor_content() -> Result<(), Infallible> {
+        let mut document = Document::new("first");
+        document.move_cursor_selecting(Motion::Right, true);
+        document.move_cursor_selecting(Motion::Right, true);
+        let mut editor = Editor::new("first", theme());
+        let diagnostics = Diagnostics::default();
+        let backend = TestBackend::new(30, 5);
+        let mut terminal = Terminal::new(backend)?;
+
+        terminal.draw(|frame| editor.draw(frame, frame.area(), &document, &diagnostics, true))?;
+
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| { matches!(cell.symbol(), "f" | "i") && cell.bg == Color::DarkGray })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mouse_position_uses_visual_columns_for_wide_text() -> Result<(), Infallible> {
+        let mut document = Document::new("one\n界two");
+        let mut editor = Editor::new("one\n界two", theme());
+        let diagnostics = Diagnostics::default();
+        let backend = TestBackend::new(30, 6);
+        let mut terminal = Terminal::new(backend)?;
+        terminal.draw(|frame| editor.draw(frame, frame.area(), &document, &diagnostics, true))?;
+
+        assert!(editor.place_cursor(&mut document, 6, 2, false));
+        assert_eq!(document.cursor_position().line, 1);
+        assert_eq!(document.cursor_position().visual_column, 2);
         Ok(())
     }
 }

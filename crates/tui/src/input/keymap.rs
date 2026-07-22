@@ -13,6 +13,7 @@ pub(crate) enum InputMode {
     Normal,
     Overlay,
     Help,
+    Search,
     Welcome,
     Confirmation,
     QuitConfirmation,
@@ -66,7 +67,7 @@ pub(crate) fn resolve(event: Event, mode: InputMode, keymap: &Keymap) -> Option<
         Event::ExportFinished(result) => Some(Action::ExportFinished(result)),
         Event::Tick => Some(Action::Tick),
         Event::Paste(text) if matches!(mode, InputMode::Normal) => Some(Action::InsertText(text)),
-        Event::Paste(text) if matches!(mode, InputMode::Overlay) => {
+        Event::Paste(text) if matches!(mode, InputMode::Overlay | InputMode::Search) => {
             Some(Action::OverlayInputText(text))
         }
         Event::Mouse(mouse) if matches!(mode, InputMode::Normal) => resolve_mouse(mouse),
@@ -99,6 +100,7 @@ fn resolve_key(key: KeyEvent, mode: InputMode, keymap: &Keymap) -> Option<Action
                 None
             }
         }
+        InputMode::Search => resolve_search_key(key, keymap),
         InputMode::Overlay => resolve_overlay_key(key, keymap),
         InputMode::Welcome => {
             if keymap.matches("help", key) {
@@ -110,6 +112,30 @@ fn resolve_key(key: KeyEvent, mode: InputMode, keymap: &Keymap) -> Option<Action
             }
         }
         InputMode::Normal => resolve_normal_key(key, keymap),
+    }
+}
+
+fn resolve_search_key(key: KeyEvent, keymap: &Keymap) -> Option<Action> {
+    if keymap.matches("close_overlay", key) {
+        Some(Action::CloseOverlay)
+    } else if keymap.matches("find_previous", key) {
+        Some(Action::SearchNext(true))
+    } else if keymap.matches("replace_current", key) {
+        Some(Action::ReplaceCurrent)
+    } else if keymap.matches("find_next", key) {
+        Some(Action::SearchNext(false))
+    } else if keymap.matches("search_toggle_field", key) {
+        Some(Action::SearchToggleField)
+    } else if keymap.matches("backspace", key) {
+        Some(Action::OverlayBackspace)
+    } else if let KeyCode::Char(character) = key.code
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        Some(Action::OverlayInput(character))
+    } else {
+        None
     }
 }
 
@@ -139,6 +165,18 @@ fn resolve_normal_key(key: KeyEvent, keymap: &Keymap) -> Option<Action> {
     let binding = |name| keymap.matches(name, key);
     if binding("quit") {
         Some(Action::RequestQuit)
+    } else if binding("select_all") {
+        Some(Action::SelectAll)
+    } else if binding("copy") {
+        Some(Action::Copy)
+    } else if binding("cut") {
+        Some(Action::Cut)
+    } else if binding("paste") {
+        Some(Action::PasteClipboard)
+    } else if binding("find_replace") {
+        Some(Action::OpenReplace)
+    } else if binding("find") {
+        Some(Action::OpenFind)
     } else if binding("recompile") {
         Some(Action::Recompile)
     } else if binding("save") {
@@ -175,6 +213,18 @@ fn resolve_normal_key(key: KeyEvent, keymap: &Keymap) -> Option<Action> {
         Some(Action::Move(Motion::Up))
     } else if binding("move_down") {
         Some(Action::Move(Motion::Down))
+    } else if binding("select_word_left") {
+        Some(Action::Select(Motion::WordLeft))
+    } else if binding("select_word_right") {
+        Some(Action::Select(Motion::WordRight))
+    } else if binding("select_left") {
+        Some(Action::Select(Motion::Left))
+    } else if binding("select_right") {
+        Some(Action::Select(Motion::Right))
+    } else if binding("select_up") {
+        Some(Action::Select(Motion::Up))
+    } else if binding("select_down") {
+        Some(Action::Select(Motion::Down))
     } else if binding("preview_page_up") {
         Some(Action::ScrollPreviewPages(-1))
     } else if binding("preview_page_down") {
@@ -193,6 +243,14 @@ fn resolve_normal_key(key: KeyEvent, keymap: &Keymap) -> Option<Action> {
         Some(Action::Move(Motion::LineStart))
     } else if binding("line_end") {
         Some(Action::Move(Motion::LineEnd))
+    } else if binding("select_document_start") {
+        Some(Action::Select(Motion::DocumentStart))
+    } else if binding("select_document_end") {
+        Some(Action::Select(Motion::DocumentEnd))
+    } else if binding("select_line_start") {
+        Some(Action::Select(Motion::LineStart))
+    } else if binding("select_line_end") {
+        Some(Action::Select(Motion::LineEnd))
     } else if binding("backspace") {
         Some(Action::Backspace)
     } else if binding("delete") {
@@ -212,7 +270,11 @@ fn resolve_normal_key(key: KeyEvent, keymap: &Keymap) -> Option<Action> {
 
 fn resolve_mouse(mouse: MouseEvent) -> Option<Action> {
     match mouse.kind {
-        MouseEventKind::Down(MouseButton::Left) => Some(Action::Click {
+        MouseEventKind::Down(MouseButton::Left) => Some(Action::MouseDown {
+            column: mouse.column,
+            row: mouse.row,
+        }),
+        MouseEventKind::Drag(MouseButton::Left) => Some(Action::MouseDrag {
             column: mouse.column,
             row: mouse.row,
         }),
@@ -368,6 +430,44 @@ mod tests {
             &keymap,
         );
         assert!(matches!(action, Some(Action::Insert('A'))));
+        Ok(())
+    }
+
+    #[test]
+    fn default_selection_and_clipboard_bindings_resolve() -> Result<(), String> {
+        let keymap = Keymap::new(&Config::default())?;
+        let selection = resolve_key(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
+            InputMode::Normal,
+            &keymap,
+        );
+        let copy = resolve_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            InputMode::Normal,
+            &keymap,
+        );
+
+        assert!(matches!(selection, Some(Action::Select(_))));
+        assert!(matches!(copy, Some(Action::Copy)));
+        Ok(())
+    }
+
+    #[test]
+    fn search_bindings_are_scoped_to_the_search_overlay() -> Result<(), String> {
+        let keymap = Keymap::new(&Config::default())?;
+        let replace = resolve_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            InputMode::Search,
+            &keymap,
+        );
+        let previous = resolve_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            InputMode::Search,
+            &keymap,
+        );
+
+        assert!(matches!(replace, Some(Action::ReplaceCurrent)));
+        assert!(matches!(previous, Some(Action::SearchNext(true))));
         Ok(())
     }
 }
