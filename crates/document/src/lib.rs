@@ -108,6 +108,11 @@ impl Document {
     }
 
     #[must_use]
+    pub fn cursor_byte_index(&self) -> usize {
+        self.text.char_to_byte(self.cursor)
+    }
+
+    #[must_use]
     pub fn cursor_position(&self) -> CursorPosition {
         let line = self.text.char_to_line(self.cursor);
         let line_start = self.text.line_to_char(line);
@@ -133,6 +138,32 @@ impl Document {
     #[must_use]
     pub fn last_edit(&self) -> Option<&TextEdit> {
         self.last_edit.as_ref()
+    }
+
+    pub fn set_cursor_byte_index(&mut self, byte: usize) -> bool {
+        if byte > self.text.len_bytes() {
+            return false;
+        }
+        let cursor = self.text.byte_to_char(byte);
+        if self.text.char_to_byte(cursor) != byte {
+            return false;
+        }
+
+        self.cursor = cursor;
+        self.preferred_visual_column = None;
+        true
+    }
+
+    pub fn set_cursor_line_char(&mut self, line: usize, column: usize) -> bool {
+        if line >= self.line_count() {
+            return false;
+        }
+
+        let line_start = self.text.line_to_char(line);
+        let line_length = self.line_without_ending(line).chars().count();
+        self.cursor = line_start + column.min(line_length);
+        self.preferred_visual_column = None;
+        true
     }
 
     pub fn mark_saved(&mut self) {
@@ -524,5 +555,21 @@ mod tests {
         document.undo();
         assert_eq!(document.last_edit().map(TextEdit::range), Some(3..3));
         assert_eq!(document.last_edit().map(TextEdit::replacement), Some("界"));
+    }
+
+    #[test]
+    fn cursor_placement_validates_utf8_boundaries() {
+        let mut document = Document::new("aé\n界");
+
+        assert!(document.set_cursor_byte_index(3));
+        assert_eq!(document.cursor_position().line, 0);
+        assert_eq!(document.cursor_position().column, 2);
+        assert!(!document.set_cursor_byte_index(2));
+        assert_eq!(document.cursor_byte_index(), 3);
+
+        assert!(document.set_cursor_line_char(1, 99));
+        assert_eq!(document.cursor_position().line, 1);
+        assert_eq!(document.cursor_position().column, 1);
+        assert!(!document.set_cursor_line_char(2, 0));
     }
 }
