@@ -31,6 +31,7 @@ pub(crate) struct Editor {
     non_code_ranges: Vec<Range<usize>>,
     visual_rows: Vec<VisualRow>,
     layout_width: u16,
+    preferred_visual_column: Option<usize>,
     theme: Theme,
 }
 
@@ -48,6 +49,7 @@ impl Editor {
             non_code_ranges,
             visual_rows: Vec::new(),
             layout_width: 0,
+            preferred_visual_column: None,
             theme,
         }
     }
@@ -60,6 +62,12 @@ impl Editor {
 
     pub(crate) fn update(&mut self, action: &Action, document: &mut Document) {
         let revision = document.revision();
+        if !matches!(
+            action,
+            Action::Move(Motion::Up | Motion::Down) | Action::Select(Motion::Up | Motion::Down)
+        ) {
+            self.preferred_visual_column = None;
+        }
         match action {
             Action::Insert(character) => document.insert_char(*character),
             Action::InsertText(text) => document.insert_text(text),
@@ -223,7 +231,7 @@ impl Editor {
     }
 
     pub(crate) fn place_cursor(
-        &self,
+        &mut self,
         document: &mut Document,
         column: u16,
         row: u16,
@@ -232,6 +240,7 @@ impl Editor {
         if !self.contains(column, row) {
             return false;
         }
+        self.preferred_visual_column = None;
         let row = self
             .vertical_scroll
             .saturating_add(usize::from(row.saturating_sub(self.text_area.y)))
@@ -254,12 +263,17 @@ impl Editor {
             .min(self.visual_rows.len().saturating_sub(1));
     }
 
+    pub(crate) fn reset_preferred_visual_column(&mut self) {
+        self.preferred_visual_column = None;
+    }
+
     fn ensure_layout(&mut self, width: u16) {
         let width = width.max(1);
         if self.layout_width == width && !self.visual_rows.is_empty() {
             return;
         }
         self.layout_width = width;
+        self.preferred_visual_column = None;
         self.visual_rows.clear();
         for (logical_line, content) in self.highlighted_lines.iter().enumerate() {
             let byte_start = self
@@ -299,7 +313,7 @@ impl Editor {
             .unwrap_or(0)
     }
 
-    fn move_vertically(&self, document: &mut Document, direction: isize, selecting: bool) {
+    fn move_vertically(&mut self, document: &mut Document, direction: isize, selecting: bool) {
         let motion = if direction < 0 {
             Motion::Up
         } else {
@@ -307,6 +321,7 @@ impl Editor {
         };
         if self.visual_rows.is_empty() || (!selecting && document.selection_byte_range().is_some())
         {
+            self.preferred_visual_column = None;
             document.move_cursor_selecting(motion, selecting);
             return;
         }
@@ -318,14 +333,18 @@ impl Editor {
             .min(self.visual_rows.len().saturating_sub(1));
         let current_row = &self.visual_rows[current];
         let target_row = &self.visual_rows[target];
-        let column = cursor
-            .visual_column
-            .saturating_sub(current_row.start_visual_column);
-        document.set_cursor_visual_position(
+        let column = self.preferred_visual_column.unwrap_or_else(|| {
+            cursor
+                .visual_column
+                .saturating_sub(current_row.start_visual_column)
+        });
+        if document.set_cursor_visual_position(
             target_row.logical_line,
             target_row.start_visual_column.saturating_add(column),
             selecting,
-        );
+        ) {
+            self.preferred_visual_column = Some(column);
+        }
     }
 }
 
@@ -902,6 +921,25 @@ mod tests {
                 .iter()
                 .any(|cell| cell.symbol() == "↪")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn vertical_motion_preserves_the_column_across_short_lines() -> Result<(), Infallible> {
+        let source = "abcd\nx\nabcd";
+        let mut document = Document::new(source);
+        let mut editor = Editor::new(source, theme());
+        let diagnostics = Diagnostics::default();
+        let backend = TestBackend::new(30, 7);
+        let mut terminal = Terminal::new(backend)?;
+        terminal.draw(|frame| editor.draw(frame, frame.area(), &document, &diagnostics, true))?;
+        assert!(document.set_cursor_line_char(0, 3));
+
+        editor.update(&Action::Move(Motion::Down), &mut document);
+        assert_eq!(document.cursor_position().visual_column, 1);
+        editor.update(&Action::Move(Motion::Down), &mut document);
+        assert_eq!(document.cursor_position().visual_column, 3);
+
         Ok(())
     }
 
