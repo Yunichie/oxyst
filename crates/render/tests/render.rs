@@ -1,7 +1,7 @@
 use std::{error::Error, fs, io, path::PathBuf};
 
 use typst_tui_compiler::{CompileOutcome, Compiler};
-use typst_tui_render::{ExportFormat, export};
+use typst_tui_render::{Error as RenderError, ExportFormat, export};
 
 #[test]
 fn renders_compiled_page_pixels() -> Result<(), Box<dyn Error>> {
@@ -44,6 +44,17 @@ fn exports_all_supported_formats() -> Result<(), Box<dyn Error>> {
         let path = output_root.join(format!("document.{}", format.extension()));
         export(&document, format, &path)?;
         assert!(fs::metadata(path)?.len() > 0);
+    }
+
+    let missing_path = output_root.join("missing").join("document.pdf");
+    let Err(error) = export(&document, ExportFormat::Pdf, &missing_path) else {
+        return Err(io::Error::other("export unexpectedly created a missing directory").into());
+    };
+    match error {
+        RenderError::Write { path, .. } => assert_eq!(path, missing_path),
+        other => {
+            return Err(io::Error::other(format!("unexpected export error: {other}")).into());
+        }
     }
 
     fs::remove_dir_all(output_root)?;

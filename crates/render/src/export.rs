@@ -1,11 +1,10 @@
 use std::{fs, io::Cursor, path::Path};
 
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage, imageops};
-use thiserror::Error;
 use typst::layout::Abs;
 use typst_tui_compiler::CompiledDocument;
 
-use crate::render_at;
+use crate::{Error, render_at};
 
 const EXPORT_PIXELS_PER_POINT: f64 = 2.0;
 const PAGE_GAP: u32 = 16;
@@ -35,24 +34,6 @@ impl ExportFormat {
             Self::Svg => "SVG",
         }
     }
-}
-
-#[derive(Debug, Error)]
-pub enum Error {
-    #[error("could not export PDF: {0}")]
-    Pdf(String),
-    #[error("could not render PNG")]
-    Render(#[from] crate::Error),
-    #[error("could not encode PNG")]
-    Encode(#[from] image::ImageError),
-    #[error("exported PNG dimensions are too large")]
-    PngTooLarge,
-    #[error("could not write export to {path}")]
-    Write {
-        path: std::path::PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
 }
 
 pub fn export(document: &CompiledDocument, format: ExportFormat, path: &Path) -> Result<(), Error> {

@@ -36,6 +36,18 @@ pub enum Error {
     InvalidPixelData { page: usize },
     #[error("preview rendering was cancelled")]
     Cancelled,
+    #[error("could not export PDF: {0}")]
+    Pdf(String),
+    #[error("could not encode PNG")]
+    EncodePng(#[from] image::ImageError),
+    #[error("exported PNG dimensions are too large")]
+    PngTooLarge,
+    #[error("could not write export to {path}")]
+    Write {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 pub struct RenderedDocument {
