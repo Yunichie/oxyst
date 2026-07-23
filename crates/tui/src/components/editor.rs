@@ -1,4 +1,4 @@
-use std::{cmp, collections::BTreeMap, ops::Range};
+use std::{collections::BTreeMap, ops::Range};
 
 use ratatui::{
     Frame,
@@ -7,9 +7,9 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph},
 };
-use typst_syntax::{LinkedNode, Source, Tag, highlight};
+use typst_syntax::{LinkedNode, Side, Source, Tag, highlight};
 use typst_tui_compiler::Severity;
-use typst_tui_document::{Document, Motion};
+use typst_tui_document::{Document, Motion, TextEdit};
 use typst_tui_theme::{TextStyle, Theme};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -24,14 +24,14 @@ use super::{Component, Diagnostics};
 #[derive(Debug)]
 pub(crate) struct Editor {
     document: Document,
-    vertical_scroll: usize,
+    scroll: VisualPosition,
     follow_cursor: bool,
     inner: Rect,
     text_area: Rect,
     source: Source,
-    highlighted_lines: Vec<Line<'static>>,
-    non_code_ranges: Vec<Range<usize>>,
-    visual_rows: Vec<VisualRow>,
+    line_rows: Vec<usize>,
+    total_visual_rows: usize,
+    viewport_rows: Vec<VisualRow>,
     layout_width: u16,
     preferred_visual_column: Option<usize>,
     diagnostic_lines: BTreeMap<usize, Severity>,
@@ -41,18 +41,17 @@ pub(crate) struct Editor {
 impl Editor {
     pub(crate) fn new(text: &str, theme: Theme) -> Self {
         let source = Source::detached(text);
-        let highlighted_lines = highlighted_lines(&source, theme);
-        let non_code_ranges = non_code_ranges(&source);
+        let line_count = source.lines().len_lines();
         Self {
             document: Document::new(text),
-            vertical_scroll: 0,
+            scroll: VisualPosition::default(),
             follow_cursor: true,
             inner: Rect::default(),
             text_area: Rect::default(),
             source,
-            highlighted_lines,
-            non_code_ranges,
-            visual_rows: Vec::new(),
+            line_rows: vec![1; line_count],
+            total_visual_rows: line_count,
+            viewport_rows: Vec::new(),
             layout_width: 0,
             preferred_visual_column: None,
             diagnostic_lines: BTreeMap::new(),
@@ -62,8 +61,6 @@ impl Editor {
 
     pub(crate) fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
-        self.highlighted_lines = highlighted_lines(&self.source, theme);
-        self.layout_width = 0;
     }
 
     fn apply_action(&mut self, action: &Action) {
@@ -93,14 +90,12 @@ impl Editor {
         }
 
         if self.document.revision() != revision {
-            if let Some(edit) = self.document.last_edit() {
-                self.source.edit(edit.range(), edit.replacement());
+            if let Some(edit) = self.document.last_edit().cloned() {
+                self.apply_source_edit(&edit);
             } else {
                 self.source.replace(&self.document.text());
+                self.reset_layout();
             }
-            self.highlighted_lines = highlighted_lines(&self.source, self.theme);
-            self.non_code_ranges = non_code_ranges(&self.source);
-            self.layout_width = 0;
         }
         if self.document.revision() != revision || self.document.cursor_char_index() != cursor {
             self.follow_cursor = true;
@@ -136,18 +131,18 @@ impl Editor {
         self.text_area = text_area;
         let cursor = self.document.cursor_position();
         self.ensure_layout(text_area.width);
-        let cursor_row = self.cursor_visual_row(cursor.line, cursor.visual_column);
+        let cursor_row = self.visual_position(cursor.line, cursor.visual_column);
         if self.follow_cursor {
             self.keep_cursor_visible(cursor_row, text_area);
         } else {
             self.clamp_scroll(text_area.height);
         }
 
-        let visible_lines = usize::from(text_area.height);
-        let end_line = (self.vertical_scroll + visible_lines).min(self.visual_rows.len());
-        let gutter = (self.vertical_scroll..end_line)
-            .map(|row| {
-                let visual = &self.visual_rows[row];
+        self.viewport_rows = self.build_viewport_rows(usize::from(text_area.height));
+        let gutter = self
+            .viewport_rows
+            .iter()
+            .map(|visual| {
                 let (marker, marker_color) = if visual.continuation {
                     ("↪", self.theme.muted)
                 } else {
@@ -172,14 +167,11 @@ impl Editor {
             })
             .collect::<Vec<_>>();
         let selection = self.document.selection_byte_range();
-        let brackets = matching_brackets(
-            self.source.text(),
-            self.document.cursor_byte_index(),
-            &self.non_code_ranges,
-        );
-        let text = (self.vertical_scroll..end_line)
-            .map(|row| {
-                let visual = &self.visual_rows[row];
+        let brackets = matching_brackets(&self.source, self.document.cursor_byte_index());
+        let text = self
+            .viewport_rows
+            .iter()
+            .map(|visual| {
                 let style = if visual.logical_line == cursor.line {
                     Style::default().bg(color(self.theme.current_line))
                 } else {
@@ -197,32 +189,36 @@ impl Editor {
         frame.render_widget(Paragraph::new(gutter), gutter_area);
         frame.render_widget(Paragraph::new(text), text_area);
 
-        if focused && cursor_row >= self.vertical_scroll && cursor_row < end_line {
-            let row = &self.visual_rows[cursor_row];
+        if focused
+            && let Some((screen_row, row)) = self
+                .viewport_rows
+                .iter()
+                .enumerate()
+                .find(|(_, row)| row.position() == cursor_row)
+        {
             let cursor_x = cursor
                 .visual_column
                 .saturating_sub(row.start_visual_column)
                 .min(usize::from(text_area.width.saturating_sub(1)));
             let x = text_area.x.saturating_add(scroll_as_u16(cursor_x));
-            let y = text_area
-                .y
-                .saturating_add(scroll_as_u16(cursor_row - self.vertical_scroll));
+            let y = text_area.y.saturating_add(scroll_as_u16(screen_row));
             if x < text_area.right() && y < text_area.bottom() {
                 frame.set_cursor_position((x, y));
             }
         }
     }
 
-    fn keep_cursor_visible(&mut self, row: usize, area: Rect) {
+    fn keep_cursor_visible(&mut self, cursor: VisualPosition, area: Rect) {
         let height = usize::from(area.height.max(1));
-        if row < self.vertical_scroll {
-            self.vertical_scroll = row;
-        } else if row >= self.vertical_scroll + height {
-            self.vertical_scroll = row + 1 - height;
+        if cursor < self.scroll {
+            self.scroll = cursor;
+        } else if self.visual_distance(self.scroll, cursor) >= height {
+            self.scroll = self.advance_visual_position(
+                cursor,
+                -isize::try_from(height.saturating_sub(1)).unwrap_or(isize::MAX),
+            );
         }
-        self.vertical_scroll = self
-            .vertical_scroll
-            .min(self.visual_rows.len().saturating_sub(1));
+        self.clamp_scroll(area.height);
     }
 
     pub(crate) fn contains(&self, column: u16, row: u16) -> bool {
@@ -242,11 +238,14 @@ impl Editor {
             return false;
         }
         self.preferred_visual_column = None;
-        let row = self
-            .vertical_scroll
-            .saturating_add(usize::from(row.saturating_sub(self.text_area.y)))
-            .min(self.visual_rows.len().saturating_sub(1));
-        let visual = &self.visual_rows[row];
+        let screen_row = usize::from(row.saturating_sub(self.text_area.y));
+        let Some(visual) = self
+            .viewport_rows
+            .get(screen_row)
+            .or_else(|| self.viewport_rows.last())
+        else {
+            return false;
+        };
         let visual_column = if column < self.text_area.x {
             visual.start_visual_column
         } else {
@@ -265,10 +264,8 @@ impl Editor {
 
     pub(crate) fn scroll_lines(&mut self, lines: isize) {
         self.follow_cursor = false;
-        self.vertical_scroll = self
-            .vertical_scroll
-            .saturating_add_signed(lines)
-            .min(self.max_scroll());
+        self.scroll = self.advance_visual_position(self.scroll, lines);
+        self.clamp_scroll(self.text_area.height);
     }
 
     pub(crate) fn reset_preferred_visual_column(&mut self) {
@@ -277,48 +274,28 @@ impl Editor {
 
     fn ensure_layout(&mut self, width: u16) {
         let width = width.max(1);
-        if self.layout_width == width && !self.visual_rows.is_empty() {
+        if self.layout_width == width && self.line_rows.len() == self.source.lines().len_lines() {
             return;
         }
         self.layout_width = width;
         self.preferred_visual_column = None;
-        self.visual_rows.clear();
-        for (logical_line, content) in self.highlighted_lines.iter().enumerate() {
-            let byte_start = self
-                .source
-                .lines()
-                .line_to_range(logical_line)
-                .map_or(0, |range| range.start);
-            self.visual_rows.extend(wrap_line(
-                content,
-                logical_line,
-                byte_start,
-                usize::from(width),
-            ));
-        }
-        if self.visual_rows.is_empty() {
-            self.visual_rows.push(VisualRow::empty(0, 0, 0, false));
-        }
-        self.vertical_scroll = self
-            .vertical_scroll
-            .min(self.visual_rows.len().saturating_sub(1));
+        self.line_rows = (0..self.source.lines().len_lines())
+            .map(|line| line_row_count(&self.source, line, usize::from(width)))
+            .collect();
+        self.total_visual_rows = self.line_rows.iter().sum();
+        self.clamp_scroll(self.text_area.height);
     }
 
-    fn cursor_visual_row(&self, logical_line: usize, visual_column: usize) -> usize {
-        self.visual_rows
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| {
-                row.logical_line == logical_line && row.start_visual_column <= visual_column
-            })
-            .map(|(index, _)| index)
-            .next_back()
-            .or_else(|| {
-                self.visual_rows
-                    .iter()
-                    .position(|row| row.logical_line == logical_line)
-            })
-            .unwrap_or(0)
+    fn visual_position(&self, logical_line: usize, visual_column: usize) -> VisualPosition {
+        let line = logical_line.min(self.line_rows.len().saturating_sub(1));
+        let subrow = source_line_content(&self.source, line).map_or(0, |(_, content)| {
+            visual_row_at_column(
+                content,
+                usize::from(self.layout_width.max(1)),
+                visual_column,
+            )
+        });
+        VisualPosition { line, subrow }
     }
 
     fn move_vertically(&mut self, direction: isize, selecting: bool) {
@@ -327,8 +304,7 @@ impl Editor {
         } else {
             Motion::Down
         };
-        if self.visual_rows.is_empty()
-            || (!selecting && self.document.selection_byte_range().is_some())
+        if self.layout_width == 0 || (!selecting && self.document.selection_byte_range().is_some())
         {
             self.preferred_visual_column = None;
             self.document.move_cursor_selecting(motion, selecting);
@@ -336,24 +312,203 @@ impl Editor {
         }
 
         let cursor = self.document.cursor_position();
-        let current = self.cursor_visual_row(cursor.line, cursor.visual_column);
-        let target = current
-            .saturating_add_signed(direction)
-            .min(self.visual_rows.len().saturating_sub(1));
-        let current_row = &self.visual_rows[current];
-        let target_row = &self.visual_rows[target];
-        let column = self.preferred_visual_column.unwrap_or_else(|| {
-            cursor
-                .visual_column
-                .saturating_sub(current_row.start_visual_column)
-        });
+        let current = self.visual_position(cursor.line, cursor.visual_column);
+        let target = self.advance_visual_position(current, direction);
+        let current_start = self.visual_row_start(current);
+        let target_start = self.visual_row_start(target);
+        let column = self
+            .preferred_visual_column
+            .unwrap_or_else(|| cursor.visual_column.saturating_sub(current_start));
         if self.document.set_cursor_visual_position(
-            target_row.logical_line,
-            target_row.start_visual_column.saturating_add(column),
+            target.line,
+            target_start.saturating_add(column),
             selecting,
         ) {
             self.preferred_visual_column = Some(column);
         }
+    }
+
+    fn apply_source_edit(&mut self, edit: &TextEdit) {
+        let range = edit.range();
+        let old_line_count = self.source.lines().len_lines();
+        let start_line = self
+            .source
+            .lines()
+            .byte_to_line(range.start)
+            .unwrap_or(old_line_count.saturating_sub(1));
+        let old_end_line = self
+            .source
+            .lines()
+            .byte_to_line(range.end)
+            .unwrap_or(old_line_count.saturating_sub(1));
+        let metrics_match = self.line_rows.len() == old_line_count;
+
+        self.source.edit(range.clone(), edit.replacement());
+
+        if !metrics_match {
+            self.reset_layout();
+            return;
+        }
+
+        let new_line_count = self.source.lines().len_lines();
+        let replacement_end = range
+            .start
+            .saturating_add(edit.replacement().len())
+            .min(self.source.text().len());
+        let new_end_line = self
+            .source
+            .lines()
+            .byte_to_line(replacement_end)
+            .unwrap_or(new_line_count.saturating_sub(1));
+        let width = usize::from(self.layout_width.max(1));
+        let replacement_rows = (start_line..=new_end_line)
+            .map(|line| {
+                if self.layout_width == 0 {
+                    1
+                } else {
+                    line_row_count(&self.source, line, width)
+                }
+            })
+            .collect::<Vec<_>>();
+        let removed_rows: usize = self.line_rows[start_line..=old_end_line].iter().sum();
+        let added_rows: usize = replacement_rows.iter().sum();
+        self.line_rows
+            .splice(start_line..=old_end_line, replacement_rows);
+        self.total_visual_rows = self
+            .total_visual_rows
+            .saturating_sub(removed_rows)
+            .saturating_add(added_rows);
+
+        let old_span = old_end_line - start_line + 1;
+        let new_span = new_end_line - start_line + 1;
+        if self.scroll.line > old_end_line {
+            self.scroll.line = self
+                .scroll
+                .line
+                .saturating_sub(old_span)
+                .saturating_add(new_span);
+        } else if self.scroll.line >= start_line {
+            self.scroll = VisualPosition {
+                line: start_line,
+                subrow: 0,
+            };
+        }
+        self.viewport_rows.clear();
+    }
+
+    fn reset_layout(&mut self) {
+        let line_count = self.source.lines().len_lines();
+        self.line_rows = vec![1; line_count];
+        self.total_visual_rows = line_count;
+        self.viewport_rows.clear();
+        self.layout_width = 0;
+        self.scroll = VisualPosition::default();
+    }
+
+    fn build_viewport_rows(&self, height: usize) -> Vec<VisualRow> {
+        let mut rows = Vec::with_capacity(height);
+        let mut line = self.scroll.line;
+        let mut skip = self.scroll.subrow;
+
+        while rows.len() < height && line < self.line_rows.len() {
+            rows.extend(wrap_line_window(
+                &self.source,
+                line,
+                usize::from(self.layout_width.max(1)),
+                skip,
+                height - rows.len(),
+            ));
+            line += 1;
+            skip = 0;
+        }
+
+        if let (Some(first), Some(last)) = (rows.first(), rows.last()) {
+            let ranges = styled_ranges(&self.source, first.byte_start..last.byte_end, self.theme);
+            let mut first_range = 0;
+            for row in &mut rows {
+                row.content = highlighted_range(
+                    self.source.text(),
+                    row.byte_start..row.byte_end,
+                    &ranges,
+                    &mut first_range,
+                );
+            }
+        }
+        rows
+    }
+
+    fn visual_row_start(&self, position: VisualPosition) -> usize {
+        source_line_content(&self.source, position.line).map_or(0, |(_, content)| {
+            visual_column_at_row(
+                content,
+                usize::from(self.layout_width.max(1)),
+                position.subrow,
+            )
+        })
+    }
+
+    fn advance_visual_position(
+        &self,
+        mut position: VisualPosition,
+        distance: isize,
+    ) -> VisualPosition {
+        if self.line_rows.is_empty() {
+            return VisualPosition::default();
+        }
+        position.line = position.line.min(self.line_rows.len() - 1);
+        position.subrow = position
+            .subrow
+            .min(self.line_rows[position.line].saturating_sub(1));
+        let mut remaining = distance.unsigned_abs();
+
+        if distance >= 0 {
+            while remaining > 0 {
+                let available = self.line_rows[position.line]
+                    .saturating_sub(position.subrow)
+                    .saturating_sub(1);
+                if remaining <= available {
+                    position.subrow += remaining;
+                    break;
+                }
+                if position.line + 1 == self.line_rows.len() {
+                    position.subrow = self.line_rows[position.line].saturating_sub(1);
+                    break;
+                }
+                remaining -= available + 1;
+                position.line += 1;
+                position.subrow = 0;
+            }
+        } else {
+            while remaining > 0 {
+                if remaining <= position.subrow {
+                    position.subrow -= remaining;
+                    break;
+                }
+                if position.line == 0 {
+                    return VisualPosition::default();
+                }
+                remaining -= position.subrow + 1;
+                position.line -= 1;
+                position.subrow = self.line_rows[position.line].saturating_sub(1);
+            }
+        }
+
+        position
+    }
+
+    fn visual_distance(&self, start: VisualPosition, end: VisualPosition) -> usize {
+        if end < start {
+            return self.visual_distance(end, start);
+        }
+        if start.line == end.line {
+            return end.subrow.saturating_sub(start.subrow);
+        }
+
+        self.line_rows[start.line].saturating_sub(start.subrow)
+            + self.line_rows[start.line + 1..end.line]
+                .iter()
+                .sum::<usize>()
+            + end.subrow
     }
 
     pub(crate) fn set_diagnostics(&mut self, diagnostics: &Diagnostics) {
@@ -439,18 +594,28 @@ impl Editor {
         selected
     }
 
-    fn max_scroll(&self) -> usize {
-        self.visual_rows
-            .len()
-            .saturating_sub(usize::from(self.text_area.height.max(1)))
+    fn max_scroll_position(&self, height: u16) -> VisualPosition {
+        if self.line_rows.is_empty() || self.total_visual_rows <= usize::from(height.max(1)) {
+            return VisualPosition::default();
+        }
+        let end = VisualPosition {
+            line: self.line_rows.len() - 1,
+            subrow: self.line_rows[self.line_rows.len() - 1].saturating_sub(1),
+        };
+        self.advance_visual_position(end, -isize::try_from(height.saturating_sub(1)).unwrap_or(0))
     }
 
     fn clamp_scroll(&mut self, height: u16) {
-        self.vertical_scroll = self.vertical_scroll.min(
-            self.visual_rows
-                .len()
-                .saturating_sub(usize::from(height.max(1))),
-        );
+        if self.line_rows.is_empty() {
+            self.scroll = VisualPosition::default();
+            return;
+        }
+        self.scroll.line = self.scroll.line.min(self.line_rows.len() - 1);
+        self.scroll.subrow = self
+            .scroll
+            .subrow
+            .min(self.line_rows[self.scroll.line].saturating_sub(1));
+        self.scroll = self.scroll.min(self.max_scroll_position(height));
     }
 }
 
@@ -476,81 +641,162 @@ impl Default for Editor {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+struct VisualPosition {
+    line: usize,
+    subrow: usize,
+}
+
 #[derive(Debug)]
 struct StyledRange {
     range: Range<usize>,
-    style: TextStyle,
+    style: Style,
 }
 
 #[derive(Clone, Debug)]
 struct VisualRow {
     logical_line: usize,
+    subrow: usize,
     start_visual_column: usize,
     byte_start: usize,
+    byte_end: usize,
     content: Line<'static>,
     continuation: bool,
 }
 
 impl VisualRow {
-    fn empty(
-        logical_line: usize,
-        start_visual_column: usize,
-        byte_start: usize,
-        continuation: bool,
-    ) -> Self {
-        Self {
-            logical_line,
-            start_visual_column,
-            byte_start,
-            content: Line::default(),
-            continuation,
+    fn position(&self) -> VisualPosition {
+        VisualPosition {
+            line: self.logical_line,
+            subrow: self.subrow,
         }
     }
 }
 
-fn wrap_line(
-    line: &Line<'static>,
-    logical_line: usize,
-    line_byte_start: usize,
-    width: usize,
-) -> Vec<VisualRow> {
-    let mut rows = Vec::new();
-    let mut spans = Vec::new();
+fn source_line_content(source: &Source, line: usize) -> Option<(usize, &str)> {
+    let range = source.lines().line_to_range(line)?;
+    let content = source.text()[range.clone()].trim_end_matches([
+        '\r', '\n', '\u{000B}', '\u{000C}', '\u{0085}', '\u{2028}', '\u{2029}',
+    ]);
+    Some((range.start, content))
+}
+
+fn line_row_count(source: &Source, line: usize, width: usize) -> usize {
+    source_line_content(source, line).map_or(1, |(_, content)| wrapped_row_count(content, width))
+}
+
+fn wrapped_row_count(content: &str, width: usize) -> usize {
+    let mut rows = 1_usize;
+    let mut row_width = 0_usize;
+    for grapheme in content.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if row_width > 0 && row_width.saturating_add(grapheme_width) > width {
+            rows += 1;
+            row_width = 0;
+        }
+        row_width = row_width.saturating_add(grapheme_width);
+    }
+    rows
+}
+
+fn visual_row_at_column(content: &str, width: usize, target: usize) -> usize {
+    let mut row = 0_usize;
     let mut row_width = 0_usize;
     let mut visual_column = 0_usize;
-    let mut byte = line_byte_start;
-    let mut row_byte_start = byte;
-    let mut row_visual_start = visual_column;
+    for grapheme in content.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if row_width > 0 && row_width.saturating_add(grapheme_width) > width {
+            row += 1;
+            row_width = 0;
+        }
+        if visual_column >= target {
+            return row;
+        }
+        row_width = row_width.saturating_add(grapheme_width);
+        visual_column = visual_column.saturating_add(grapheme_width);
+    }
+    row
+}
 
-    for span in &line.spans {
-        for grapheme in span.content.graphemes(true) {
-            let grapheme_width = UnicodeWidthStr::width(grapheme);
-            if row_width > 0 && row_width.saturating_add(grapheme_width) > width {
+fn visual_column_at_row(content: &str, width: usize, target: usize) -> usize {
+    if target == 0 {
+        return 0;
+    }
+    let mut row = 0_usize;
+    let mut row_width = 0_usize;
+    let mut visual_column = 0_usize;
+    for grapheme in content.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if row_width > 0 && row_width.saturating_add(grapheme_width) > width {
+            row += 1;
+            row_width = 0;
+            if row == target {
+                return visual_column;
+            }
+        }
+        row_width = row_width.saturating_add(grapheme_width);
+        visual_column = visual_column.saturating_add(grapheme_width);
+    }
+    visual_column
+}
+
+fn wrap_line_window(
+    source: &Source,
+    logical_line: usize,
+    width: usize,
+    skip: usize,
+    limit: usize,
+) -> Vec<VisualRow> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let Some((line_byte_start, content)) = source_line_content(source, logical_line) else {
+        return Vec::new();
+    };
+    let mut rows = Vec::with_capacity(limit);
+    let mut subrow = 0_usize;
+    let mut row_width = 0_usize;
+    let mut visual_column = 0_usize;
+    let mut row_byte_start = 0_usize;
+    let mut row_visual_start = 0_usize;
+
+    for (byte, grapheme) in content.grapheme_indices(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if row_width > 0 && row_width.saturating_add(grapheme_width) > width {
+            if subrow >= skip {
                 rows.push(VisualRow {
                     logical_line,
+                    subrow,
                     start_visual_column: row_visual_start,
-                    byte_start: row_byte_start,
-                    content: Line::from(std::mem::take(&mut spans)),
-                    continuation: !rows.is_empty(),
+                    byte_start: line_byte_start + row_byte_start,
+                    byte_end: line_byte_start + byte,
+                    content: Line::default(),
+                    continuation: subrow > 0,
                 });
-                row_width = 0;
-                row_byte_start = byte;
-                row_visual_start = visual_column;
+                if rows.len() == limit {
+                    return rows;
+                }
             }
-            push_span(&mut spans, grapheme, span.style);
-            row_width = row_width.saturating_add(grapheme_width);
-            visual_column = visual_column.saturating_add(grapheme_width);
-            byte += grapheme.len();
+            subrow += 1;
+            row_width = 0;
+            row_byte_start = byte;
+            row_visual_start = visual_column;
         }
+        row_width = row_width.saturating_add(grapheme_width);
+        visual_column = visual_column.saturating_add(grapheme_width);
     }
 
-    rows.push(VisualRow {
-        logical_line,
-        start_visual_column: row_visual_start,
-        byte_start: row_byte_start,
-        content: Line::from(spans),
-        continuation: !rows.is_empty(),
-    });
+    if subrow >= skip {
+        rows.push(VisualRow {
+            logical_line,
+            subrow,
+            start_visual_column: row_visual_start,
+            byte_start: line_byte_start + row_byte_start,
+            byte_end: line_byte_start + content.len(),
+            content: Line::default(),
+            continuation: subrow > 0,
+        });
+    }
     rows
 }
 
@@ -564,34 +810,15 @@ fn push_span(spans: &mut Vec<Span<'static>>, content: &str, style: Style) {
     spans.push(Span::styled(content.to_owned(), style));
 }
 
-fn non_code_ranges(source: &Source) -> Vec<Range<usize>> {
-    let mut ranges = Vec::new();
-    collect_non_code_ranges(&LinkedNode::new(source.root()), &mut ranges);
-    ranges
-}
-
-fn collect_non_code_ranges(node: &LinkedNode<'_>, ranges: &mut Vec<Range<usize>>) {
-    if matches!(highlight(node), Some(Tag::Comment | Tag::Raw | Tag::String)) {
-        ranges.push(node.range());
-        return;
-    }
-    for child in node.children() {
-        collect_non_code_ranges(&child, ranges);
-    }
-}
-
-fn matching_brackets(
-    text: &str,
-    cursor: usize,
-    non_code_ranges: &[Range<usize>],
-) -> Option<[Range<usize>; 2]> {
+fn matching_brackets(source: &Source, cursor: usize) -> Option<[Range<usize>; 2]> {
+    let text = source.text();
     let candidate = bracket_at(text, cursor).or_else(|| {
         text.get(..cursor)
             .and_then(|before| before.char_indices().next_back())
             .filter(|(_, character)| is_bracket(*character))
     })?;
     let (start, bracket) = candidate;
-    if is_non_code(start, non_code_ranges) {
+    if is_non_code(source, start) {
         return None;
     }
     let (matching, forward) = match bracket {
@@ -604,9 +831,9 @@ fn matching_brackets(
         _ => return None,
     };
     let found = if forward {
-        find_forward_match(text, start, bracket, matching, non_code_ranges)
+        find_forward_match(source, start, bracket, matching)
     } else {
-        find_backward_match(text, start, bracket, matching, non_code_ranges)
+        find_backward_match(source, start, bracket, matching)
     }?;
     Some([
         start..start + bracket.len_utf8(),
@@ -623,29 +850,36 @@ fn is_bracket(character: char) -> bool {
     matches!(character, '(' | ')' | '[' | ']' | '{' | '}')
 }
 
-fn is_non_code(byte: usize, ranges: &[Range<usize>]) -> bool {
-    ranges
-        .partition_point(|range| range.start <= byte)
-        .checked_sub(1)
-        .is_some_and(|index| byte < ranges[index].end)
+fn is_non_code(source: &Source, byte: usize) -> bool {
+    let root = LinkedNode::new(source.root());
+    root.leaf_at(byte, Side::After)
+        .or_else(|| root.leaf_at(byte, Side::Before))
+        .is_some_and(|leaf| {
+            node_has_tag(&leaf, |tag| {
+                matches!(tag, Tag::Comment | Tag::Raw | Tag::String)
+            })
+        })
 }
 
 fn find_forward_match(
-    text: &str,
+    source: &Source,
     start: usize,
     opening: char,
     closing: char,
-    non_code_ranges: &[Range<usize>],
 ) -> Option<usize> {
+    let text = source.text();
     let mut depth = 1_usize;
     for (offset, character) in text.get(start + opening.len_utf8()..)?.char_indices() {
         let byte = start + opening.len_utf8() + offset;
-        if is_non_code(byte, non_code_ranges) {
+        if character != opening && character != closing {
+            continue;
+        }
+        if is_non_code(source, byte) {
             continue;
         }
         if character == opening {
             depth += 1;
-        } else if character == closing {
+        } else {
             depth -= 1;
             if depth == 0 {
                 return Some(byte);
@@ -656,20 +890,23 @@ fn find_forward_match(
 }
 
 fn find_backward_match(
-    text: &str,
+    source: &Source,
     start: usize,
     closing: char,
     opening: char,
-    non_code_ranges: &[Range<usize>],
 ) -> Option<usize> {
+    let text = source.text();
     let mut depth = 1_usize;
     for (byte, character) in text.get(..start)?.char_indices().rev() {
-        if is_non_code(byte, non_code_ranges) {
+        if character != closing && character != opening {
+            continue;
+        }
+        if is_non_code(source, byte) {
             continue;
         }
         if character == closing {
             depth += 1;
-        } else if character == opening {
+        } else {
             depth -= 1;
             if depth == 0 {
                 return Some(byte);
@@ -679,83 +916,119 @@ fn find_backward_match(
     None
 }
 
-fn highlighted_lines(source: &Source, theme: Theme) -> Vec<Line<'static>> {
+fn node_has_tag(node: &LinkedNode<'_>, predicate: impl Fn(Tag) -> bool) -> bool {
+    let mut current = Some(node);
+    while let Some(node) = current {
+        if highlight(node).is_some_and(&predicate) {
+            return true;
+        }
+        current = node.parent();
+    }
+    false
+}
+
+fn effective_style(node: &LinkedNode<'_>, theme: Theme) -> TextStyle {
+    let mut tags = Vec::new();
+    let mut current = Some(node);
+    while let Some(node) = current {
+        if let Some(tag) = highlight(node) {
+            tags.push(tag);
+        }
+        current = node.parent();
+    }
+
+    tags.into_iter()
+        .rev()
+        .fold(TextStyle::default(), |style, tag| {
+            style.patch(theme.syntax(tag))
+        })
+}
+
+fn leftmost_leaf_with_trivia(mut node: LinkedNode<'_>) -> LinkedNode<'_> {
+    loop {
+        let Some(child) = node.children().next() else {
+            return node;
+        };
+        node = child;
+    }
+}
+
+fn next_leaf_with_trivia<'a>(node: &LinkedNode<'a>) -> Option<LinkedNode<'a>> {
+    let mut current = node.clone();
+    loop {
+        if let Some(next) = current.next_sibling_with_trivia() {
+            return Some(leftmost_leaf_with_trivia(next));
+        }
+        current = current.parent()?.clone();
+    }
+}
+
+fn styled_ranges(source: &Source, range: Range<usize>, theme: Theme) -> Vec<StyledRange> {
+    if range.is_empty() {
+        return Vec::new();
+    }
+    let root = LinkedNode::new(source.root());
+    let Some(mut leaf) = root
+        .leaf_at(range.start, Side::After)
+        .or_else(|| root.leaf_at(range.start, Side::Before))
+    else {
+        return Vec::new();
+    };
     let mut ranges = Vec::new();
-    collect_ranges(
-        &LinkedNode::new(source.root()),
-        TextStyle::default(),
-        theme,
-        &mut ranges,
-    );
 
-    let mut first_range = 0;
-    (0..source.lines().len_lines())
-        .filter_map(|line| source.lines().line_to_range(line))
-        .map(|range| highlighted_line(source.text(), range, &ranges, &mut first_range))
-        .collect()
-}
-
-fn collect_ranges(
-    node: &LinkedNode<'_>,
-    inherited: TextStyle,
-    theme: Theme,
-    ranges: &mut Vec<StyledRange>,
-) {
-    let style = highlight(node).map_or(inherited, |tag| inherited.patch(theme.syntax(tag)));
-    if !node.leaf_text().is_empty() {
-        ranges.push(StyledRange {
-            range: node.range(),
-            style,
-        });
-        return;
+    loop {
+        let leaf_range = leaf.range();
+        if leaf_range.start >= range.end {
+            break;
+        }
+        let start = leaf_range.start.max(range.start);
+        let end = leaf_range.end.min(range.end);
+        if start < end {
+            ranges.push(StyledRange {
+                range: start..end,
+                style: text_style(effective_style(&leaf, theme)),
+            });
+        }
+        let Some(next) = next_leaf_with_trivia(&leaf) else {
+            break;
+        };
+        leaf = next;
     }
 
-    for child in node.children() {
-        collect_ranges(&child, style, theme, ranges);
-    }
+    ranges
 }
 
-fn highlighted_line(
+fn highlighted_range(
     text: &str,
-    line_range: Range<usize>,
+    range: Range<usize>,
     ranges: &[StyledRange],
     first_range: &mut usize,
 ) -> Line<'static> {
-    let line = &text[line_range.clone()];
-    let content = line.trim_end_matches([
-        '\r', '\n', '\u{000B}', '\u{000C}', '\u{0085}', '\u{2028}', '\u{2029}',
-    ]);
-    let content_range = line_range.start..line_range.start + content.len();
     while ranges
         .get(*first_range)
-        .is_some_and(|range| range.range.end <= content_range.start)
+        .is_some_and(|styled| styled.range.end <= range.start)
     {
         *first_range += 1;
     }
-
     let mut spans = Vec::new();
-    let mut cursor = content_range.start;
-    for range in ranges.iter().skip(*first_range) {
-        if range.range.start >= content_range.end {
+    let mut cursor = range.start;
+    for styled in ranges.iter().skip(*first_range) {
+        if styled.range.start >= range.end {
             break;
         }
-        let start = cmp::max(range.range.start, content_range.start);
-        let end = cmp::min(range.range.end, content_range.end);
+        let start = styled.range.start.max(range.start);
+        let end = styled.range.end.min(range.end);
         if cursor < start {
-            spans.push(Span::raw(text[cursor..start].to_owned()));
+            push_span(&mut spans, &text[cursor..start], Style::default());
         }
         if start < end {
-            spans.push(Span::styled(
-                text[start..end].to_owned(),
-                text_style(range.style),
-            ));
+            push_span(&mut spans, &text[start..end], styled.style);
             cursor = end;
         }
     }
-    if cursor < content_range.end {
-        spans.push(Span::raw(text[cursor..content_range.end].to_owned()));
+    if cursor < range.end {
+        push_span(&mut spans, &text[cursor..range.end], Style::default());
     }
-
     Line::from(spans)
 }
 
@@ -854,7 +1127,7 @@ fn scroll_as_u16(value: usize) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use std::convert::Infallible;
+    use std::{convert::Infallible, time::Instant};
 
     use ratatui::{Terminal, backend::TestBackend, style::Color};
     use typst_syntax::Source;
@@ -862,7 +1135,9 @@ mod tests {
     use typst_tui_document::Motion;
     use typst_tui_theme::{ColorDepth, Theme, ThemeName};
 
-    use super::{Component, Diagnostics, Editor, matching_brackets, non_code_ranges};
+    use super::{
+        Component, Diagnostics, Editor, VisualPosition, line_row_count, matching_brackets,
+    };
     use crate::action::Action;
 
     fn theme() -> Theme {
@@ -923,6 +1198,68 @@ mod tests {
 
         editor.update(Action::Undo);
         assert_eq!(editor.source.text(), source);
+    }
+
+    #[test]
+    fn edits_splice_only_the_affected_line_metrics() -> Result<(), Infallible> {
+        let mut editor = Editor::new("abcdefghi\nshort\nthird", theme());
+        let mut terminal = Terminal::new(TestBackend::new(12, 6))?;
+        terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
+
+        assert!(editor.set_cursor_line_char(0, 3));
+        editor.update(Action::Insert('\n'));
+
+        assert_eq!(editor.line_rows.len(), editor.source.lines().len_lines());
+        for line in 0..editor.line_rows.len() {
+            assert_eq!(
+                editor.line_rows[line],
+                line_row_count(&editor.source, line, usize::from(editor.layout_width))
+            );
+        }
+        assert_eq!(
+            editor.total_visual_rows,
+            editor.line_rows.iter().sum::<usize>()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn edits_before_the_viewport_preserve_the_scroll_anchor() -> Result<(), Infallible> {
+        let source = (0..20)
+            .map(|line| format!("line-{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut editor = Editor::new(&source, theme());
+        let mut terminal = Terminal::new(TestBackend::new(30, 6))?;
+        terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
+        editor.scroll_lines(10);
+        assert_eq!(
+            editor.scroll,
+            VisualPosition {
+                line: 10,
+                subrow: 0
+            }
+        );
+
+        assert!(editor.set_cursor_line_char(0, 6));
+        editor.update(Action::Insert('\n'));
+        assert_eq!(
+            editor.scroll,
+            VisualPosition {
+                line: 11,
+                subrow: 0
+            }
+        );
+
+        editor.update(Action::Undo);
+        assert_eq!(
+            editor.scroll,
+            VisualPosition {
+                line: 10,
+                subrow: 0
+            }
+        );
+        Ok(())
     }
 
     #[test]
@@ -999,9 +1336,9 @@ mod tests {
         let mut terminal = Terminal::new(backend)?;
         terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
 
-        assert!(editor.visual_rows.len() > 1);
-        assert!(editor.visual_rows[1].continuation);
-        let continuation_column = editor.visual_rows[1].start_visual_column;
+        assert!(editor.viewport_rows.len() > 1);
+        assert!(editor.viewport_rows[1].continuation);
+        let continuation_column = editor.viewport_rows[1].start_visual_column;
         editor.update(Action::Move(Motion::Down));
         assert_eq!(editor.cursor_position().line, 0);
         assert_eq!(editor.cursor_position().visual_column, continuation_column);
@@ -1047,7 +1384,7 @@ mod tests {
 
         editor.scroll_lines(3);
         terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
-        assert_eq!(editor.vertical_scroll, 3);
+        assert_eq!(editor.scroll, VisualPosition { line: 3, subrow: 0 });
         let rendered = terminal
             .backend()
             .buffer()
@@ -1060,7 +1397,51 @@ mod tests {
 
         editor.update(Action::Move(Motion::DocumentEnd));
         terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
-        assert_eq!(editor.vertical_scroll, editor.max_scroll());
+        assert_eq!(
+            editor.scroll,
+            editor.max_scroll_position(editor.text_area.height)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn viewport_cache_stays_bounded_for_large_and_long_sources() -> Result<(), Infallible> {
+        let source = (0..2_000)
+            .map(|line| format!("#let value{line} = {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut editor = Editor::new(&source, theme());
+        let mut terminal = Terminal::new(TestBackend::new(40, 8))?;
+        terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
+
+        assert_eq!(editor.line_rows.len(), 2_000);
+        assert!(editor.viewport_rows.len() <= usize::from(editor.text_area.height));
+        assert!(editor.set_cursor_line_char(1_999, 0));
+        terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
+        assert_eq!(
+            editor.viewport_rows.last().map(|row| row.logical_line),
+            Some(1_999)
+        );
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| cell.fg == Color::Blue)
+        );
+
+        let long_source = "a".repeat(100_000);
+        let mut long_editor = Editor::new(&long_source, theme());
+        terminal.draw(|frame| long_editor.draw(frame, frame.area(), true))?;
+        let materialized_bytes = long_editor
+            .viewport_rows
+            .iter()
+            .flat_map(|row| &row.content.spans)
+            .map(|span| span.content.len())
+            .sum::<usize>();
+        assert!(materialized_bytes < long_source.len());
+        assert!(long_editor.viewport_rows.len() <= usize::from(long_editor.text_area.height));
         Ok(())
     }
 
@@ -1068,15 +1449,53 @@ mod tests {
     fn bracket_matching_ignores_strings() -> Result<(), &'static str> {
         let text = "#let value = (\"ignored )\" + [1])";
         let source = Source::detached(text);
-        let non_code = non_code_ranges(&source);
         let opening = text.find('(').ok_or("opening bracket is missing")?;
         let closing = text.rfind(')').ok_or("closing bracket is missing")?;
-        let matched =
-            matching_brackets(text, opening, &non_code).ok_or("outer brackets did not match")?;
+        let matched = matching_brackets(&source, opening).ok_or("outer brackets did not match")?;
         assert_eq!(matched[1].start, closing);
 
         let string_bracket = text.find(")\"").ok_or("string bracket is missing")?;
-        assert!(matching_brackets(text, string_bracket, &non_code).is_none());
+        assert!(matching_brackets(&source, string_bracket).is_none());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "manual release-mode performance probe"]
+    fn massive_document_edit_and_draw_is_viewport_bound() -> Result<(), Infallible> {
+        let source = (0..100_000)
+            .map(|line| format!("#let value{line} = ({line} + 1)"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let started = Instant::now();
+        let mut editor = Editor::new(&source, theme());
+        let initialized = started.elapsed();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30))?;
+        terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
+        let laid_out = started.elapsed();
+        assert!(editor.set_cursor_line_char(99_999, 0));
+        terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
+
+        let mut edit_samples = Vec::new();
+        let mut draw_samples = Vec::new();
+        for _ in 0..20 {
+            let edit_started = Instant::now();
+            editor.update(Action::Insert('x'));
+            edit_samples.push(edit_started.elapsed());
+            let draw_started = Instant::now();
+            terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
+            draw_samples.push(draw_started.elapsed());
+        }
+        edit_samples.sort_unstable();
+        draw_samples.sort_unstable();
+        let edit_p95 = edit_samples[edit_samples.len() * 95 / 100];
+        let draw_p95 = draw_samples[draw_samples.len() * 95 / 100];
+
+        eprintln!(
+            "100k token-dense lines: init={initialized:?}, initial_layout={:?}, edit_p95={edit_p95:?}, draw_p95={draw_p95:?}",
+            laid_out.saturating_sub(initialized)
+        );
+        assert_eq!(editor.line_rows.len(), 100_000);
+        assert!(editor.viewport_rows.len() <= usize::from(editor.text_area.height));
         Ok(())
     }
 }

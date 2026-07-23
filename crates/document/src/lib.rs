@@ -7,6 +7,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 const HISTORY_LIMIT: usize = 256;
+const HISTORY_BYTE_LIMIT: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Motion {
@@ -58,6 +59,12 @@ struct Edit {
     state_after: u64,
 }
 
+impl Edit {
+    fn retained_bytes(&self) -> usize {
+        self.removed.len().saturating_add(self.inserted.len())
+    }
+}
+
 #[derive(Debug)]
 pub struct Document {
     text: Rope,
@@ -71,6 +78,7 @@ pub struct Document {
     next_state: u64,
     last_edit: Option<TextEdit>,
     word_count: usize,
+    selection_grapheme_count: usize,
 }
 
 impl Document {
@@ -88,6 +96,7 @@ impl Document {
             next_state: 1,
             last_edit: None,
             word_count: text.unicode_words().count(),
+            selection_grapheme_count: 0,
         }
     }
 
@@ -149,8 +158,7 @@ impl Document {
 
     #[must_use]
     pub fn selection_graphemes(&self) -> usize {
-        self.selected_text()
-            .map_or(0, |text| text.graphemes(true).count())
+        self.selection_grapheme_count
     }
 
     #[must_use]
@@ -183,7 +191,7 @@ impl Document {
         }
 
         self.cursor = cursor;
-        self.selection_anchor = None;
+        self.clear_selection();
         self.preferred_visual_column = None;
         true
     }
@@ -196,7 +204,7 @@ impl Document {
         let line_start = self.text.line_to_char(line);
         let line_length = self.line_without_ending(line).chars().count();
         self.cursor = line_start + column.min(line_length);
-        self.selection_anchor = None;
+        self.clear_selection();
         self.preferred_visual_column = None;
         true
     }
@@ -216,17 +224,19 @@ impl Document {
         self.cursor =
             self.text.line_to_char(line) + char_offset_at_visual_column(&text, visual_column);
         self.selection_anchor = anchor.filter(|anchor| *anchor != self.cursor);
+        self.refresh_selection_graphemes();
         self.preferred_visual_column = None;
         true
     }
 
     pub fn select_all(&mut self) {
         if self.text.len_chars() == 0 {
-            self.selection_anchor = None;
+            self.clear_selection();
             return;
         }
         self.selection_anchor = Some(0);
         self.cursor = self.text.len_chars();
+        self.refresh_selection_graphemes();
         self.preferred_visual_column = None;
     }
 
@@ -243,12 +253,14 @@ impl Document {
 
         self.selection_anchor = (start != end).then_some(start);
         self.cursor = end;
+        self.refresh_selection_graphemes();
         self.preferred_visual_column = None;
         true
     }
 
     pub fn clear_selection(&mut self) {
         self.selection_anchor = None;
+        self.selection_grapheme_count = 0;
     }
 
     pub fn mark_saved(&mut self) {
@@ -323,7 +335,7 @@ impl Document {
                 Motion::DocumentStart => 0,
                 Motion::DocumentEnd => self.text.len_chars(),
             };
-            self.selection_anchor = None;
+            self.clear_selection();
             self.preferred_visual_column = None;
             return;
         }
@@ -350,6 +362,7 @@ impl Document {
         }
 
         self.selection_anchor = anchor.filter(|anchor| *anchor != self.cursor);
+        self.refresh_selection_graphemes();
         if !vertical {
             self.preferred_visual_column = None;
         }
@@ -400,7 +413,7 @@ impl Document {
         let range = self.text.char_to_byte(edit.start)..self.text.char_to_byte(inserted_end);
         self.replace_text(edit.start, inserted_end, &edit.removed);
         self.cursor = edit.cursor_before;
-        self.selection_anchor = None;
+        self.clear_selection();
         self.state = edit.state_before;
         self.preferred_visual_column = None;
         self.last_edit = Some(TextEdit {
@@ -419,7 +432,7 @@ impl Document {
         let range = self.text.char_to_byte(edit.start)..self.text.char_to_byte(removed_end);
         self.replace_text(edit.start, removed_end, &edit.inserted);
         self.cursor = edit.cursor_after;
-        self.selection_anchor = None;
+        self.clear_selection();
         self.state = edit.state_after;
         self.preferred_visual_column = None;
         self.last_edit = Some(TextEdit {
@@ -440,7 +453,7 @@ impl Document {
 
         self.replace_text(start, end, inserted);
         self.cursor = cursor_after;
-        self.selection_anchor = None;
+        self.clear_selection();
         self.state = state_after;
         self.preferred_visual_column = None;
         self.redo.clear();
@@ -460,10 +473,23 @@ impl Document {
     }
 
     fn push_undo(&mut self, edit: Edit) {
-        if self.undo.len() == HISTORY_LIMIT {
-            self.undo.pop_front();
+        let edit_bytes = edit.retained_bytes();
+        let mut retained_bytes = self.undo.iter().map(Edit::retained_bytes).sum::<usize>();
+        while !self.undo.is_empty()
+            && (self.undo.len() >= HISTORY_LIMIT
+                || retained_bytes.saturating_add(edit_bytes) > HISTORY_BYTE_LIMIT)
+        {
+            if let Some(discarded) = self.undo.pop_front() {
+                retained_bytes = retained_bytes.saturating_sub(discarded.retained_bytes());
+            }
         }
         self.undo.push_back(edit);
+    }
+
+    fn refresh_selection_graphemes(&mut self) {
+        self.selection_grapheme_count = self.selection_char_range().map_or(0, |range| {
+            self.text.slice(range).to_string().graphemes(true).count()
+        });
     }
 
     fn replace_text(&mut self, start: usize, end: usize, inserted: &str) {
@@ -534,25 +560,39 @@ impl Document {
     }
 
     fn word_left(&self) -> usize {
-        let text = self.text.to_string();
-        let cursor_byte = self.text.char_to_byte(self.cursor);
-        text.unicode_word_indices()
-            .map(|(byte, _)| byte)
-            .take_while(|byte| *byte < cursor_byte)
-            .last()
-            .map_or(0, |byte| text[..byte].chars().count())
+        let mut line = self.text.char_to_line(self.cursor);
+        let mut end = self.cursor;
+        loop {
+            let start = self.text.line_to_char(line);
+            if start < end {
+                let prefix = self.text.slice(start..end).to_string();
+                if let Some((byte, _)) = prefix.unicode_word_indices().next_back() {
+                    return start + prefix[..byte].chars().count();
+                }
+            }
+            let Some(previous) = line.checked_sub(1) else {
+                return 0;
+            };
+            line = previous;
+            end = self.line_content_end(line);
+        }
     }
 
     fn word_right(&self) -> usize {
-        let text = self.text.to_string();
-        let cursor_byte = self.text.char_to_byte(self.cursor);
-        text.unicode_word_indices()
-            .map(|(byte, _)| byte)
-            .find(|byte| *byte > cursor_byte)
-            .map_or_else(
-                || self.text.len_chars(),
-                |byte| text[..byte].chars().count(),
-            )
+        let mut line = self.text.char_to_line(self.cursor);
+        while line < self.line_count() {
+            let start = self.text.line_to_char(line);
+            let end = self.line_content_end(line);
+            let content = self.text.slice(start..end).to_string();
+            if let Some(position) = content.unicode_word_indices().find_map(|(byte, _)| {
+                let position = start + content[..byte].chars().count();
+                (position > self.cursor).then_some(position)
+            }) {
+                return position;
+            }
+            line += 1;
+        }
+        self.text.len_chars()
     }
 
     fn previous_grapheme_boundary(&self, line_start: usize, cursor: usize) -> usize {
@@ -622,7 +662,7 @@ fn char_offset_at_visual_column(text: &str, target: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{CursorPosition, Document, Motion, TextEdit};
+    use super::{CursorPosition, Document, Edit, HISTORY_BYTE_LIMIT, Motion, TextEdit};
 
     #[test]
     fn edits_undo_and_redo() {
@@ -712,6 +752,29 @@ mod tests {
     }
 
     #[test]
+    fn undo_history_is_bounded_by_retained_text() {
+        let mut document = Document::default();
+        for state in 0..10 {
+            document.push_undo(Edit {
+                start: 0,
+                removed: String::new(),
+                inserted: "x".repeat(2 * 1024 * 1024),
+                cursor_before: 0,
+                cursor_after: 0,
+                state_before: state,
+                state_after: state + 1,
+            });
+        }
+
+        let retained = document
+            .undo
+            .iter()
+            .map(Edit::retained_bytes)
+            .sum::<usize>();
+        assert!(retained <= HISTORY_BYTE_LIMIT);
+    }
+
+    #[test]
     fn edit_deltas_use_utf8_byte_ranges() {
         let mut document = Document::new("aé");
         document.move_cursor(Motion::DocumentEnd);
@@ -771,6 +834,24 @@ mod tests {
         assert_eq!(document.cursor_position().line, 2);
         assert_eq!(document.cursor_position().visual_column, 3);
         assert_eq!(document.selected_text().as_deref(), Some("d\nx\nabc"));
+    }
+
+    #[test]
+    fn word_motion_scans_lines_without_changing_boundaries() {
+        let mut document = Document::new("alpha\n\nβeta gamma");
+
+        document.move_cursor(Motion::WordRight);
+        assert_eq!(document.cursor_position().line, 2);
+        assert_eq!(document.cursor_position().column, 0);
+
+        document.move_cursor(Motion::DocumentEnd);
+        document.move_cursor(Motion::WordLeft);
+        assert_eq!(document.cursor_position().column, 5);
+        document.move_cursor(Motion::WordLeft);
+        assert_eq!(document.cursor_position().column, 0);
+        document.move_cursor(Motion::WordLeft);
+        assert_eq!(document.cursor_position().line, 0);
+        assert_eq!(document.cursor_position().column, 0);
     }
 
     #[test]
