@@ -67,10 +67,14 @@ pub struct RenderManifest {
     pixels_per_point: f64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PageFingerprint(u64);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PageMetadata {
     width: u32,
     height: u32,
+    fingerprint: PageFingerprint,
 }
 
 #[derive(Clone, Default)]
@@ -82,7 +86,7 @@ pub struct RenderCache {
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 struct PageCacheKey {
-    page: u64,
+    page: PageFingerprint,
     pixels_per_point: u64,
 }
 
@@ -124,6 +128,18 @@ impl PageMetadata {
     #[must_use]
     pub fn height(self) -> u32 {
         self.height
+    }
+
+    #[must_use]
+    pub fn fingerprint(self) -> PageFingerprint {
+        self.fingerprint
+    }
+}
+
+impl PageFingerprint {
+    #[must_use]
+    pub fn value(self) -> u64 {
+        self.0
     }
 }
 
@@ -288,21 +304,25 @@ pub fn render_pages_cached_cancellable(
             .pages()
             .get(index)
             .ok_or(Error::PageOutOfBounds { page: index + 1 })?;
+        let metadata = manifest
+            .pages
+            .get(index)
+            .ok_or(Error::PageOutOfBounds { page: index + 1 })?;
+        validate_page_fingerprint(page, *metadata)?;
         let key = PageCacheKey {
-            page: page_hash(page),
+            page: metadata.fingerprint,
             pixels_per_point: manifest.pixels_per_point.to_bits(),
         };
         let image = if let Some(image) = next_cache.get(key) {
             image
         } else {
             let pixmap = typst_render::render(page, &options);
-            let (width, height) = (pixmap.width(), pixmap.height());
-            let mut rgba = pixmap.data().to_vec();
-            unpremultiply(&mut rgba);
-            let image = Arc::new(
-                RgbaImage::from_raw(width, height, rgba)
-                    .ok_or(Error::InvalidPixelData { page: index + 1 })?,
-            );
+            let image = Arc::new(rendered_image(
+                pixmap.width(),
+                pixmap.height(),
+                pixmap.data(),
+                index,
+            )?);
             next_cache.insert(key, Arc::clone(&image));
             image
         };
@@ -313,6 +333,51 @@ pub fn render_pages_cached_cancellable(
     }
 
     Ok((pages, next_cache))
+}
+
+pub fn render_pages_cancellable(
+    document: &CompiledDocument,
+    manifest: &RenderManifest,
+    indices: impl IntoIterator<Item = usize>,
+    cancelled: impl Fn() -> bool,
+) -> Result<Vec<RenderedPage>, Error> {
+    if manifest.pages.len() != document.pages().len() {
+        return Err(Error::ManifestMismatch);
+    }
+    let options = RenderOptions {
+        pixel_per_pt: manifest.pixels_per_point.into(),
+        render_bleed: false,
+    };
+    let mut pages = Vec::new();
+
+    for index in indices {
+        if cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let page = document
+            .pages()
+            .get(index)
+            .ok_or(Error::PageOutOfBounds { page: index + 1 })?;
+        let metadata = manifest
+            .pages
+            .get(index)
+            .ok_or(Error::PageOutOfBounds { page: index + 1 })?;
+        validate_page_fingerprint(page, *metadata)?;
+        let pixmap = typst_render::render(page, &options);
+        pages.push(RenderedPage {
+            index,
+            image: PageImage {
+                image: Arc::new(rendered_image(
+                    pixmap.width(),
+                    pixmap.height(),
+                    pixmap.data(),
+                    index,
+                )?),
+            },
+        });
+    }
+
+    Ok(pages)
 }
 
 fn render_at(document: &CompiledDocument, pixels_per_point: f64) -> Result<Vec<PageImage>, Error> {
@@ -351,6 +416,7 @@ fn manifest_at(
         pages.push(PageMetadata {
             width: width as u32,
             height: height as u32,
+            fingerprint: PageFingerprint(page_hash(page)),
         });
     }
     Ok(RenderManifest {
@@ -363,6 +429,18 @@ fn page_hash(page: &impl Hash) -> u64 {
     let mut hasher = DefaultHasher::new();
     page.hash(&mut hasher);
     hasher.finish()
+}
+
+fn validate_page_fingerprint(page: &impl Hash, metadata: PageMetadata) -> Result<(), Error> {
+    (PageFingerprint(page_hash(page)) == metadata.fingerprint)
+        .then_some(())
+        .ok_or(Error::ManifestMismatch)
+}
+
+fn rendered_image(width: u32, height: u32, data: &[u8], index: usize) -> Result<RgbaImage, Error> {
+    let mut rgba = data.to_vec();
+    unpremultiply(&mut rgba);
+    RgbaImage::from_raw(width, height, rgba).ok_or(Error::InvalidPixelData { page: index + 1 })
 }
 
 fn validate_total_pixels(manifest: &RenderManifest) -> Result<(), Error> {
@@ -405,7 +483,7 @@ mod tests {
 
     use super::{
         MAX_CACHED_PAGES, RenderCache, render_cached_cancellable, render_manifest,
-        render_pages_cached_cancellable, unpremultiply,
+        render_pages_cached_cancellable, render_pages_cancellable, unpremultiply,
     };
 
     #[test]
@@ -432,11 +510,37 @@ mod tests {
         else {
             return Err("updated fixture did not compile".into());
         };
+        let first_manifest = render_manifest(&first_document, 400)?;
+        let second_manifest = render_manifest(&second_document, 400)?;
         let (second, _) = render_cached_cancellable(&second_document, 400, &cache, || false)?;
 
         assert_eq!(first.pages.len(), 2);
+        assert_eq!(
+            first_manifest.pages[0].fingerprint,
+            second_manifest.pages[0].fingerprint
+        );
+        assert_ne!(
+            first_manifest.pages[1].fingerprint,
+            second_manifest.pages[1].fingerprint
+        );
         assert!(Arc::ptr_eq(&first.pages[0].image, &second.pages[0].image));
         assert!(!Arc::ptr_eq(&first.pages[1].image, &second.pages[1].image));
+        Ok(())
+    }
+
+    #[test]
+    fn uncached_pages_have_unique_pixel_ownership() -> Result<(), Box<dyn Error>> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        let mut compiler = Compiler::new(&root, root.join("simple.typ"))?;
+        let CompileOutcome::Success(document) = compiler.compile("= Owned page") else {
+            return Err("fixture did not compile".into());
+        };
+        let manifest = render_manifest(&document, 800)?;
+
+        let pages = render_pages_cancellable(&document, &manifest, [0], || false)?;
+
+        assert_eq!(pages.len(), 1);
+        assert_eq!(Arc::strong_count(&pages[0].image.image), 1);
         Ok(())
     }
 
