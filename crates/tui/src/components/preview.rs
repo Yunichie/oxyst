@@ -24,11 +24,23 @@ use super::Component;
 
 const ENCODED_PAGE_CACHE_LIMIT: usize = 5;
 
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct EncodedPageKey {
+    fingerprint: u64,
+    raster_width: u32,
+    raster_height: u32,
+    terminal_width: u16,
+    terminal_height: u16,
+    font_width: u16,
+    font_height: u16,
+}
+
 pub(crate) struct Preview {
     page_sizes: Vec<Size>,
+    page_keys: Vec<EncodedPageKey>,
     page_tops: Vec<usize>,
-    pages: HashMap<usize, SlicedProtocol>,
-    page_lru: VecDeque<usize>,
+    pages: HashMap<EncodedPageKey, SlicedProtocol>,
+    page_lru: VecDeque<EncodedPageKey>,
     scroll: usize,
     viewport: Size,
     inner: Rect,
@@ -40,6 +52,7 @@ impl Preview {
     pub(crate) fn new(theme: Theme) -> Self {
         Self {
             page_sizes: Vec::new(),
+            page_keys: Vec::new(),
             page_tops: vec![0],
             pages: HashMap::new(),
             page_lru: VecDeque::new(),
@@ -99,41 +112,72 @@ impl Preview {
             .collect()
     }
 
-    pub(crate) fn replace_manifest(&mut self, page_sizes: Vec<Size>) {
-        self.page_sizes = page_sizes;
-        self.rebuild_page_tops();
-        self.pages.clear();
-        self.page_lru.clear();
-        self.scroll = 0;
-        self.clamp_scroll();
+    pub(crate) fn replace_render_manifest(
+        &mut self,
+        picker: &Picker,
+        manifest: &RenderManifest,
+        width: u16,
+    ) {
+        let page_sizes = Self::page_sizes(picker, manifest, width);
+        let page_keys = encoded_page_keys(picker, manifest, &page_sizes);
+        self.replace_page_metadata(page_sizes, page_keys, false);
     }
 
-    pub(crate) fn rescale_manifest(&mut self, page_sizes: Vec<Size>) {
-        let anchor = self.current_page_index().map(|page| {
-            let height = usize::from(self.page_sizes[page].height.max(1));
-            let offset = self.scroll.saturating_sub(self.page_top(page)).min(height);
-            (page, offset, height)
-        });
-        self.replace_manifest(page_sizes);
+    pub(crate) fn rescale_render_manifest(
+        &mut self,
+        picker: &Picker,
+        manifest: &RenderManifest,
+        width: u16,
+    ) {
+        let page_sizes = Self::page_sizes(picker, manifest, width);
+        let page_keys = encoded_page_keys(picker, manifest, &page_sizes);
+        self.replace_page_metadata(page_sizes, page_keys, true);
+    }
+
+    fn replace_page_metadata(
+        &mut self,
+        page_sizes: Vec<Size>,
+        page_keys: Vec<EncodedPageKey>,
+        preserve_position: bool,
+    ) {
+        let anchor = preserve_position
+            .then(|| {
+                self.current_page_index().map(|page| {
+                    let height = usize::from(self.page_sizes[page].height.max(1));
+                    let offset = self.scroll.saturating_sub(self.page_top(page)).min(height);
+                    (page, offset, height)
+                })
+            })
+            .flatten();
+        self.page_sizes = page_sizes;
+        self.page_keys = page_keys;
+        self.rebuild_page_tops();
+        self.pages.retain(|key, _| self.page_keys.contains(key));
+        self.page_lru.retain(|key| self.pages.contains_key(key));
+        self.scroll = 0;
         if let Some((page, offset, old_height)) = anchor
             && let Some(size) = self.page_sizes.get(page)
         {
             let offset = offset.saturating_mul(usize::from(size.height)) / old_height;
             self.scroll = self.page_top(page).saturating_add(offset);
-            self.clamp_scroll();
         }
+        self.clamp_scroll();
     }
 
     pub(crate) fn install_pages(&mut self, pages: Vec<(usize, SlicedProtocol)>) {
         for (index, page) in pages {
-            if index >= self.page_sizes.len() {
+            let Some(key) = self.page_keys.get(index).copied() else {
                 continue;
-            }
-            self.pages.insert(index, page);
-            self.page_lru.retain(|candidate| *candidate != index);
-            self.page_lru.push_back(index);
+            };
+            self.pages.insert(key, page);
+            self.page_lru.retain(|candidate| *candidate != key);
+            self.page_lru.push_back(key);
         }
-        let required = self.required_pages();
+        let required = self
+            .required_pages()
+            .into_iter()
+            .filter_map(|index| self.page_keys.get(index).copied())
+            .collect::<Vec<_>>();
         while self.pages.len() > ENCODED_PAGE_CACHE_LIMIT {
             let Some(position) = self
                 .page_lru
@@ -142,17 +186,26 @@ impl Preview {
             else {
                 break;
             };
-            let Some(index) = self.page_lru.remove(position) else {
+            let Some(key) = self.page_lru.remove(position) else {
                 break;
             };
-            self.pages.remove(&index);
+            self.pages.remove(&key);
         }
     }
 
     pub(crate) fn page_requests(&self) -> Vec<usize> {
+        let mut keys = Vec::new();
         self.required_pages()
             .into_iter()
-            .filter(|index| !self.pages.contains_key(index))
+            .filter(|index| {
+                let Some(key) = self.page_keys.get(*index) else {
+                    return false;
+                };
+                !self.pages.contains_key(key) && !keys.contains(key) && {
+                    keys.push(*key);
+                    true
+                }
+            })
             .collect()
     }
 
@@ -163,8 +216,47 @@ impl Preview {
         self.install_pages(pages.into_iter().enumerate().collect());
     }
 
+    #[cfg(test)]
+    pub(crate) fn replace_manifest(&mut self, page_sizes: Vec<Size>) {
+        let metadata = page_sizes
+            .iter()
+            .enumerate()
+            .map(|(index, size)| (index as u64, *size))
+            .collect();
+        self.replace_test_metadata(metadata, false);
+    }
+
+    #[cfg(test)]
+    fn rescale_manifest(&mut self, page_sizes: Vec<Size>) {
+        let metadata = page_sizes
+            .iter()
+            .enumerate()
+            .map(|(index, size)| (index as u64, *size))
+            .collect();
+        self.replace_test_metadata(metadata, true);
+    }
+
+    #[cfg(test)]
+    fn replace_test_metadata(&mut self, metadata: Vec<(u64, Size)>, preserve_position: bool) {
+        let page_sizes = metadata.iter().map(|(_, size)| *size).collect::<Vec<_>>();
+        let page_keys = metadata
+            .into_iter()
+            .map(|(fingerprint, size)| EncodedPageKey {
+                fingerprint,
+                raster_width: u32::from(size.width),
+                raster_height: u32::from(size.height),
+                terminal_width: size.width,
+                terminal_height: size.height,
+                font_width: 1,
+                font_height: 1,
+            })
+            .collect();
+        self.replace_page_metadata(page_sizes, page_keys, preserve_position);
+    }
+
     pub(crate) fn clear(&mut self) {
         self.page_sizes.clear();
+        self.page_keys.clear();
         self.page_tops.clear();
         self.page_tops.push(0);
         self.pages.clear();
@@ -318,11 +410,12 @@ impl Preview {
                 let page_top = self.page_top(page_index) as i64;
                 let y = page_top - self.scroll as i64;
                 let x = inner.width.saturating_sub(size.width) / 2;
-                if self.pages.contains_key(&page_index) {
-                    self.page_lru.retain(|candidate| *candidate != page_index);
-                    self.page_lru.push_back(page_index);
+                let key = self.page_keys[page_index];
+                if self.pages.contains_key(&key) {
+                    self.page_lru.retain(|candidate| *candidate != key);
+                    self.page_lru.push_back(key);
                 }
-                if let Some(page) = self.pages.get(&page_index) {
+                if let Some(page) = self.pages.get(&key) {
                     let position = SignedPosition::from((
                         i16::try_from(x).unwrap_or(i16::MAX),
                         y.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16,
@@ -466,6 +559,28 @@ impl Preview {
     }
 }
 
+fn encoded_page_keys(
+    picker: &Picker,
+    manifest: &RenderManifest,
+    page_sizes: &[Size],
+) -> Vec<EncodedPageKey> {
+    let font = picker.font_size();
+    manifest
+        .pages()
+        .iter()
+        .zip(page_sizes)
+        .map(|(page, terminal)| EncodedPageKey {
+            fingerprint: page.fingerprint().value(),
+            raster_width: page.width(),
+            raster_height: page.height(),
+            terminal_width: terminal.width,
+            terminal_height: terminal.height,
+            font_width: font.width,
+            font_height: font.height,
+        })
+        .collect()
+}
+
 fn encode_page(picker: &Picker, page: PageImage, width: u16) -> Result<SlicedProtocol, String> {
     let width = width.max(1);
     let font = picker.font_size();
@@ -505,7 +620,13 @@ impl Component for Preview {
 
 #[cfg(test)]
 mod tests {
-    use std::{convert::Infallible, error::Error, fs, io, path::PathBuf, time::Instant};
+    use std::{
+        convert::Infallible,
+        error::Error,
+        fs, io,
+        path::PathBuf,
+        time::{Duration, Instant},
+    };
 
     use ratatui::{
         Terminal,
@@ -674,7 +795,34 @@ mod tests {
         preview.replace_pages(pages);
 
         assert!(preview.pages.len() <= super::ENCODED_PAGE_CACHE_LIMIT);
-        assert!(preview.pages.contains_key(&0));
+        assert!(preview.pages.contains_key(&preview.page_keys[0]));
+        Ok(())
+    }
+
+    #[test]
+    fn encoded_cache_survives_reordering_and_invalidates_changes() -> Result<(), Box<dyn Error>> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        let mut compiler = Compiler::new(&root, root.join("simple.typ"))?;
+        let CompileOutcome::Success(document) = compiler.compile("= First\n#pagebreak()\n= Second")
+        else {
+            return Err("fixture did not compile".into());
+        };
+        let rendered = typst_tui_render::render(&document, 200)?;
+        let protocols =
+            Preview::encode_pages(&Picker::halfblocks(), rendered, 20).map_err(io::Error::other)?;
+        let sizes = protocols.iter().map(|page| page.size()).collect::<Vec<_>>();
+        let mut preview = Preview::new(theme());
+        preview.set_viewport(Rect::new(0, 0, 22, 100));
+        preview.replace_test_metadata(vec![(10, sizes[0]), (20, sizes[1])], false);
+        preview.install_pages(protocols.into_iter().enumerate().collect());
+
+        preview.replace_test_metadata(vec![(20, sizes[1]), (10, sizes[0])], false);
+        assert!(preview.page_requests().is_empty());
+        assert_eq!(preview.pages.len(), 2);
+
+        preview.replace_test_metadata(vec![(20, sizes[1]), (30, sizes[0])], false);
+        assert_eq!(preview.page_requests(), vec![1]);
+        assert_eq!(preview.pages.len(), 1);
         Ok(())
     }
 
@@ -694,13 +842,8 @@ mod tests {
         let width = 80;
         let pixels = u32::from(width) * u32::from(picker.font_size().width.max(1));
         let manifest = typst_tui_render::render_manifest(&document, pixels)?;
-        let (rendered, _) = typst_tui_render::render_pages_cached_cancellable(
-            &document,
-            &manifest,
-            [0],
-            &typst_tui_render::RenderCache::default(),
-            || false,
-        )?;
+        let rendered =
+            typst_tui_render::render_pages_cancellable(&document, &manifest, [0], || false)?;
 
         let started = Instant::now();
         let encoded =
@@ -710,6 +853,137 @@ mod tests {
 
         eprintln!("100-page document: first_page_terminal_encoding={elapsed:?}");
         assert_eq!(encoded.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "manual release-mode performance probe"]
+    fn high_resolution_render_to_encoding_latency() -> Result<(), Box<dyn Error>> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        let mut compiler = Compiler::new(&root, root.join("simple.typ"))?;
+        let source = (0..100)
+            .map(|page| {
+                format!(
+                    "#rect(width: 100%, height: 100%, fill: rgb({}, 80, 120))",
+                    page % 256
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n#pagebreak()\n");
+        let CompileOutcome::Success(document) = compiler.compile(&source) else {
+            return Err("fixture did not compile".into());
+        };
+        let picker = Picker::halfblocks();
+        let font_width = u32::from(picker.font_size().width.max(1));
+
+        for target_pixels in [800_u32, 1_600, 2_048] {
+            let width = u16::try_from(target_pixels / font_width)?;
+            let manifest = typst_tui_render::render_manifest(&document, target_pixels)?;
+            let page = manifest.pages()[0];
+            let rgba_bytes = u64::from(page.width()) * u64::from(page.height()) * u64::from(4_u8);
+            let mut cached_render_samples = Vec::new();
+            let mut cached_encoding_samples = Vec::new();
+            let mut cached_total_samples = Vec::new();
+            let mut owned_render_samples = Vec::new();
+            let mut owned_encoding_samples = Vec::new();
+            let mut owned_total_samples = Vec::new();
+            let cached_sample = || -> Result<_, Box<dyn Error>> {
+                let total_started = Instant::now();
+                let render_started = Instant::now();
+                let (rendered, cache) = typst_tui_render::render_pages_cached_cancellable(
+                    &document,
+                    &manifest,
+                    [0],
+                    &typst_tui_render::RenderCache::default(),
+                    || false,
+                )?;
+                let rendered_elapsed = render_started.elapsed();
+                let encoding_started = Instant::now();
+                let encoded =
+                    Preview::encode_rendered_pages_cancellable(&picker, rendered, width, || false)?
+                        .ok_or("encoding was cancelled")?;
+                let encoding_elapsed = encoding_started.elapsed();
+                let total_elapsed = total_started.elapsed();
+                drop(cache);
+                assert_eq!(encoded.len(), 1);
+                Ok((rendered_elapsed, encoding_elapsed, total_elapsed))
+            };
+            let owned_sample = || -> Result<_, Box<dyn Error>> {
+                let total_started = Instant::now();
+                let render_started = Instant::now();
+                let rendered =
+                    typst_tui_render::render_pages_cancellable(&document, &manifest, [0], || {
+                        false
+                    })?;
+                let rendered_elapsed = render_started.elapsed();
+                let encoding_started = Instant::now();
+                let encoded =
+                    Preview::encode_rendered_pages_cancellable(&picker, rendered, width, || false)?
+                        .ok_or("encoding was cancelled")?;
+                let encoding_elapsed = encoding_started.elapsed();
+                let total_elapsed = total_started.elapsed();
+                assert_eq!(encoded.len(), 1);
+                Ok((rendered_elapsed, encoding_elapsed, total_elapsed))
+            };
+
+            for sample in 0..17 {
+                let (cached, owned) = if sample % 2 == 0 {
+                    (cached_sample()?, owned_sample()?)
+                } else {
+                    let owned = owned_sample()?;
+                    let cached = cached_sample()?;
+                    (cached, owned)
+                };
+                if sample > 0 {
+                    cached_render_samples.push(cached.0);
+                    cached_encoding_samples.push(cached.1);
+                    cached_total_samples.push(cached.2);
+                    owned_render_samples.push(owned.0);
+                    owned_encoding_samples.push(owned.1);
+                    owned_total_samples.push(owned.2);
+                }
+            }
+
+            let p95 = |samples: &mut Vec<Duration>| {
+                samples.sort_unstable();
+                samples[(samples.len() - 1) * 95 / 100]
+            };
+            eprintln!(
+                "{target_pixels}px cached-copy: duplicate={:.2}MiB, render_p95={:?}, encoding_p95={:?}, total_p95={:?}",
+                rgba_bytes as f64 / (1024.0 * 1024.0),
+                p95(&mut cached_render_samples),
+                p95(&mut cached_encoding_samples),
+                p95(&mut cached_total_samples),
+            );
+            eprintln!(
+                "{target_pixels}px owned: duplicate=0MiB, render_p95={:?}, encoding_p95={:?}, total_p95={:?}",
+                p95(&mut owned_render_samples),
+                p95(&mut owned_encoding_samples),
+                p95(&mut owned_total_samples),
+            );
+
+            let rendered =
+                typst_tui_render::render_pages_cancellable(&document, &manifest, [0], || false)?;
+            let encoded =
+                Preview::encode_rendered_pages_cancellable(&picker, rendered, width, || false)?
+                    .ok_or("encoding was cancelled")?;
+            let mut preview = Preview::new(theme());
+            preview.set_viewport(Rect::new(0, 0, width, 20));
+            preview.replace_render_manifest(&picker, &manifest, width);
+            preview.install_pages(encoded);
+            let mut cache_hit_samples = Vec::new();
+            for _ in 0..100 {
+                let started = Instant::now();
+                preview.replace_render_manifest(&picker, &manifest, width);
+                let requests = preview.page_requests();
+                cache_hit_samples.push(started.elapsed());
+                assert!(!requests.contains(&0));
+            }
+            eprintln!(
+                "{target_pixels}px unchanged-page cache_hit_p95={:?}",
+                p95(&mut cache_hit_samples)
+            );
+        }
         Ok(())
     }
 

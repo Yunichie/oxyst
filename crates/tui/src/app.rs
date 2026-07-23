@@ -15,7 +15,7 @@ use tokio::runtime::Handle;
 use typst_tui_compiler::{CompiledDocument, Compiler, DocumentSync, Severity};
 use typst_tui_config::Config;
 use typst_tui_document::Motion;
-use typst_tui_render::{ExportFormat, RenderCache, RenderManifest};
+use typst_tui_render::{ExportFormat, RenderManifest};
 use typst_tui_theme::{Color, ColorDepth, Theme, ThemeName};
 
 use crate::{
@@ -110,7 +110,6 @@ pub(crate) struct App {
     compile_generation: u64,
     world_rebuild_pending: bool,
     preview_target_width: u16,
-    preview_render_cache: RenderCache,
     preview_manifest: Option<(u64, u64, RenderManifest, u16)>,
     preview_page_request: Option<(u64, Vec<usize>)>,
     preview_stale: bool,
@@ -197,7 +196,6 @@ impl App {
             compile_generation: 0,
             world_rebuild_pending: false,
             preview_target_width: 0,
-            preview_render_cache: RenderCache::default(),
             preview_manifest: None,
             preview_page_request: None,
             preview_stale: false,
@@ -502,7 +500,6 @@ impl App {
         let watch_error = self.watcher.retarget(&root, Some(&path)).err();
         self.editor.replace_document(&opened.text);
         self.preview.clear();
-        self.preview_render_cache = RenderCache::default();
         self.preview_manifest = None;
         self.preview_page_request = None;
         self.preview_stale = false;
@@ -1027,11 +1024,12 @@ impl App {
         width: u16,
         preserve_position: bool,
     ) {
-        let page_sizes = Preview::page_sizes(&self.picker, &manifest, width);
         if preserve_position {
-            self.preview.rescale_manifest(page_sizes);
+            self.preview
+                .rescale_render_manifest(&self.picker, &manifest, width);
         } else {
-            self.preview.replace_manifest(page_sizes);
+            self.preview
+                .replace_render_manifest(&self.picker, &manifest, width);
         }
         self.preview_manifest = Some((generation, revision, manifest, width));
         self.preview_page_request = None;
@@ -1077,7 +1075,6 @@ impl App {
             picker: self.picker.clone(),
             width: *width,
             pages: pages.clone(),
-            render_cache: self.preview_render_cache.clone(),
         });
         self.preview_page_request = Some((request, pages));
     }
@@ -1100,7 +1097,6 @@ impl App {
         match result.outcome {
             Ok(success) => {
                 self.preview.install_pages(success.pages);
-                self.preview_render_cache = success.render_cache;
                 self.preview_page_request = None;
             }
             Err(error) => {
@@ -1344,7 +1340,6 @@ mod tests {
     use ratatui_image::picker::Picker;
     use typst_tui_compiler::{CompileOutcome, Compiler};
     use typst_tui_config::Config;
-    use typst_tui_render::RenderCache;
 
     use super::{
         App, AppInit, COMPILE_STALLED_AFTER, CompileDebounce, CompileState, Preview,
@@ -1533,7 +1528,6 @@ mod tests {
             return Err("fixture did not compile".into());
         };
         let picker = Picker::halfblocks();
-        let mut cache = RenderCache::default();
         let mut layout_samples = Vec::new();
         let mut render_samples = Vec::new();
         let mut encoding_samples = Vec::new();
@@ -1548,15 +1542,9 @@ mod tests {
             layout_samples.push(layout_started.elapsed());
 
             let render_started = Instant::now();
-            let (rendered, next_cache) = typst_tui_render::render_pages_cached_cancellable(
-                &document,
-                &manifest,
-                [0],
-                &cache,
-                || false,
-            )?;
+            let rendered =
+                typst_tui_render::render_pages_cancellable(&document, &manifest, [0], || false)?;
             render_samples.push(render_started.elapsed());
-            cache = next_cache;
 
             let encoding_started = Instant::now();
             let encoded =

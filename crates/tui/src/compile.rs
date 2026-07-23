@@ -14,7 +14,7 @@ use typst_tui_compiler::{
     CompileOutcome, CompileSnapshot, CompiledDocument, Compiler, Diagnostic, DocumentSync,
 };
 use typst_tui_document::TextEdit;
-use typst_tui_render::{RenderCache, RenderManifest};
+use typst_tui_render::RenderManifest;
 
 use crate::{components::Preview, event::Event};
 
@@ -56,7 +56,6 @@ pub(crate) struct PreviewPageResult {
 
 pub(crate) struct PreviewPageSuccess {
     pub(crate) pages: Vec<(usize, SlicedProtocol)>,
-    pub(crate) render_cache: RenderCache,
 }
 
 enum CompileInput {
@@ -78,7 +77,6 @@ pub(crate) struct PreviewPageRequest {
     pub(crate) picker: Picker,
     pub(crate) width: u16,
     pub(crate) pages: Vec<usize>,
-    pub(crate) render_cache: RenderCache,
 }
 
 #[derive(Default)]
@@ -355,23 +353,19 @@ fn render_preview_request(
             || !is_current(&runner.preview_request, queued.id)
     };
     let requested = request.pages.clone();
-    let outcome = match typst_tui_render::render_pages_cached_cancellable(
+    let outcome = match typst_tui_render::render_pages_cancellable(
         &request.document,
         &request.manifest,
         request.pages,
-        &request.render_cache,
         cancelled,
     ) {
-        Ok((rendered, render_cache)) => match Preview::encode_rendered_pages_cancellable(
+        Ok(rendered) => match Preview::encode_rendered_pages_cancellable(
             &request.picker,
             rendered,
             request.width,
             cancelled,
         ) {
-            Ok(Some(pages)) => Ok(PreviewPageSuccess {
-                pages,
-                render_cache,
-            }),
+            Ok(Some(pages)) => Ok(PreviewPageSuccess { pages }),
             Ok(None) => return None,
             Err(_) if cancelled() => return None,
             Err(error) => Err(error),
@@ -503,7 +497,6 @@ mod tests {
 
     use ratatui_image::picker::Picker;
     use typst_tui_compiler::Compiler;
-    use typst_tui_render::RenderCache;
 
     use super::{
         CompileInput, CompileRequest, CompileResultKind, CompileWorker, PreviewPageRequest,
@@ -627,7 +620,6 @@ mod tests {
             picker,
             width,
             pages: vec![1],
-            render_cache: RenderCache::default(),
         });
 
         let Event::PreviewPagesFinished(result) = receiver.recv_timeout(Duration::from_secs(30))?
@@ -667,7 +659,6 @@ mod tests {
                 picker: picker.clone(),
                 width,
                 pages: vec![1],
-                render_cache: RenderCache::default(),
             },
         };
         let mut scheduler = PreviewScheduler::default();
