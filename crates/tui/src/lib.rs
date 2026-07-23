@@ -13,12 +13,13 @@ mod style;
 mod watcher;
 mod workspace;
 
-use std::{io, path::PathBuf, time::Duration};
+use std::{io, io::ErrorKind, path::PathBuf, time::Duration};
 
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture},
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     execute,
 };
+use ratatui_image::picker::Picker;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -41,9 +42,9 @@ pub fn run(
     let compiler = typst_tui_compiler::Compiler::new(&root, main)?;
     let runtime = tokio::runtime::Builder::new_multi_thread().build()?;
     let mut terminal = ratatui::try_init()?;
-    let picker = match ratatui_image::picker::Picker::from_query_stdio() {
+    let picker = match Picker::from_query_stdio() {
         Ok(picker) => picker,
-        Err(_) => ratatui_image::picker::Picker::halfblocks(),
+        Err(_) => Picker::halfblocks(),
     };
     let (mut recent, mut startup_status) = recent::RecentFiles::load_default();
     if let Some(path) = path.as_deref().filter(|path| path.is_file())
@@ -51,11 +52,14 @@ pub fn run(
     {
         startup_status = Some(error);
     }
-    if let Err(error) = execute!(io::stdout(), EnableMouseCapture) {
-        let _ = ratatui::try_restore();
-        runtime.shutdown_timeout(Duration::from_millis(100));
-        return Err(Error::Terminal(error));
-    }
+    let bracketed_paste = match enable_input_modes() {
+        Ok(bracketed_paste) => bracketed_paste,
+        Err(error) => {
+            let _ = ratatui::try_restore();
+            runtime.shutdown_timeout(Duration::from_millis(100));
+            return Err(Error::Terminal(error));
+        }
+    };
     let mut app = match app::App::new(app::AppInit {
         path,
         root,
@@ -69,19 +73,41 @@ pub fn run(
     }) {
         Ok(app) => app,
         Err(error) => {
-            let _ = execute!(io::stdout(), DisableMouseCapture);
+            let _ = disable_input_modes(bracketed_paste);
             let _ = ratatui::try_restore();
             runtime.shutdown_timeout(Duration::from_millis(100));
             return Err(Error::Configuration(error));
         }
     };
     let run_result = app.run(&mut terminal);
-    let mouse_result = execute!(io::stdout(), DisableMouseCapture);
+    let input_result = disable_input_modes(bracketed_paste);
     let restore_result = ratatui::try_restore();
     runtime.shutdown_timeout(Duration::from_millis(100));
 
     run_result?;
-    mouse_result?;
+    input_result?;
     restore_result?;
     Ok(())
+}
+
+fn enable_input_modes() -> io::Result<bool> {
+    execute!(io::stdout(), EnableMouseCapture)?;
+    match execute!(io::stdout(), EnableBracketedPaste) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::Unsupported => Ok(false),
+        Err(error) => {
+            let _ = execute!(io::stdout(), DisableMouseCapture);
+            Err(error)
+        }
+    }
+}
+
+fn disable_input_modes(bracketed_paste: bool) -> io::Result<()> {
+    let paste_result = if bracketed_paste {
+        execute!(io::stdout(), DisableBracketedPaste)
+    } else {
+        Ok(())
+    };
+    let mouse_result = execute!(io::stdout(), DisableMouseCapture);
+    paste_result.and(mouse_result)
 }
