@@ -35,6 +35,7 @@ pub enum Error {
 pub fn run(
     path: Option<PathBuf>,
     root: PathBuf,
+    root_is_explicit: bool,
     text: &str,
     config: typst_tui_config::Config,
 ) -> Result<(), Error> {
@@ -63,6 +64,7 @@ pub fn run(
     let mut app = match app::App::new(app::AppInit {
         path,
         root,
+        root_is_explicit,
         text,
         compiler,
         picker,

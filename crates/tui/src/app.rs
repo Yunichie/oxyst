@@ -123,6 +123,7 @@ pub(crate) struct App {
 pub(crate) struct AppInit<'a> {
     pub(crate) path: Option<PathBuf>,
     pub(crate) root: PathBuf,
+    pub(crate) root_is_explicit: bool,
     pub(crate) text: &'a str,
     pub(crate) compiler: Compiler,
     pub(crate) picker: Picker,
@@ -137,6 +138,7 @@ impl App {
         let AppInit {
             path,
             root,
+            root_is_explicit,
             text,
             compiler,
             picker,
@@ -173,7 +175,7 @@ impl App {
             explorer: FileExplorer::new(root.clone(), theme),
             focus: Pane::Editor,
             fullscreen: false,
-            workspace: Workspace::new(path, root),
+            workspace: Workspace::new(path, root, root_is_explicit),
             picker,
             compile_worker: CompileWorker::new(compiler, text, sender.clone(), runtime.clone()),
             export_worker: ExportWorker::new(sender, runtime),
@@ -467,6 +469,13 @@ impl App {
     }
 
     fn open_path(&mut self, path: PathBuf) {
+        let root = match self.workspace.root_for_document(&path) {
+            Ok(root) => root,
+            Err(error) => {
+                self.status = Some(error);
+                return;
+            }
+        };
         let opened = match Workspace::read_source(&path) {
             Ok(opened) => opened,
             Err(error) => {
@@ -474,7 +483,6 @@ impl App {
                 return;
             }
         };
-        let root = self.workspace.root_for_open(&path);
         let watch_error = self.watcher.retarget(&root, Some(&path)).err();
         self.editor.replace_document(&opened.text);
         self.preview.clear();
@@ -519,10 +527,17 @@ impl App {
     }
 
     fn save_as(&mut self, path: PathBuf) {
+        let root = match self.workspace.root_for_document(&path) {
+            Ok(root) => root,
+            Err(error) => {
+                self.status = Some(error);
+                return;
+            }
+        };
         if !self.write_document(&path) {
             return;
         }
-        self.workspace.saved_as(path.clone());
+        self.workspace.saved_as(path.clone(), root);
         let watch_error = self
             .watcher
             .retarget(self.workspace.root(), Some(&path))
@@ -1179,7 +1194,7 @@ mod tests {
         error::Error,
         fs,
         path::PathBuf,
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
@@ -1227,6 +1242,7 @@ mod tests {
         let mut app = App::new(AppInit {
             path: Some(main),
             root,
+            root_is_explicit: false,
             text: &source,
             compiler,
             picker: Picker::halfblocks(),
@@ -1284,6 +1300,7 @@ mod tests {
         let mut app = App::new(AppInit {
             path: Some(main),
             root,
+            root_is_explicit: false,
             text: "one two",
             compiler,
             picker: Picker::halfblocks(),
@@ -1322,6 +1339,47 @@ mod tests {
 
         drop(app);
         runtime.shutdown_timeout(Duration::from_millis(100));
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_root_rejects_save_as_before_writing() -> Result<(), Box<dyn Error>> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        let compiler = Compiler::new(&root, root.join("untitled.typ"))?;
+        let runtime = tokio::runtime::Builder::new_multi_thread().build()?;
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let outside =
+            std::env::temp_dir().join(format!("typst-tui-save-as-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&outside)?;
+        let destination = outside.join("report.typ");
+        let mut app = App::new(AppInit {
+            path: None,
+            root: root.clone(),
+            root_is_explicit: true,
+            text: "= Draft",
+            compiler,
+            picker: Picker::halfblocks(),
+            runtime: runtime.handle().clone(),
+            config: Config::default(),
+            recent: crate::recent::RecentFiles::disabled(),
+            startup_status: None,
+        })
+        .map_err(std::io::Error::other)?;
+
+        app.save_as(destination.clone());
+
+        assert!(!destination.exists());
+        assert!(app.workspace.path().is_none());
+        assert_eq!(app.workspace.root(), root);
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|status| status.contains("outside project root"))
+        );
+
+        drop(app);
+        runtime.shutdown_timeout(Duration::from_millis(100));
+        fs::remove_dir_all(outside)?;
         Ok(())
     }
 }

@@ -24,12 +24,13 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let text = load(&cli.file)?;
+    let root_is_explicit = cli.root.is_some();
     let root = project_root(cli.root, cli.file.as_deref())?;
     let mut config = typst_tui_config::Config::load(cli.config.as_deref())?;
     if let Some(theme) = cli.theme {
         config.set_theme(theme);
     }
-    typst_tui_app::run(cli.file, root, &text, config)?;
+    typst_tui_app::run(cli.file, root, root_is_explicit, &text, config)?;
     Ok(())
 }
 
