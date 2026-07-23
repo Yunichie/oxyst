@@ -44,6 +44,13 @@ const AUTO_COMPILE_DELAY: Duration = Duration::from_millis(150);
 const CURSOR_SYNC_DELAY: Duration = Duration::from_millis(50);
 const COMPILE_STALLED_AFTER: Duration = Duration::from_secs(5);
 
+fn preview_dimensions(picker: &Picker, width: u16) -> (u16, u32) {
+    let font_width = picker.font_size().width.max(1);
+    let max_columns = (2_048 / font_width).max(1);
+    let width = width.clamp(1, max_columns);
+    (width, u32::from(width) * u32::from(font_width))
+}
+
 fn overlay_transition_requires_clear(action: &Action) -> bool {
     matches!(action, Action::CloseOverlay | Action::OverlaySubmit)
 }
@@ -304,7 +311,7 @@ impl App {
             Action::ToggleFullscreen => self.fullscreen = !self.fullscreen,
             Action::ZoomPreview(direction) if self.preview.zoom(direction) => {
                 self.focus = Pane::Preview;
-                self.start_compile();
+                self.refresh_preview_scale();
             }
             Action::NavigateDiagnostic(direction) => self.navigate_diagnostic(direction),
             Action::MouseDown { column, row } => self.mouse_down(column, row),
@@ -851,9 +858,33 @@ impl App {
             return;
         }
         self.preview_target_width = width;
-        if self.welcome.is_none() {
-            self.schedule_compile(false, false);
+        self.refresh_preview_scale();
+    }
+
+    fn refresh_preview_scale(&mut self) {
+        self.preview_target_width = self.preview.target_width();
+        if self.welcome.is_some() || self.preview_stale || self.compile_state != CompileState::Ready
+        {
+            return;
         }
+        let Some((revision, document)) = self
+            .compiled_document
+            .as_ref()
+            .filter(|(revision, _)| *revision == self.editor.revision())
+        else {
+            return;
+        };
+        let revision = *revision;
+        let (width, target_pixels) = preview_dimensions(&self.picker, self.preview_target_width);
+        let manifest = match typst_tui_render::render_manifest(document, target_pixels) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                self.status = Some(format!("Preview failed: {error}"));
+                return;
+            }
+        };
+        self.install_preview_manifest(self.compile_generation, revision, manifest, width, true);
+        self.request_preview_pages();
     }
 
     fn schedule_compile(&mut self, files_changed: bool, mark_preview_stale: bool) {
@@ -887,11 +918,7 @@ impl App {
         }
         self.compile_debounce.cancel();
         self.preview_target_width = self.preview.target_width();
-        self.compile_generation = self.compile_worker.spawn(
-            self.editor.revision(),
-            self.picker.clone(),
-            self.preview.target_width(),
-        );
+        self.compile_generation = self.compile_worker.spawn(self.editor.revision());
         self.preview_page_request = None;
         self.compile_started_at = Some(Instant::now());
         self.compile_state = CompileState::Compiling;
@@ -905,8 +932,6 @@ impl App {
         let main = self.workspace.main_path();
         self.compile_generation = self.compile_worker.spawn_with_world(
             self.editor.revision(),
-            self.picker.clone(),
-            self.preview.target_width(),
             WorldRebuild {
                 root: self.workspace.root().to_owned(),
                 main,
@@ -947,17 +972,30 @@ impl App {
                 diagnostics,
                 sync,
                 document,
-                manifest,
-                width,
             } => {
-                self.preview
-                    .replace_manifest(Preview::page_sizes(&self.picker, &manifest, width));
+                let document = *document;
+                self.preview_target_width = self.preview.target_width();
+                let (width, target_pixels) =
+                    preview_dimensions(&self.picker, self.preview_target_width);
+                let manifest = match typst_tui_render::render_manifest(&document, target_pixels) {
+                    Ok(manifest) => manifest,
+                    Err(error) => {
+                        self.compile_state = CompileState::Error;
+                        self.status = Some(format!("Preview failed: {error}"));
+                        return;
+                    }
+                };
                 self.diagnostics.set_items(diagnostics);
                 self.editor.set_diagnostics(&self.diagnostics);
                 self.document_sync = Some((result.revision, sync));
-                self.compiled_document = Some((result.revision, *document));
-                self.preview_manifest = Some((result.generation, result.revision, manifest, width));
-                self.preview_page_request = None;
+                self.compiled_document = Some((result.revision, document));
+                self.install_preview_manifest(
+                    result.generation,
+                    result.revision,
+                    manifest,
+                    width,
+                    false,
+                );
                 self.compile_state = CompileState::Ready;
                 self.preview_stale = false;
                 self.status = None;
@@ -979,6 +1017,24 @@ impl App {
                 self.status = Some(format!("Preview failed: {error}"));
             }
         }
+    }
+
+    fn install_preview_manifest(
+        &mut self,
+        generation: u64,
+        revision: u64,
+        manifest: RenderManifest,
+        width: u16,
+        preserve_position: bool,
+    ) {
+        let page_sizes = Preview::page_sizes(&self.picker, &manifest, width);
+        if preserve_position {
+            self.preview.rescale_manifest(page_sizes);
+        } else {
+            self.preview.replace_manifest(page_sizes);
+        }
+        self.preview_manifest = Some((generation, revision, manifest, width));
+        self.preview_page_request = None;
     }
 
     fn request_preview_pages(&mut self) {
@@ -1286,14 +1342,15 @@ mod tests {
 
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
     use ratatui_image::picker::Picker;
-    use typst_tui_compiler::Compiler;
+    use typst_tui_compiler::{CompileOutcome, Compiler};
     use typst_tui_config::Config;
+    use typst_tui_render::RenderCache;
 
     use super::{
-        App, AppInit, COMPILE_STALLED_AFTER, CompileDebounce, CompileState,
-        overlay_transition_requires_clear,
+        App, AppInit, COMPILE_STALLED_AFTER, CompileDebounce, CompileState, Preview,
+        overlay_transition_requires_clear, preview_dimensions,
     };
-    use crate::action::Action;
+    use crate::{action::Action, compile::PreviewPageResult, event::Event};
 
     #[test]
     fn compile_debounce_restarts_after_each_edit() {
@@ -1320,7 +1377,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_width_and_stalled_compile_states_are_tracked() -> Result<(), Box<dyn Error>> {
+    fn resource_changes_and_stalled_compile_states_are_tracked() -> Result<(), Box<dyn Error>> {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
         let main = root.join("simple.typ");
         let source = fs::read_to_string(&main)?;
@@ -1351,9 +1408,10 @@ mod tests {
         app.preview_stale = false;
         app.preview.set_viewport(Rect::new(0, 0, 62, 20));
         let resource_generation = app.compile_generation;
+        let compile_deadline = app.compile_debounce.deadline;
         app.observe_preview_width();
-        assert!(app.compile_generation > resource_generation);
-        assert!(app.compile_debounce.deadline.is_some());
+        assert_eq!(app.compile_generation, resource_generation);
+        assert_eq!(app.compile_debounce.deadline, compile_deadline);
         assert!(!app.preview_stale);
 
         app.compile_debounce.cancel();
@@ -1368,6 +1426,160 @@ mod tests {
 
         drop(app);
         runtime.shutdown_timeout(Duration::from_millis(100));
+        Ok(())
+    }
+
+    #[test]
+    fn preview_scale_changes_reuse_the_compiled_document() -> Result<(), Box<dyn Error>> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        let main = root.join("multi-page.typ");
+        let source = fs::read_to_string(&main)?;
+        let compiler = Compiler::new(&root, &main)?;
+        let runtime = tokio::runtime::Builder::new_multi_thread().build()?;
+        let mut app = App::new(AppInit {
+            path: Some(main),
+            root,
+            root_is_explicit: false,
+            text: &source,
+            compiler,
+            picker: Picker::halfblocks(),
+            runtime: runtime.handle().clone(),
+            config: Config::default(),
+            recent: crate::recent::RecentFiles::disabled(),
+            startup_status: None,
+        })
+        .map_err(std::io::Error::other)?;
+
+        app.preview.set_viewport(Rect::new(0, 0, 42, 20));
+        app.start_compile();
+        let generation = app.compile_generation;
+        app.preview.set_viewport(Rect::new(0, 0, 52, 20));
+        app.observe_preview_width();
+        assert_eq!(app.compile_generation, generation);
+        let Event::CompileFinished(result) =
+            app.internal_events.recv_timeout(Duration::from_secs(30))?
+        else {
+            return Err("worker returned an unexpected event".into());
+        };
+        app.finish_compile(result);
+        assert_eq!(app.compile_generation, generation);
+        let revision = app.editor.revision();
+        let (old_request, old_pages) = app
+            .preview_page_request
+            .clone()
+            .ok_or("initial preview pages were not requested")?;
+        let old_width = app
+            .preview_manifest
+            .as_ref()
+            .map(|(_, _, _, width)| *width)
+            .ok_or("initial preview manifest was not installed")?;
+
+        app.preview.set_viewport(Rect::new(0, 0, 62, 20));
+        app.observe_preview_width();
+
+        assert_eq!(app.compile_generation, generation);
+        assert!(app.compile_debounce.deadline.is_none());
+        assert_eq!(app.compile_state, CompileState::Ready);
+        let resized_request = app
+            .preview_page_request
+            .as_ref()
+            .map(|(request, _)| *request)
+            .ok_or("resized preview pages were not requested")?;
+        assert_ne!(resized_request, old_request);
+        assert_ne!(
+            app.preview_manifest.as_ref().map(|(_, _, _, width)| *width),
+            Some(old_width)
+        );
+
+        app.finish_preview_pages(PreviewPageResult {
+            generation,
+            revision,
+            request: old_request,
+            width: old_width,
+            requested: old_pages,
+            outcome: Err("stale scale".to_owned()),
+        });
+        assert_eq!(
+            app.preview_page_request
+                .as_ref()
+                .map(|(request, _)| *request),
+            Some(resized_request)
+        );
+        assert_ne!(
+            app.status.as_deref(),
+            Some("Preview page failed: stale scale")
+        );
+
+        app.update(Action::ZoomPreview(1));
+        assert_eq!(app.compile_generation, generation);
+        assert!(app.compile_debounce.deadline.is_none());
+
+        drop(app);
+        runtime.shutdown_timeout(Duration::from_millis(100));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "manual release-mode performance probe"]
+    fn scale_refresh_reports_visible_page_latency_without_compiling() -> Result<(), Box<dyn Error>>
+    {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        let mut compiler = Compiler::new(&root, root.join("simple.typ"))?;
+        let source = (0..100)
+            .map(|page| format!("#rect(width: 100%, height: 100%, fill: rgb({page}, 80, 120))"))
+            .collect::<Vec<_>>()
+            .join("\n#pagebreak()\n");
+        let CompileOutcome::Success(document) = compiler.compile(&source) else {
+            return Err("fixture did not compile".into());
+        };
+        let picker = Picker::halfblocks();
+        let mut cache = RenderCache::default();
+        let mut layout_samples = Vec::new();
+        let mut render_samples = Vec::new();
+        let mut encoding_samples = Vec::new();
+        let mut total_samples = Vec::new();
+
+        for target_width in 60..100 {
+            let total_started = Instant::now();
+            let layout_started = Instant::now();
+            let (width, pixels) = preview_dimensions(&picker, target_width);
+            let manifest = typst_tui_render::render_manifest(&document, pixels)?;
+            let page_sizes = Preview::page_sizes(&picker, &manifest, width);
+            layout_samples.push(layout_started.elapsed());
+
+            let render_started = Instant::now();
+            let (rendered, next_cache) = typst_tui_render::render_pages_cached_cancellable(
+                &document,
+                &manifest,
+                [0],
+                &cache,
+                || false,
+            )?;
+            render_samples.push(render_started.elapsed());
+            cache = next_cache;
+
+            let encoding_started = Instant::now();
+            let encoded =
+                Preview::encode_rendered_pages_cancellable(&picker, rendered, width, || false)?
+                    .ok_or("encoding was cancelled")?;
+            encoding_samples.push(encoding_started.elapsed());
+            total_samples.push(total_started.elapsed());
+
+            assert_eq!(page_sizes.len(), 100);
+            assert_eq!(encoded.len(), 1);
+        }
+
+        let p95 = |samples: &mut Vec<Duration>| {
+            samples.sort_unstable();
+            samples[(samples.len() - 1) * 95 / 100]
+        };
+        eprintln!(
+            "100-page scale refresh: layout_p95={:?}, render_p95={:?}, encoding_p95={:?}, total_p95={:?}",
+            p95(&mut layout_samples),
+            p95(&mut render_samples),
+            p95(&mut encoding_samples),
+            p95(&mut total_samples),
+        );
         Ok(())
     }
 

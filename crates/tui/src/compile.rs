@@ -34,8 +34,6 @@ pub(crate) enum CompileResultKind {
         diagnostics: Vec<Diagnostic>,
         sync: DocumentSync,
         document: Box<CompiledDocument>,
-        manifest: RenderManifest,
-        width: u16,
     },
     Diagnostics(Vec<Diagnostic>),
     Error(String),
@@ -45,8 +43,6 @@ struct CompileRequest {
     generation: u64,
     revision: u64,
     input: CompileInput,
-    picker: Picker,
-    width: u16,
 }
 
 pub(crate) struct PreviewPageResult {
@@ -212,7 +208,7 @@ impl CompileWorker {
         Ok(generation)
     }
 
-    pub(crate) fn spawn(&self, revision: u64, picker: Picker, width: u16) -> u64 {
+    pub(crate) fn spawn(&self, revision: u64) -> u64 {
         let generation = match self.advance_and_cancel_pending() {
             Ok(generation) => generation,
             Err(error) => return self.report_preparation_error(revision, error),
@@ -228,19 +224,11 @@ impl CompileWorker {
             generation,
             revision,
             input: CompileInput::Snapshot(snapshot),
-            picker,
-            width,
         });
         generation
     }
 
-    pub(crate) fn spawn_with_world(
-        &self,
-        revision: u64,
-        picker: Picker,
-        width: u16,
-        rebuild: WorldRebuild,
-    ) -> u64 {
+    pub(crate) fn spawn_with_world(&self, revision: u64, rebuild: WorldRebuild) -> u64 {
         let generation = match self.advance_and_cancel_pending() {
             Ok(generation) => generation,
             Err(error) => return self.report_preparation_error(revision, error),
@@ -249,8 +237,6 @@ impl CompileWorker {
             generation,
             revision,
             input: CompileInput::Rebuild(rebuild),
-            picker,
-            width,
         });
         generation
     }
@@ -483,20 +469,6 @@ fn compile(
         return None;
     }
     let sync = compiled.sync();
-    let (width, target_pixels) = preview_dimensions(&request.picker, request.width);
-    let manifest = match typst_tui_render::render_manifest(&compiled, target_pixels) {
-        Ok(manifest) => manifest,
-        Err(error) => {
-            return Some(CompileResult {
-                generation: request.generation,
-                revision: request.revision,
-                elapsed: started.elapsed(),
-                rebuilt_compiler,
-                rebuild_attempted,
-                outcome: CompileResultKind::Error(error.to_string()),
-            });
-        }
-    };
 
     is_current(generations, request.generation).then_some(CompileResult {
         generation: request.generation,
@@ -508,17 +480,8 @@ fn compile(
             diagnostics: compiled.warnings().to_vec(),
             sync,
             document: Box::new(compiled),
-            manifest,
-            width,
         },
     })
-}
-
-fn preview_dimensions(picker: &Picker, width: u16) -> (u16, u32) {
-    let font_width = picker.font_size().width.max(1);
-    let max_columns = (2_048 / font_width).max(1);
-    let width = width.clamp(1, max_columns);
-    (width, u32::from(width) * u32::from(font_width))
 }
 
 fn advance(generation: &AtomicU64) -> u64 {
@@ -545,7 +508,6 @@ mod tests {
     use super::{
         CompileInput, CompileRequest, CompileResultKind, CompileWorker, PreviewPageRequest,
         PreviewScheduler, QueuedPreviewRequest, Scheduler, WorldRebuild, advance, is_current,
-        preview_dimensions,
     };
     use crate::event::Event;
 
@@ -610,8 +572,6 @@ mod tests {
 
         worker.spawn_with_world(
             0,
-            Picker::halfblocks(),
-            40,
             WorldRebuild {
                 root: root.clone(),
                 main: root.join("simple.typ"),
@@ -648,19 +608,16 @@ mod tests {
             runtime.handle().clone(),
         );
 
-        let generation = worker.spawn(7, picker.clone(), 40);
+        let generation = worker.spawn(7);
         let Event::CompileFinished(result) = receiver.recv_timeout(Duration::from_secs(30))? else {
             return Err("worker returned an unexpected event".into());
         };
-        let CompileResultKind::Success {
-            document,
-            manifest,
-            width,
-            ..
-        } = result.outcome
-        else {
+        let CompileResultKind::Success { document, .. } = result.outcome else {
             return Err("document did not compile".into());
         };
+        let width = 40;
+        let pixels = u32::from(width) * u32::from(picker.font_size().width.max(1));
+        let manifest = typst_tui_render::render_manifest(&document, pixels)?;
         let expected_size = crate::components::Preview::page_sizes(&picker, &manifest, width)[1];
         let request = worker.spawn_preview_pages(PreviewPageRequest {
             generation,
@@ -697,7 +654,8 @@ mod tests {
             return Err("fixture did not compile".into());
         };
         let picker = Picker::halfblocks();
-        let (width, pixels) = preview_dimensions(&picker, 40);
+        let width = 40;
+        let pixels = u32::from(width) * u32::from(picker.font_size().width.max(1));
         let manifest = typst_tui_render::render_manifest(&document, pixels)?;
         let queued = |id| QueuedPreviewRequest {
             id,
@@ -734,8 +692,6 @@ mod tests {
             generation,
             revision: generation,
             input: CompileInput::Snapshot(compiler.snapshot()),
-            picker: Picker::halfblocks(),
-            width: 40,
         })
     }
 }

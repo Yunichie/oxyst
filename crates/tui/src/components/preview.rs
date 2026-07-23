@@ -108,6 +108,22 @@ impl Preview {
         self.clamp_scroll();
     }
 
+    pub(crate) fn rescale_manifest(&mut self, page_sizes: Vec<Size>) {
+        let anchor = self.current_page_index().map(|page| {
+            let height = usize::from(self.page_sizes[page].height.max(1));
+            let offset = self.scroll.saturating_sub(self.page_top(page)).min(height);
+            (page, offset, height)
+        });
+        self.replace_manifest(page_sizes);
+        if let Some((page, offset, old_height)) = anchor
+            && let Some(size) = self.page_sizes.get(page)
+        {
+            let offset = offset.saturating_mul(usize::from(size.height)) / old_height;
+            self.scroll = self.page_top(page).saturating_add(offset);
+            self.clamp_scroll();
+        }
+    }
+
     pub(crate) fn install_pages(&mut self, pages: Vec<(usize, SlicedProtocol)>) {
         for (index, page) in pages {
             if index >= self.page_sizes.len() {
@@ -623,6 +639,21 @@ mod tests {
         assert_eq!(preview.page_requests(), vec![0, 1]);
         assert!(preview.go_to_page(5));
         assert_eq!(preview.page_requests(), vec![4, 3, 5]);
+    }
+
+    #[test]
+    fn rescaling_preserves_the_page_and_relative_scroll_position() {
+        let mut preview = Preview::new(theme());
+        preview.replace_manifest(vec![Size::new(20, 10); 10]);
+        preview.set_viewport(Rect::new(0, 0, 22, 7));
+        assert!(preview.go_to_page(5));
+        preview.scroll_lines(5);
+
+        preview.rescale_manifest(vec![Size::new(30, 20); 10]);
+
+        assert_eq!(preview.current_page(), 5);
+        assert_eq!(preview.scroll, preview.page_top(4) + 10);
+        assert!(preview.pages.is_empty());
     }
 
     #[test]
