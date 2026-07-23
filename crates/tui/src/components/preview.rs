@@ -357,9 +357,12 @@ mod tests {
     use ratatui::{
         Terminal,
         backend::TestBackend,
+        layout::Rect,
         style::{Color, Modifier},
+        text::Line,
+        widgets::Paragraph,
     };
-    use ratatui_image::picker::Picker;
+    use ratatui_image::picker::{Picker, ProtocolType};
     use typst_tui_compiler::{CompileOutcome, Compiler, PagePosition};
     use typst_tui_theme::{ColorDepth, Theme, ThemeName};
 
@@ -470,6 +473,71 @@ mod tests {
         assert_eq!(preview.current_page(), 2);
         preview.scroll_pages(-1);
         assert_eq!(preview.current_page(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn scrolled_preview_stays_inside_its_area() -> Result<(), Box<dyn Error>> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        let source = fs::read_to_string(root.join("multi-page.typ"))?;
+        let mut compiler = Compiler::new(&root, root.join("multi-page.typ"))?;
+        let CompileOutcome::Success(document) = compiler.compile(&source) else {
+            return Err(io::Error::other("multi-page fixture did not compile").into());
+        };
+        let width = 46;
+        let height = 12;
+        let area = Rect::new(22, 2, 22, 8);
+        for protocol_type in [ProtocolType::Iterm2, ProtocolType::Sixel] {
+            let mut picker = Picker::halfblocks();
+            picker.set_protocol_type(protocol_type);
+            let font_height = usize::from(picker.font_size().height);
+            let rendered = typst_tui_render::render(&document, 280)?;
+            let pages = Preview::encode_pages(&picker, rendered, 18).map_err(io::Error::other)?;
+            let mut preview = Preview::new(theme());
+            preview.replace_pages(pages);
+            preview.scroll_lines(5);
+
+            let background = (0..height)
+                .map(|_| Line::raw(".".repeat(width.into())))
+                .collect::<Vec<_>>();
+            let mut terminal = Terminal::new(TestBackend::new(width, height))?;
+            terminal.draw(|frame| {
+                frame.render_widget(Paragraph::new(background), frame.area());
+                preview.draw_preview(frame, area, true, false);
+            })?;
+
+            let buffer = terminal.backend().buffer();
+            for y in 0..height {
+                for x in 0..width {
+                    if !area.contains((x, y).into()) {
+                        assert_eq!(
+                            buffer[(x, y)].symbol(),
+                            ".",
+                            "{protocol_type:?} rendered outside the preview"
+                        );
+                    }
+                }
+            }
+            let sequences = (area.y + 1..area.bottom() - 1)
+                .flat_map(|y| (area.x + 1..area.right() - 1).map(move |x| buffer[(x, y)].symbol()))
+                .filter(|symbol| symbol.contains('\x1b'))
+                .collect::<Vec<_>>();
+            assert!(
+                !sequences.is_empty(),
+                "{protocol_type:?} did not render an image sequence"
+            );
+
+            if protocol_type == ProtocolType::Sixel {
+                let band_count = sequences[0].bytes().filter(|byte| *byte == b'-').count();
+                let visible_rows = usize::from(area.height.saturating_sub(2));
+                let max_visible_bands = (visible_rows * font_height).div_ceil(6);
+                assert!(
+                    band_count <= max_visible_bands,
+                    "Sixel rendered {band_count} bands for a {visible_rows}-row viewport"
+                );
+            }
+        }
 
         Ok(())
     }
