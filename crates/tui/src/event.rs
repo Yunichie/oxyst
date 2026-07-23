@@ -6,7 +6,10 @@ use std::{
 
 use crossterm::event::{self, KeyEvent, MouseEvent};
 
-use crate::{compile::CompileResult, export::ExportResult};
+use crate::{
+    compile::{CompileResult, PreviewPageResult},
+    export::ExportResult,
+};
 
 pub(crate) enum Event {
     Key(KeyEvent),
@@ -16,6 +19,7 @@ pub(crate) enum Event {
     ProjectFilesChanged,
     FileWatchFailed(String),
     CompileFinished(CompileResult),
+    PreviewPagesFinished(PreviewPageResult),
     ExportFinished(ExportResult),
     Tick,
     Ignored,

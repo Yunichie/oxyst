@@ -15,13 +15,16 @@ use tokio::runtime::Handle;
 use typst_tui_compiler::{CompiledDocument, Compiler, DocumentSync, Severity};
 use typst_tui_config::Config;
 use typst_tui_document::Motion;
-use typst_tui_render::{ExportFormat, RenderCache};
+use typst_tui_render::{ExportFormat, RenderCache, RenderManifest};
 use typst_tui_theme::{Color, ColorDepth, Theme, ThemeName};
 
 use crate::{
     action::{Action, Pane},
     clipboard::Clipboard,
-    compile::{CompileResult, CompileResultKind, CompileWorker, WorldRebuild},
+    compile::{
+        CompileResult, CompileResultKind, CompileWorker, PreviewPageRequest, PreviewPageResult,
+        WorldRebuild,
+    },
     components::{
         Command, Component, ConfirmIntent, Diagnostics, Editor, FileExplorer, Header, HeaderState,
         OverlayHost, OverlaySubmission, Preview, Prompt, PromptKind, SearchMode, StatusBar,
@@ -101,6 +104,8 @@ pub(crate) struct App {
     world_rebuild_pending: bool,
     preview_target_width: u16,
     preview_render_cache: RenderCache,
+    preview_manifest: Option<(u64, u64, RenderManifest, u16)>,
+    preview_page_request: Option<(u64, Vec<usize>)>,
     preview_stale: bool,
     compiled_document: Option<(u64, CompiledDocument)>,
     document_sync: Option<(u64, DocumentSync)>,
@@ -186,6 +191,8 @@ impl App {
             world_rebuild_pending: false,
             preview_target_width: 0,
             preview_render_cache: RenderCache::default(),
+            preview_manifest: None,
+            preview_page_request: None,
             preview_stale: false,
             compiled_document: None,
             document_sync: None,
@@ -211,6 +218,7 @@ impl App {
         while !self.should_quit {
             terminal.draw(|frame| self.draw(frame))?;
             self.observe_preview_width();
+            self.request_preview_pages();
             if !initial_compile_requested {
                 self.start_compile();
                 initial_compile_requested = true;
@@ -279,6 +287,7 @@ impl App {
             Action::Save => self.save(),
             Action::Recompile => self.start_compile(),
             Action::CompileFinished(result) => self.finish_compile(result),
+            Action::PreviewPagesFinished(result) => self.finish_preview_pages(result),
             Action::ExportFinished(result) => self.finish_export(result),
             Action::Resize => {}
             Action::ProjectFilesChanged => {
@@ -487,6 +496,8 @@ impl App {
         self.editor.replace_document(&opened.text);
         self.preview.clear();
         self.preview_render_cache = RenderCache::default();
+        self.preview_manifest = None;
+        self.preview_page_request = None;
         self.preview_stale = false;
         self.diagnostics = Diagnostics::new(self.theme);
         self.document_sync = None;
@@ -880,8 +891,8 @@ impl App {
             self.editor.revision(),
             self.picker.clone(),
             self.preview.target_width(),
-            self.preview_render_cache.clone(),
         );
+        self.preview_page_request = None;
         self.compile_started_at = Some(Instant::now());
         self.compile_state = CompileState::Compiling;
         self.status = None;
@@ -896,13 +907,13 @@ impl App {
             self.editor.revision(),
             self.picker.clone(),
             self.preview.target_width(),
-            self.preview_render_cache.clone(),
             WorldRebuild {
                 root: self.workspace.root().to_owned(),
                 main,
                 source: self.editor.text(),
             },
         );
+        self.preview_page_request = None;
         self.compile_started_at = Some(Instant::now());
         self.compile_state = CompileState::Compiling;
         self.status = None;
@@ -933,22 +944,25 @@ impl App {
         self.last_compile_time = Some(result.elapsed);
         match result.outcome {
             CompileResultKind::Success {
-                pages,
                 diagnostics,
                 sync,
                 document,
-                render_cache,
+                manifest,
+                width,
             } => {
-                self.preview.replace_pages(pages);
+                self.preview
+                    .replace_manifest(Preview::page_sizes(&self.picker, &manifest, width));
                 self.diagnostics.set_items(diagnostics);
                 self.editor.set_diagnostics(&self.diagnostics);
                 self.document_sync = Some((result.revision, sync));
                 self.compiled_document = Some((result.revision, *document));
-                self.preview_render_cache = render_cache;
+                self.preview_manifest = Some((result.generation, result.revision, manifest, width));
+                self.preview_page_request = None;
                 self.compile_state = CompileState::Ready;
                 self.preview_stale = false;
                 self.status = None;
                 self.sync_cursor_to_preview();
+                self.request_preview_pages();
             }
             CompileResultKind::Diagnostics(diagnostics) => {
                 let errors = diagnostics
@@ -963,6 +977,79 @@ impl App {
             CompileResultKind::Error(error) => {
                 self.compile_state = CompileState::Error;
                 self.status = Some(format!("Preview failed: {error}"));
+            }
+        }
+    }
+
+    fn request_preview_pages(&mut self) {
+        if self.preview_stale {
+            return;
+        }
+        let pages = self.preview.page_requests();
+        if pages.is_empty() {
+            self.preview_page_request = None;
+            return;
+        }
+        if self
+            .preview_page_request
+            .as_ref()
+            .is_some_and(|(_, requested)| *requested == pages)
+        {
+            return;
+        }
+        let Some((revision, document)) = self
+            .compiled_document
+            .as_ref()
+            .filter(|(revision, _)| *revision == self.editor.revision())
+        else {
+            return;
+        };
+        let Some((_, manifest_revision, manifest, width)) =
+            self.preview_manifest
+                .as_ref()
+                .filter(|(generation, manifest_revision, _, _)| {
+                    *generation == self.compile_generation && manifest_revision == revision
+                })
+        else {
+            return;
+        };
+        let request = self.compile_worker.spawn_preview_pages(PreviewPageRequest {
+            generation: self.compile_generation,
+            revision: *manifest_revision,
+            document: document.clone(),
+            manifest: manifest.clone(),
+            picker: self.picker.clone(),
+            width: *width,
+            pages: pages.clone(),
+            render_cache: self.preview_render_cache.clone(),
+        });
+        self.preview_page_request = Some((request, pages));
+    }
+
+    fn finish_preview_pages(&mut self, result: PreviewPageResult) {
+        if result.generation != self.compile_generation
+            || result.revision != self.editor.revision()
+            || self
+                .preview_page_request
+                .as_ref()
+                .is_none_or(|(request, _)| *request != result.request)
+            || self
+                .preview_manifest
+                .as_ref()
+                .is_none_or(|(_, _, _, width)| *width != result.width)
+        {
+            return;
+        }
+
+        match result.outcome {
+            Ok(success) => {
+                self.preview.install_pages(success.pages);
+                self.preview_render_cache = success.render_cache;
+                self.preview_page_request = None;
+            }
+            Err(error) => {
+                self.preview_page_request = Some((result.request, result.requested));
+                self.status = Some(format!("Preview page failed: {error}"));
             }
         }
     }

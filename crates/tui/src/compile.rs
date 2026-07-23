@@ -14,7 +14,7 @@ use typst_tui_compiler::{
     CompileOutcome, CompileSnapshot, CompiledDocument, Compiler, Diagnostic, DocumentSync,
 };
 use typst_tui_document::TextEdit;
-use typst_tui_render::RenderCache;
+use typst_tui_render::{RenderCache, RenderManifest};
 
 use crate::{components::Preview, event::Event};
 
@@ -31,11 +31,11 @@ pub(crate) struct CompileResult {
 
 pub(crate) enum CompileResultKind {
     Success {
-        pages: Vec<SlicedProtocol>,
         diagnostics: Vec<Diagnostic>,
         sync: DocumentSync,
         document: Box<CompiledDocument>,
-        render_cache: RenderCache,
+        manifest: RenderManifest,
+        width: u16,
     },
     Diagnostics(Vec<Diagnostic>),
     Error(String),
@@ -47,7 +47,20 @@ struct CompileRequest {
     input: CompileInput,
     picker: Picker,
     width: u16,
-    render_cache: RenderCache,
+}
+
+pub(crate) struct PreviewPageResult {
+    pub(crate) generation: u64,
+    pub(crate) revision: u64,
+    pub(crate) request: u64,
+    pub(crate) width: u16,
+    pub(crate) requested: Vec<usize>,
+    pub(crate) outcome: Result<PreviewPageSuccess, String>,
+}
+
+pub(crate) struct PreviewPageSuccess {
+    pub(crate) pages: Vec<(usize, SlicedProtocol)>,
+    pub(crate) render_cache: RenderCache,
 }
 
 enum CompileInput {
@@ -61,10 +74,57 @@ pub(crate) struct WorldRebuild {
     pub(crate) source: String,
 }
 
+pub(crate) struct PreviewPageRequest {
+    pub(crate) generation: u64,
+    pub(crate) revision: u64,
+    pub(crate) document: CompiledDocument,
+    pub(crate) manifest: RenderManifest,
+    pub(crate) picker: Picker,
+    pub(crate) width: u16,
+    pub(crate) pages: Vec<usize>,
+    pub(crate) render_cache: RenderCache,
+}
+
 #[derive(Default)]
 struct Scheduler {
     active_native_compiles: usize,
     latest_pending: Option<CompileRequest>,
+}
+
+struct QueuedPreviewRequest {
+    id: u64,
+    request: PreviewPageRequest,
+}
+
+#[derive(Default)]
+struct PreviewScheduler {
+    active: bool,
+    latest_pending: Option<QueuedPreviewRequest>,
+}
+
+impl PreviewScheduler {
+    fn enqueue(&mut self, request: QueuedPreviewRequest) -> Option<QueuedPreviewRequest> {
+        if self.active {
+            self.latest_pending = Some(request);
+            None
+        } else {
+            self.active = true;
+            Some(request)
+        }
+    }
+
+    fn cancel_pending(&mut self) {
+        self.latest_pending = None;
+    }
+
+    fn finish(&mut self) -> Option<QueuedPreviewRequest> {
+        if let Some(request) = self.latest_pending.take() {
+            Some(request)
+        } else {
+            self.active = false;
+            None
+        }
+    }
 }
 
 impl Scheduler {
@@ -95,7 +155,9 @@ struct Runner {
     sender: Sender<Event>,
     runtime: Handle,
     generation: Arc<AtomicU64>,
+    preview_request: Arc<AtomicU64>,
     scheduler: Arc<Mutex<Scheduler>>,
+    preview_scheduler: Arc<Mutex<PreviewScheduler>>,
 }
 
 pub(crate) struct CompileWorker {
@@ -117,7 +179,9 @@ impl CompileWorker {
                 sender,
                 runtime,
                 generation: Arc::new(AtomicU64::new(0)),
+                preview_request: Arc::new(AtomicU64::new(0)),
                 scheduler: Arc::new(Mutex::new(Scheduler::default())),
+                preview_scheduler: Arc::new(Mutex::new(PreviewScheduler::default())),
             },
         }
     }
@@ -148,13 +212,7 @@ impl CompileWorker {
         Ok(generation)
     }
 
-    pub(crate) fn spawn(
-        &self,
-        revision: u64,
-        picker: Picker,
-        width: u16,
-        render_cache: RenderCache,
-    ) -> u64 {
+    pub(crate) fn spawn(&self, revision: u64, picker: Picker, width: u16) -> u64 {
         let generation = match self.advance_and_cancel_pending() {
             Ok(generation) => generation,
             Err(error) => return self.report_preparation_error(revision, error),
@@ -172,7 +230,6 @@ impl CompileWorker {
             input: CompileInput::Snapshot(snapshot),
             picker,
             width,
-            render_cache,
         });
         generation
     }
@@ -182,7 +239,6 @@ impl CompileWorker {
         revision: u64,
         picker: Picker,
         width: u16,
-        render_cache: RenderCache,
         rebuild: WorldRebuild,
     ) -> u64 {
         let generation = match self.advance_and_cancel_pending() {
@@ -195,7 +251,6 @@ impl CompileWorker {
             input: CompileInput::Rebuild(rebuild),
             picker,
             width,
-            render_cache,
         });
         generation
     }
@@ -209,8 +264,44 @@ impl CompileWorker {
         Ok(())
     }
 
+    pub(crate) fn spawn_preview_pages(&self, request: PreviewPageRequest) -> u64 {
+        let request_id = advance(&self.runner.preview_request);
+        let start = match self.runner.preview_scheduler.lock() {
+            Ok(mut scheduler) => scheduler.enqueue(QueuedPreviewRequest {
+                id: request_id,
+                request,
+            }),
+            Err(_) => {
+                let _ = self
+                    .runner
+                    .sender
+                    .send(Event::PreviewPagesFinished(PreviewPageResult {
+                        generation: request.generation,
+                        revision: request.revision,
+                        request: request_id,
+                        width: request.width,
+                        requested: request.pages,
+                        outcome: Err("preview scheduler is unavailable".to_owned()),
+                    }));
+                None
+            }
+        };
+        if let Some(request) = start {
+            start_preview_request(self.runner.clone(), request);
+        }
+        request_id
+    }
+
     fn advance_and_cancel_pending(&self) -> Result<u64, String> {
         let generation = advance(&self.runner.generation);
+        advance(&self.runner.preview_request);
+        let mut preview_scheduler = self
+            .runner
+            .preview_scheduler
+            .lock()
+            .map_err(|_| "preview scheduler is unavailable".to_owned())?;
+        preview_scheduler.cancel_pending();
+        drop(preview_scheduler);
         let mut scheduler = self
             .runner
             .scheduler
@@ -255,6 +346,70 @@ impl CompileWorker {
                 rebuild_attempted: false,
                 outcome: CompileResultKind::Error(error.to_owned()),
             }));
+    }
+}
+
+fn start_preview_request(runner: Runner, queued: QueuedPreviewRequest) {
+    let runtime = runner.runtime.clone();
+    drop(runtime.spawn_blocking(move || {
+        if let Some(result) = render_preview_request(&runner, queued) {
+            let _ = runner.sender.send(Event::PreviewPagesFinished(result));
+        }
+        finish_preview_request(runner);
+    }));
+}
+
+fn render_preview_request(
+    runner: &Runner,
+    queued: QueuedPreviewRequest,
+) -> Option<PreviewPageResult> {
+    let request = queued.request;
+    let cancelled = || {
+        !is_current(&runner.generation, request.generation)
+            || !is_current(&runner.preview_request, queued.id)
+    };
+    let requested = request.pages.clone();
+    let outcome = match typst_tui_render::render_pages_cached_cancellable(
+        &request.document,
+        &request.manifest,
+        request.pages,
+        &request.render_cache,
+        cancelled,
+    ) {
+        Ok((rendered, render_cache)) => match Preview::encode_rendered_pages_cancellable(
+            &request.picker,
+            rendered,
+            request.width,
+            cancelled,
+        ) {
+            Ok(Some(pages)) => Ok(PreviewPageSuccess {
+                pages,
+                render_cache,
+            }),
+            Ok(None) => return None,
+            Err(_) if cancelled() => return None,
+            Err(error) => Err(error),
+        },
+        Err(typst_tui_render::Error::Cancelled) => return None,
+        Err(error) => Err(error.to_string()),
+    };
+    (!cancelled()).then_some(PreviewPageResult {
+        generation: request.generation,
+        revision: request.revision,
+        request: queued.id,
+        width: request.width,
+        requested,
+        outcome,
+    })
+}
+
+fn finish_preview_request(runner: Runner) {
+    let next = match runner.preview_scheduler.lock() {
+        Ok(mut scheduler) => scheduler.finish(),
+        Err(_) => None,
+    };
+    if let Some(request) = next {
+        start_preview_request(runner, request);
     }
 }
 
@@ -328,18 +483,9 @@ fn compile(
         return None;
     }
     let sync = compiled.sync();
-    let font_width = request.picker.font_size().width.max(1);
-    let max_columns = (2_048 / font_width).max(1);
-    let width = request.width.clamp(1, max_columns);
-    let target_pixels = u32::from(width) * u32::from(font_width);
-    let (rendered, render_cache) = match typst_tui_render::render_cached_cancellable(
-        &compiled,
-        target_pixels,
-        &request.render_cache,
-        || !is_current(generations, request.generation),
-    ) {
-        Ok(rendered) => rendered,
-        Err(typst_tui_render::Error::Cancelled) => return None,
+    let (width, target_pixels) = preview_dimensions(&request.picker, request.width);
+    let manifest = match typst_tui_render::render_manifest(&compiled, target_pixels) {
+        Ok(manifest) => manifest,
         Err(error) => {
             return Some(CompileResult {
                 generation: request.generation,
@@ -351,22 +497,6 @@ fn compile(
             });
         }
     };
-    let pages = match Preview::encode_pages_cancellable(&request.picker, rendered, width, || {
-        !is_current(generations, request.generation)
-    }) {
-        Ok(Some(pages)) => pages,
-        Ok(None) => return None,
-        Err(error) => {
-            return Some(CompileResult {
-                generation: request.generation,
-                revision: request.revision,
-                elapsed: started.elapsed(),
-                rebuilt_compiler,
-                rebuild_attempted,
-                outcome: CompileResultKind::Error(error),
-            });
-        }
-    };
 
     is_current(generations, request.generation).then_some(CompileResult {
         generation: request.generation,
@@ -375,13 +505,20 @@ fn compile(
         rebuilt_compiler,
         rebuild_attempted,
         outcome: CompileResultKind::Success {
-            pages,
             diagnostics: compiled.warnings().to_vec(),
             sync,
             document: Box::new(compiled),
-            render_cache,
+            manifest,
+            width,
         },
     })
+}
+
+fn preview_dimensions(picker: &Picker, width: u16) -> (u16, u32) {
+    let font_width = picker.font_size().width.max(1);
+    let max_columns = (2_048 / font_width).max(1);
+    let width = width.clamp(1, max_columns);
+    (width, u32::from(width) * u32::from(font_width))
 }
 
 fn advance(generation: &AtomicU64) -> u64 {
@@ -406,7 +543,9 @@ mod tests {
     use typst_tui_render::RenderCache;
 
     use super::{
-        CompileInput, CompileRequest, CompileWorker, Scheduler, WorldRebuild, advance, is_current,
+        CompileInput, CompileRequest, CompileResultKind, CompileWorker, PreviewPageRequest,
+        PreviewScheduler, QueuedPreviewRequest, Scheduler, WorldRebuild, advance, is_current,
+        preview_dimensions,
     };
     use crate::event::Event;
 
@@ -473,7 +612,6 @@ mod tests {
             0,
             Picker::halfblocks(),
             40,
-            RenderCache::default(),
             WorldRebuild {
                 root: root.clone(),
                 main: root.join("simple.typ"),
@@ -496,6 +634,98 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn preview_worker_renders_only_requested_pages() -> Result<(), Box<dyn Error>> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        let compiler = Compiler::new(&root, root.join("simple.typ"))?;
+        let runtime = tokio::runtime::Builder::new_multi_thread().build()?;
+        let (sender, receiver) = channel();
+        let picker = Picker::halfblocks();
+        let worker = CompileWorker::new(
+            compiler,
+            "= One\n#pagebreak()\n= Two",
+            sender,
+            runtime.handle().clone(),
+        );
+
+        let generation = worker.spawn(7, picker.clone(), 40);
+        let Event::CompileFinished(result) = receiver.recv_timeout(Duration::from_secs(30))? else {
+            return Err("worker returned an unexpected event".into());
+        };
+        let CompileResultKind::Success {
+            document,
+            manifest,
+            width,
+            ..
+        } = result.outcome
+        else {
+            return Err("document did not compile".into());
+        };
+        let expected_size = crate::components::Preview::page_sizes(&picker, &manifest, width)[1];
+        let request = worker.spawn_preview_pages(PreviewPageRequest {
+            generation,
+            revision: 7,
+            document: *document,
+            manifest,
+            picker,
+            width,
+            pages: vec![1],
+            render_cache: RenderCache::default(),
+        });
+
+        let Event::PreviewPagesFinished(result) = receiver.recv_timeout(Duration::from_secs(30))?
+        else {
+            return Err("worker returned an unexpected preview event".into());
+        };
+        assert_eq!(result.request, request);
+        let success = result.outcome.map_err(std::io::Error::other)?;
+        assert_eq!(success.pages.len(), 1);
+        assert_eq!(success.pages[0].0, 1);
+        assert_eq!(success.pages[0].1.size(), expected_size);
+
+        drop(worker);
+        runtime.shutdown_timeout(Duration::from_millis(100));
+        Ok(())
+    }
+
+    #[test]
+    fn preview_scheduler_retains_only_the_latest_request() -> Result<(), Box<dyn Error>> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        let mut compiler = Compiler::new(&root, root.join("simple.typ"))?;
+        let source = "= One\n#pagebreak()\n= Two";
+        let typst_tui_compiler::CompileOutcome::Success(document) = compiler.compile(source) else {
+            return Err("fixture did not compile".into());
+        };
+        let picker = Picker::halfblocks();
+        let (width, pixels) = preview_dimensions(&picker, 40);
+        let manifest = typst_tui_render::render_manifest(&document, pixels)?;
+        let queued = |id| QueuedPreviewRequest {
+            id,
+            request: PreviewPageRequest {
+                generation: 1,
+                revision: 1,
+                document: document.clone(),
+                manifest: manifest.clone(),
+                picker: picker.clone(),
+                width,
+                pages: vec![1],
+                render_cache: RenderCache::default(),
+            },
+        };
+        let mut scheduler = PreviewScheduler::default();
+
+        assert_eq!(
+            scheduler.enqueue(queued(1)).map(|request| request.id),
+            Some(1)
+        );
+        assert!(scheduler.enqueue(queued(2)).is_none());
+        assert!(scheduler.enqueue(queued(3)).is_none());
+        assert_eq!(scheduler.finish().map(|request| request.id), Some(3));
+        assert!(scheduler.finish().is_none());
+        assert!(!scheduler.active);
+        Ok(())
+    }
+
     fn request(generation: u64) -> Result<CompileRequest, Box<dyn Error>> {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
         let mut compiler = Compiler::new(&root, root.join("simple.typ"))?;
@@ -506,7 +736,6 @@ mod tests {
             input: CompileInput::Snapshot(compiler.snapshot()),
             picker: Picker::halfblocks(),
             width: 40,
-            render_cache: RenderCache::default(),
         })
     }
 }

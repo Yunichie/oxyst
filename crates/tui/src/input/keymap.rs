@@ -76,6 +76,7 @@ pub(crate) fn resolve(
 ) -> Option<Action> {
     match event {
         Event::CompileFinished(result) => Some(Action::CompileFinished(result)),
+        Event::PreviewPagesFinished(result) => Some(Action::PreviewPagesFinished(result)),
         Event::ExportFinished(result) => Some(Action::ExportFinished(result)),
         Event::Resize => Some(Action::Resize),
         Event::ProjectFilesChanged => Some(Action::ProjectFilesChanged),

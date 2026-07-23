@@ -1,6 +1,6 @@
 use typst_tui_document::Motion;
 
-use crate::compile::CompileResult;
+use crate::compile::{CompileResult, PreviewPageResult};
 use crate::export::ExportResult;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25,6 +25,7 @@ pub(crate) enum Action {
     Redo,
     Recompile,
     CompileFinished(CompileResult),
+    PreviewPagesFinished(PreviewPageResult),
     ExportFinished(ExportResult),
     Resize,
     ProjectFilesChanged,
