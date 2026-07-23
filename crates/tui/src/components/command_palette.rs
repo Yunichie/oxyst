@@ -117,11 +117,13 @@ impl CommandPalette {
         let [query_area, results_area] =
             Layout::vertical([Constraint::Length(2), Constraint::Fill(1)]).areas(inner);
         let available = usize::from(results_area.height);
-        let lines = self
-            .matches()
+        let matches = self.matches();
+        let start = visible_start(self.selected, matches.len(), available);
+        let lines = matches
             .into_iter()
-            .take(available)
             .enumerate()
+            .skip(start)
+            .take(available)
             .map(|(index, command)| {
                 let line = Line::raw(format!("  {}", command.label()));
                 if index == self.selected {
@@ -166,6 +168,12 @@ impl CommandPalette {
     }
 }
 
+fn visible_start(selected: usize, count: usize, available: usize) -> usize {
+    selected
+        .saturating_sub(available.saturating_sub(1))
+        .min(count.saturating_sub(available))
+}
+
 fn fuzzy_match(candidate: &str, query: &str) -> bool {
     let mut candidate = candidate.chars().flat_map(char::to_lowercase);
     query
@@ -176,7 +184,12 @@ fn fuzzy_match(candidate: &str, query: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, CommandPalette, fuzzy_match};
+    use std::convert::Infallible;
+
+    use ratatui::{Terminal, backend::TestBackend, style::Color};
+    use typst_tui_theme::{ColorDepth, Theme, ThemeName};
+
+    use super::{Command, CommandPalette, fuzzy_match, visible_start};
 
     #[test]
     fn fuzzy_search_matches_subsequences() {
@@ -189,5 +202,57 @@ mod tests {
             palette.selected(),
             Some(Command::Export(typst_tui_render::ExportFormat::Png))
         );
+    }
+
+    #[test]
+    fn result_window_tracks_the_selection() {
+        assert_eq!(visible_start(0, Command::ALL.len(), 2), 0);
+        assert_eq!(visible_start(5, Command::ALL.len(), 2), 4);
+        assert_eq!(
+            visible_start(Command::ALL.len() - 1, Command::ALL.len(), 2),
+            Command::ALL.len() - 2
+        );
+        assert_eq!(visible_start(0, Command::ALL.len(), 0), 0);
+    }
+
+    #[test]
+    fn draws_selected_results_in_short_terminals() -> Result<(), Infallible> {
+        let theme = Theme::new(ThemeName::Dark, ColorDepth::Ansi16);
+        let mut palette = CommandPalette::default();
+        for _ in 1..Command::ALL.len() {
+            palette.move_selection(1);
+        }
+        let mut terminal = Terminal::new(TestBackend::new(40, 8))?;
+        terminal.draw(|frame| palette.draw(frame, &theme))?;
+        let buffer = terminal.backend().buffer();
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Quit"));
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.symbol() == "Q" && cell.bg == Color::DarkGray)
+        );
+
+        let mut filtered = CommandPalette::default();
+        filtered.input_text("export");
+        filtered.move_selection(2);
+        terminal.draw(|frame| filtered.draw(frame, &theme))?;
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Export as SVG"));
+
+        let mut tiny = Terminal::new(TestBackend::new(10, 2))?;
+        tiny.draw(|frame| filtered.draw(frame, &theme))?;
+        Ok(())
     }
 }
