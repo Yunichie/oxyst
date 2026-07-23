@@ -34,8 +34,15 @@ impl Keymap {
                 let chords = bindings
                     .iter()
                     .map(|binding| {
-                        KeyChord::parse(binding)
-                            .map_err(|error| format!("invalid `{action}` binding: {error}"))
+                        let chord = KeyChord::parse(binding)
+                            .map_err(|error| format!("invalid `{action}` binding: {error}"))?;
+                        if !allows_printable_binding(action) && chord.is_printable() {
+                            return Err(format!(
+                                "invalid `{action}` binding `{binding}`: unmodified printable keys \
+                                 are reserved for text input"
+                            ));
+                        }
+                        Ok(chord)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok((action.clone(), chords))
@@ -130,7 +137,9 @@ fn resolve_key(key: KeyEvent, mode: InputMode, keymap: &Keymap) -> Option<Action
 }
 
 fn resolve_search_key(key: KeyEvent, keymap: &Keymap) -> Option<Action> {
-    if keymap.matches("close_overlay", key) {
+    if let Some(character) = printable_character(key) {
+        Some(Action::OverlayInput(character))
+    } else if keymap.matches("close_overlay", key) {
         Some(Action::CloseOverlay)
     } else if keymap.matches("find_previous", key) {
         Some(Action::SearchNext(true))
@@ -142,19 +151,15 @@ fn resolve_search_key(key: KeyEvent, keymap: &Keymap) -> Option<Action> {
         Some(Action::SearchToggleField)
     } else if keymap.matches("backspace", key) {
         Some(Action::OverlayBackspace)
-    } else if let KeyCode::Char(character) = key.code
-        && !key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
-    {
-        Some(Action::OverlayInput(character))
     } else {
         None
     }
 }
 
 fn resolve_overlay_key(key: KeyEvent, keymap: &Keymap) -> Option<Action> {
-    if keymap.matches("close_overlay", key) {
+    if let Some(character) = printable_character(key) {
+        Some(Action::OverlayInput(character))
+    } else if keymap.matches("close_overlay", key) {
         Some(Action::CloseOverlay)
     } else if keymap.matches("move_up", key) {
         Some(Action::OverlayMove(-1))
@@ -164,12 +169,6 @@ fn resolve_overlay_key(key: KeyEvent, keymap: &Keymap) -> Option<Action> {
         Some(Action::OverlaySubmit)
     } else if keymap.matches("backspace", key) {
         Some(Action::OverlayBackspace)
-    } else if let KeyCode::Char(character) = key.code
-        && !key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
-    {
-        Some(Action::OverlayInput(character))
     } else {
         None
     }
@@ -177,7 +176,9 @@ fn resolve_overlay_key(key: KeyEvent, keymap: &Keymap) -> Option<Action> {
 
 fn resolve_normal_key(key: KeyEvent, keymap: &Keymap) -> Option<Action> {
     let binding = |name| keymap.matches(name, key);
-    if binding("quit") {
+    if let Some(character) = printable_character(key) {
+        Some(Action::Insert(character))
+    } else if binding("quit") {
         Some(Action::RequestQuit)
     } else if binding("select_all") {
         Some(Action::SelectAll)
@@ -271,15 +272,29 @@ fn resolve_normal_key(key: KeyEvent, keymap: &Keymap) -> Option<Action> {
         Some(Action::Delete)
     } else if binding("newline") {
         Some(Action::Insert('\n'))
-    } else if let KeyCode::Char(character) = key.code
-        && !key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
-    {
-        Some(Action::Insert(character))
     } else {
         None
     }
+}
+
+fn printable_character(key: KeyEvent) -> Option<char> {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(character) => Some(character),
+        _ => None,
+    }
+}
+
+fn allows_printable_binding(action: &str) -> bool {
+    matches!(
+        action,
+        "confirm" | "cancel_confirmation" | "welcome_new" | "welcome_open"
+    )
 }
 
 fn resolve_mouse(mouse: MouseEvent) -> Option<Action> {
@@ -350,6 +365,13 @@ impl KeyChord {
             actual_modifiers.remove(KeyModifiers::SHIFT);
         }
         actual_modifiers == self.modifiers && codes_match(self.code, event.code)
+    }
+
+    fn is_printable(self) -> bool {
+        matches!(self.code, KeyCode::Char(_))
+            && !self
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
     }
 }
 
@@ -448,6 +470,85 @@ mod tests {
     }
 
     #[test]
+    fn terminal_paste_key_stream_cannot_open_commands() -> Result<(), String> {
+        let keymap = Keymap::new(&Config::default())?;
+        for character in ['#', 'l', 'e', 't', ' ', 'x', ':', ' ', '?'] {
+            let modifiers = if matches!(character, ':' | '?') {
+                KeyModifiers::SHIFT
+            } else {
+                KeyModifiers::NONE
+            };
+            let action = resolve_key(
+                KeyEvent::new(KeyCode::Char(character), modifiers),
+                InputMode::Normal,
+                &keymap,
+            );
+            assert!(matches!(action, Some(Action::Insert(actual)) if actual == character));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn printable_characters_remain_text_in_overlay_inputs() -> Result<(), String> {
+        let keymap = Keymap::new(&Config::default())?;
+        for mode in [InputMode::Search, InputMode::Overlay] {
+            for character in [':', '?'] {
+                let action = resolve_key(
+                    KeyEvent::new(KeyCode::Char(character), KeyModifiers::SHIFT),
+                    mode,
+                    &keymap,
+                );
+                assert!(matches!(
+                    action,
+                    Some(Action::OverlayInput(actual)) if actual == character
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn printable_command_bindings_are_rejected_in_text_modes() {
+        let mut config = Config::default();
+        config
+            .keys
+            .insert("command_palette".to_owned(), vec![":".to_owned()]);
+
+        let result = Keymap::new(&config);
+
+        assert!(matches!(
+            result,
+            Err(error) if error.contains("unmodified printable keys are reserved for text input")
+        ));
+    }
+
+    #[test]
+    fn paste_is_delivered_as_one_text_action() -> Result<(), String> {
+        let keymap = Keymap::new(&Config::default())?;
+        let text = ":\n?界";
+        let normal = super::resolve(
+            super::Event::Paste(text.to_owned()),
+            InputMode::Normal,
+            &keymap,
+        );
+        let overlay = super::resolve(
+            super::Event::Paste(text.to_owned()),
+            InputMode::Overlay,
+            &keymap,
+        );
+
+        assert!(matches!(
+            normal,
+            Some(Action::InsertText(pasted)) if pasted == text
+        ));
+        assert!(matches!(
+            overlay,
+            Some(Action::OverlayInputText(pasted)) if pasted == text
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn default_selection_and_clipboard_bindings_resolve() -> Result<(), String> {
         let keymap = Keymap::new(&Config::default())?;
         let selection = resolve_key(
@@ -460,9 +561,15 @@ mod tests {
             InputMode::Normal,
             &keymap,
         );
+        let paste = resolve_key(
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+            InputMode::Normal,
+            &keymap,
+        );
 
         assert!(matches!(selection, Some(Action::Select(_))));
         assert!(matches!(copy, Some(Action::Copy)));
+        assert!(matches!(paste, Some(Action::PasteClipboard)));
         Ok(())
     }
 

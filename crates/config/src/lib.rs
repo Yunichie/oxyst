@@ -55,13 +55,13 @@ const ACTIONS: &[(&str, &[&str])] = &[
     ("zoom_out", &["ctrl+-"]),
     ("preview_page_up", &["ctrl+pageup"]),
     ("preview_page_down", &["ctrl+pagedown"]),
-    ("command_palette", &[":", "ctrl+shift+p"]),
+    ("command_palette", &["ctrl+shift+p"]),
     ("toggle_diagnostics", &["ctrl+j"]),
     ("next_diagnostic", &["f8"]),
     ("previous_diagnostic", &["shift+f8"]),
     ("toggle_file_explorer", &["ctrl+b"]),
     ("go_to_line", &["ctrl+g"]),
-    ("help", &["?", "f1"]),
+    ("help", &["f1"]),
     ("close_overlay", &["esc"]),
     ("confirm", &["y"]),
     ("cancel_confirmation", &["n", "esc"]),
@@ -214,5 +214,13 @@ mod tests {
         );
 
         assert!(matches!(result, Err(Error::UnknownAction { .. })));
+    }
+
+    #[test]
+    fn text_commands_use_non_printable_defaults() {
+        let config = Config::default();
+
+        assert_eq!(config.keys["command_palette"], ["ctrl+shift+p"]);
+        assert_eq!(config.keys["help"], ["f1"]);
     }
 }
