@@ -1,11 +1,11 @@
+use oxyst_render::ExportFormat;
+use oxyst_theme::Theme;
 use ratatui::{
     Frame,
     style::Style,
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
-use typst_tui_render::ExportFormat;
-use typst_tui_theme::Theme;
 use unicode_width::UnicodeWidthStr;
 
 use crate::style::{base, color};

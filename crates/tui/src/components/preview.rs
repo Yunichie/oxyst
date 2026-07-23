@@ -1,5 +1,10 @@
 use std::collections::{HashMap, VecDeque};
 
+use oxyst_compiler::PagePosition;
+#[cfg(test)]
+use oxyst_render::RenderedDocument;
+use oxyst_render::{PageImage, RenderManifest, RenderedPage};
+use oxyst_theme::Theme;
 use ratatui::{
     Frame,
     layout::{Rect, Size},
@@ -12,11 +17,6 @@ use ratatui_image::{
     picker::Picker,
     sliced::{SignedPosition, SlicedImage, SlicedProtocol},
 };
-use typst_tui_compiler::PagePosition;
-#[cfg(test)]
-use typst_tui_render::RenderedDocument;
-use typst_tui_render::{PageImage, RenderManifest, RenderedPage};
-use typst_tui_theme::Theme;
 
 use crate::{action::Action, style::color};
 
@@ -597,8 +597,8 @@ fn encode_page(picker: &Picker, page: PageImage, width: u16) -> Result<SlicedPro
 impl Default for Preview {
     fn default() -> Self {
         Self::new(Theme::new(
-            typst_tui_theme::ThemeName::Dark,
-            typst_tui_theme::ColorDepth::Ansi16,
+            oxyst_theme::ThemeName::Dark,
+            oxyst_theme::ColorDepth::Ansi16,
         ))
     }
 }
@@ -607,8 +607,8 @@ impl Component for Preview {
     fn update(&mut self, action: Action) {
         match action {
             Action::ScrollPreviewPages(pages) => self.scroll_pages(pages),
-            Action::Move(typst_tui_document::Motion::Up) => self.scroll_lines(-1),
-            Action::Move(typst_tui_document::Motion::Down) => self.scroll_lines(1),
+            Action::Move(oxyst_document::Motion::Up) => self.scroll_lines(-1),
+            Action::Move(oxyst_document::Motion::Down) => self.scroll_lines(1),
             _ => {}
         }
     }
@@ -628,6 +628,8 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use oxyst_compiler::{CompileOutcome, Compiler, PagePosition};
+    use oxyst_theme::{ColorDepth, Theme, ThemeName};
     use ratatui::{
         Terminal,
         backend::TestBackend,
@@ -637,8 +639,6 @@ mod tests {
         widgets::Paragraph,
     };
     use ratatui_image::picker::{Picker, ProtocolType};
-    use typst_tui_compiler::{CompileOutcome, Compiler, PagePosition};
-    use typst_tui_theme::{ColorDepth, Theme, ThemeName};
 
     use super::Preview;
 
@@ -672,7 +672,7 @@ mod tests {
         let CompileOutcome::Success(document) = compiler.compile(&source) else {
             return Err(io::Error::other("fixture did not compile").into());
         };
-        let rendered = typst_tui_render::render(&document, 280)?;
+        let rendered = oxyst_render::render(&document, 280)?;
         let pages =
             Preview::encode_pages(&Picker::halfblocks(), rendered, 28).map_err(io::Error::other)?;
         let mut preview = Preview::new(theme());
@@ -733,7 +733,7 @@ mod tests {
         let CompileOutcome::Success(document) = compiler.compile(&source) else {
             return Err(io::Error::other("multi-page fixture did not compile").into());
         };
-        let rendered = typst_tui_render::render(&document, 280)?;
+        let rendered = oxyst_render::render(&document, 280)?;
         let pages =
             Preview::encode_pages(&Picker::halfblocks(), rendered, 28).map_err(io::Error::other)?;
         let mut preview = Preview::new(theme());
@@ -788,7 +788,7 @@ mod tests {
         let CompileOutcome::Success(document) = compiler.compile(&source) else {
             return Err("fixture did not compile".into());
         };
-        let rendered = typst_tui_render::render(&document, 200)?;
+        let rendered = oxyst_render::render(&document, 200)?;
         let pages =
             Preview::encode_pages(&Picker::halfblocks(), rendered, 20).map_err(io::Error::other)?;
         let mut preview = Preview::new(theme());
@@ -807,7 +807,7 @@ mod tests {
         else {
             return Err("fixture did not compile".into());
         };
-        let rendered = typst_tui_render::render(&document, 200)?;
+        let rendered = oxyst_render::render(&document, 200)?;
         let protocols =
             Preview::encode_pages(&Picker::halfblocks(), rendered, 20).map_err(io::Error::other)?;
         let sizes = protocols.iter().map(|page| page.size()).collect::<Vec<_>>();
@@ -841,9 +841,8 @@ mod tests {
         let picker = Picker::halfblocks();
         let width = 80;
         let pixels = u32::from(width) * u32::from(picker.font_size().width.max(1));
-        let manifest = typst_tui_render::render_manifest(&document, pixels)?;
-        let rendered =
-            typst_tui_render::render_pages_cancellable(&document, &manifest, [0], || false)?;
+        let manifest = oxyst_render::render_manifest(&document, pixels)?;
+        let rendered = oxyst_render::render_pages_cancellable(&document, &manifest, [0], || false)?;
 
         let started = Instant::now();
         let encoded =
@@ -878,7 +877,7 @@ mod tests {
 
         for target_pixels in [800_u32, 1_600, 2_048] {
             let width = u16::try_from(target_pixels / font_width)?;
-            let manifest = typst_tui_render::render_manifest(&document, target_pixels)?;
+            let manifest = oxyst_render::render_manifest(&document, target_pixels)?;
             let page = manifest.pages()[0];
             let rgba_bytes = u64::from(page.width()) * u64::from(page.height()) * u64::from(4_u8);
             let mut cached_render_samples = Vec::new();
@@ -890,11 +889,11 @@ mod tests {
             let cached_sample = || -> Result<_, Box<dyn Error>> {
                 let total_started = Instant::now();
                 let render_started = Instant::now();
-                let (rendered, cache) = typst_tui_render::render_pages_cached_cancellable(
+                let (rendered, cache) = oxyst_render::render_pages_cached_cancellable(
                     &document,
                     &manifest,
                     [0],
-                    &typst_tui_render::RenderCache::default(),
+                    &oxyst_render::RenderCache::default(),
                     || false,
                 )?;
                 let rendered_elapsed = render_started.elapsed();
@@ -912,9 +911,7 @@ mod tests {
                 let total_started = Instant::now();
                 let render_started = Instant::now();
                 let rendered =
-                    typst_tui_render::render_pages_cancellable(&document, &manifest, [0], || {
-                        false
-                    })?;
+                    oxyst_render::render_pages_cancellable(&document, &manifest, [0], || false)?;
                 let rendered_elapsed = render_started.elapsed();
                 let encoding_started = Instant::now();
                 let encoded =
@@ -963,7 +960,7 @@ mod tests {
             );
 
             let rendered =
-                typst_tui_render::render_pages_cancellable(&document, &manifest, [0], || false)?;
+                oxyst_render::render_pages_cancellable(&document, &manifest, [0], || false)?;
             let encoded =
                 Preview::encode_rendered_pages_cancellable(&picker, rendered, width, || false)?
                     .ok_or("encoding was cancelled")?;
@@ -1002,7 +999,7 @@ mod tests {
             let mut picker = Picker::halfblocks();
             picker.set_protocol_type(protocol_type);
             let font_height = usize::from(picker.font_size().height);
-            let rendered = typst_tui_render::render(&document, 280)?;
+            let rendered = oxyst_render::render(&document, 280)?;
             let pages = Preview::encode_pages(&picker, rendered, 18).map_err(io::Error::other)?;
             let mut preview = Preview::new(theme());
             preview.replace_pages(pages);

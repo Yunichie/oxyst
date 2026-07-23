@@ -1,6 +1,6 @@
 [package]
-name = "typst-tui-app"
-description = "Terminal user interface for typst-tui"
+name = "oxyst-app"
+description = "Terminal user interface for oxyst"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,11 +16,11 @@ serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true
-typst-tui-compiler.workspace = true
-typst-tui-config.workspace = true
-typst-tui-document.workspace = true
-typst-tui-render.workspace = true
-typst-tui-theme.workspace = true
+oxyst-compiler.workspace = true
+oxyst-config.workspace = true
+oxyst-document.workspace = true
+oxyst-render.workspace = true
+oxyst-theme.workspace = true
 typst-syntax.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true

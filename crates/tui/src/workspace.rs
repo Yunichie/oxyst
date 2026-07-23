@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use typst_tui_render::ExportFormat;
+use oxyst_render::ExportFormat;
 
 pub(crate) struct OpenedSource {
     pub(crate) text: String,
@@ -227,7 +227,7 @@ mod tests {
     fn temporary_directory(label: &str) -> Result<PathBuf, Box<dyn Error>> {
         let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "typst-tui-workspace-{label}-{}-{unique}",
+            "oxyst-workspace-{label}-{}-{unique}",
             std::process::id()
         ));
         fs::create_dir_all(&path)?;

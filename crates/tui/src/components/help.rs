@@ -1,3 +1,4 @@
+use oxyst_theme::Theme;
 use ratatui::{
     Frame,
     layout::Rect,
@@ -5,7 +6,6 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
 };
-use typst_tui_theme::Theme;
 
 use crate::{
     input::Keymap,
@@ -173,9 +173,9 @@ fn four(keymap: &Keymap, first: &str, second: &str, third: &str, fourth: &str) -
 
 #[cfg(test)]
 mod tests {
+    use oxyst_config::Config;
+    use oxyst_theme::{ColorDepth, Theme, ThemeName};
     use ratatui::{Terminal, backend::TestBackend};
-    use typst_tui_config::Config;
-    use typst_tui_theme::{ColorDepth, Theme, ThemeName};
 
     use super::{Help, Keymap};
 

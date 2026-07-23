@@ -1,6 +1,6 @@
 [package]
-name = "typst-tui-config"
-description = "Configuration schema and loading for typst-tui"
+name = "oxyst-config"
+description = "Configuration schema and loading for oxyst"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

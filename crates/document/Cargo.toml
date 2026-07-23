@@ -1,6 +1,6 @@
 [package]
-name = "typst-tui-document"
-description = "Editable document model for typst-tui"
+name = "oxyst-document"
+description = "Editable document model for oxyst"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

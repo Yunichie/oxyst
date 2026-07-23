@@ -1,3 +1,4 @@
+use oxyst_theme::Theme;
 use ratatui::{
     Frame,
     layout::{Alignment, Rect},
@@ -5,7 +6,6 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Paragraph},
 };
-use typst_tui_theme::Theme;
 
 use crate::{
     action::Action,
@@ -69,7 +69,7 @@ impl Welcome {
     fn draw_welcome(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Block::default().style(base(&self.theme)), area);
         let mut lines = vec![
-            Line::raw("typst-tui").style(
+            Line::raw("oxyst").style(
                 Style::default()
                     .fg(color(self.theme.accent))
                     .add_modifier(Modifier::BOLD),
@@ -118,8 +118,8 @@ impl Default for Welcome {
     fn default() -> Self {
         Self::new(
             Theme::new(
-                typst_tui_theme::ThemeName::Dark,
-                typst_tui_theme::ColorDepth::Ansi16,
+                oxyst_theme::ThemeName::Dark,
+                oxyst_theme::ColorDepth::Ansi16,
             ),
             "enter".to_owned(),
             "?".to_owned(),
@@ -143,8 +143,8 @@ impl Component for Welcome {
 mod tests {
     use std::convert::Infallible;
 
+    use oxyst_theme::{ColorDepth, Theme, ThemeName};
     use ratatui::{Terminal, backend::TestBackend};
-    use typst_tui_theme::{ColorDepth, Theme, ThemeName};
 
     use super::{Action, Component, Welcome, WelcomeChoice};
 

@@ -1,6 +1,6 @@
 use std::{error::Error, fs, io, path::PathBuf};
 
-use typst_tui_compiler::{CompileOutcome, Compiler, Error as CompilerError, Severity};
+use oxyst_compiler::{CompileOutcome, Compiler, Error as CompilerError, Severity};
 
 fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures")

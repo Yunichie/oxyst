@@ -8,13 +8,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ratatui_image::{picker::Picker, sliced::SlicedProtocol};
-use tokio::runtime::Handle;
-use typst_tui_compiler::{
+use oxyst_compiler::{
     CompileOutcome, CompileSnapshot, CompiledDocument, Compiler, Diagnostic, DocumentSync,
 };
-use typst_tui_document::TextEdit;
-use typst_tui_render::RenderManifest;
+use oxyst_document::TextEdit;
+use oxyst_render::RenderManifest;
+use ratatui_image::{picker::Picker, sliced::SlicedProtocol};
+use tokio::runtime::Handle;
 
 use crate::{components::Preview, event::Event};
 
@@ -353,7 +353,7 @@ fn render_preview_request(
             || !is_current(&runner.preview_request, queued.id)
     };
     let requested = request.pages.clone();
-    let outcome = match typst_tui_render::render_pages_cancellable(
+    let outcome = match oxyst_render::render_pages_cancellable(
         &request.document,
         &request.manifest,
         request.pages,
@@ -370,7 +370,7 @@ fn render_preview_request(
             Err(_) if cancelled() => return None,
             Err(error) => Err(error),
         },
-        Err(typst_tui_render::Error::Cancelled) => return None,
+        Err(oxyst_render::Error::Cancelled) => return None,
         Err(error) => Err(error.to_string()),
     };
     (!cancelled()).then_some(PreviewPageResult {
@@ -495,8 +495,8 @@ mod tests {
         time::Duration,
     };
 
+    use oxyst_compiler::Compiler;
     use ratatui_image::picker::Picker;
-    use typst_tui_compiler::Compiler;
 
     use super::{
         CompileInput, CompileRequest, CompileResultKind, CompileWorker, PreviewPageRequest,
@@ -610,7 +610,7 @@ mod tests {
         };
         let width = 40;
         let pixels = u32::from(width) * u32::from(picker.font_size().width.max(1));
-        let manifest = typst_tui_render::render_manifest(&document, pixels)?;
+        let manifest = oxyst_render::render_manifest(&document, pixels)?;
         let expected_size = crate::components::Preview::page_sizes(&picker, &manifest, width)[1];
         let request = worker.spawn_preview_pages(PreviewPageRequest {
             generation,
@@ -642,13 +642,13 @@ mod tests {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
         let mut compiler = Compiler::new(&root, root.join("simple.typ"))?;
         let source = "= One\n#pagebreak()\n= Two";
-        let typst_tui_compiler::CompileOutcome::Success(document) = compiler.compile(source) else {
+        let oxyst_compiler::CompileOutcome::Success(document) = compiler.compile(source) else {
             return Err("fixture did not compile".into());
         };
         let picker = Picker::halfblocks();
         let width = 40;
         let pixels = u32::from(width) * u32::from(picker.font_size().width.max(1));
-        let manifest = typst_tui_render::render_manifest(&document, pixels)?;
+        let manifest = oxyst_render::render_manifest(&document, pixels)?;
         let queued = |id| QueuedPreviewRequest {
             id,
             request: PreviewPageRequest {

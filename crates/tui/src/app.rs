@@ -4,6 +4,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use oxyst_compiler::{CompiledDocument, Compiler, DocumentSync, Severity};
+use oxyst_config::Config;
+use oxyst_document::Motion;
+use oxyst_render::{ExportFormat, RenderManifest};
+use oxyst_theme::{Color, ColorDepth, Theme, ThemeName};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Layout, Rect},
@@ -12,11 +17,6 @@ use ratatui::{
 };
 use ratatui_image::picker::Picker;
 use tokio::runtime::Handle;
-use typst_tui_compiler::{CompiledDocument, Compiler, DocumentSync, Severity};
-use typst_tui_config::Config;
-use typst_tui_document::Motion;
-use typst_tui_render::{ExportFormat, RenderManifest};
-use typst_tui_theme::{Color, ColorDepth, Theme, ThemeName};
 
 use crate::{
     action::{Action, Pane},
@@ -873,7 +873,7 @@ impl App {
         };
         let revision = *revision;
         let (width, target_pixels) = preview_dimensions(&self.picker, self.preview_target_width);
-        let manifest = match typst_tui_render::render_manifest(document, target_pixels) {
+        let manifest = match oxyst_render::render_manifest(document, target_pixels) {
             Ok(manifest) => manifest,
             Err(error) => {
                 self.status = Some(format!("Preview failed: {error}"));
@@ -974,7 +974,7 @@ impl App {
                 self.preview_target_width = self.preview.target_width();
                 let (width, target_pixels) =
                     preview_dimensions(&self.picker, self.preview_target_width);
-                let manifest = match typst_tui_render::render_manifest(&document, target_pixels) {
+                let manifest = match oxyst_render::render_manifest(&document, target_pixels) {
                     Ok(manifest) => manifest,
                     Err(error) => {
                         self.compile_state = CompileState::Error;
@@ -1336,10 +1336,10 @@ mod tests {
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
+    use oxyst_compiler::{CompileOutcome, Compiler};
+    use oxyst_config::Config;
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
     use ratatui_image::picker::Picker;
-    use typst_tui_compiler::{CompileOutcome, Compiler};
-    use typst_tui_config::Config;
 
     use super::{
         App, AppInit, COMPILE_STALLED_AFTER, CompileDebounce, CompileState, Preview,
@@ -1537,13 +1537,13 @@ mod tests {
             let total_started = Instant::now();
             let layout_started = Instant::now();
             let (width, pixels) = preview_dimensions(&picker, target_width);
-            let manifest = typst_tui_render::render_manifest(&document, pixels)?;
+            let manifest = oxyst_render::render_manifest(&document, pixels)?;
             let page_sizes = Preview::page_sizes(&picker, &manifest, width);
             layout_samples.push(layout_started.elapsed());
 
             let render_started = Instant::now();
             let rendered =
-                typst_tui_render::render_pages_cancellable(&document, &manifest, [0], || false)?;
+                oxyst_render::render_pages_cancellable(&document, &manifest, [0], || false)?;
             render_samples.push(render_started.elapsed());
 
             let encoding_started = Instant::now();
@@ -1636,7 +1636,7 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_multi_thread().build()?;
         let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let outside =
-            std::env::temp_dir().join(format!("typst-tui-save-as-{}-{unique}", std::process::id()));
+            std::env::temp_dir().join(format!("oxyst-save-as-{}-{unique}", std::process::id()));
         fs::create_dir_all(&outside)?;
         let destination = outside.join("report.typ");
         let mut app = App::new(AppInit {

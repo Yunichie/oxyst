@@ -1,8 +1,8 @@
 use std::{fs, io::Cursor, path::Path};
 
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage, imageops};
+use oxyst_compiler::CompiledDocument;
 use typst::layout::Abs;
-use typst_tui_compiler::CompiledDocument;
 
 use crate::{Error, render_at};
 

@@ -1,3 +1,4 @@
+use oxyst_theme::{Color, Theme};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -5,7 +6,6 @@ use ratatui::{
     text::{Line, Span},
     widgets::Paragraph,
 };
-use typst_tui_theme::{Color, Theme};
 use unicode_width::UnicodeWidthStr;
 
 use super::Component;
@@ -91,7 +91,7 @@ impl Header {
         let dirty = if self.state.dirty { " ●" } else { "" };
         let dirty_width = UnicodeWidthStr::width(dirty).min(width);
         let identity_width = width.saturating_sub(dirty_width);
-        let brand = " typst-tui ";
+        let brand = " oxyst ";
         let brand_width = UnicodeWidthStr::width(brand);
         let identity = if identity_width > brand_width {
             Line::from(vec![
@@ -132,8 +132,8 @@ impl Header {
 mod tests {
     use std::convert::Infallible;
 
+    use oxyst_theme::{ColorDepth, Theme, ThemeName};
     use ratatui::{Terminal, backend::TestBackend};
-    use typst_tui_theme::{ColorDepth, Theme, ThemeName};
 
     use super::{Component, Header, HeaderState};
 

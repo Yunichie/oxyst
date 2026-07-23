@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use typst_tui_config::Config;
-use typst_tui_document::Motion;
+use oxyst_config::Config;
+use oxyst_document::Motion;
 
 use crate::{action::Action, event::Event};
 
@@ -445,7 +445,7 @@ fn codes_match(expected: KeyCode, actual: KeyCode) -> bool {
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use typst_tui_config::Config;
+    use oxyst_config::Config;
 
     use super::{InputMode, KeyChord, Keymap, resolve_key};
     use crate::action::Action;

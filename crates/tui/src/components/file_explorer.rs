@@ -3,6 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use oxyst_theme::Theme;
 use ratatui::{
     Frame,
     layout::Rect,
@@ -10,7 +11,6 @@ use ratatui::{
     text::Line,
     widgets::{Block, BorderType, Borders, Paragraph},
 };
-use typst_tui_theme::Theme;
 
 use crate::{action::Action, style::color};
 
@@ -159,8 +159,8 @@ impl FileExplorer {
 impl Component for FileExplorer {
     fn update(&mut self, action: Action) {
         match action {
-            Action::Move(typst_tui_document::Motion::Up) => self.select(-1),
-            Action::Move(typst_tui_document::Motion::Down) => self.select(1),
+            Action::Move(oxyst_document::Motion::Up) => self.select(-1),
+            Action::Move(oxyst_document::Motion::Down) => self.select(1),
             Action::ToggleFileExplorer => self.toggle(),
             _ => {}
         }
@@ -209,18 +209,16 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use oxyst_theme::{ColorDepth, Theme, ThemeName};
     use ratatui::{Terminal, backend::TestBackend};
-    use typst_tui_theme::{ColorDepth, Theme, ThemeName};
 
     use super::{Component, FileExplorer};
 
     #[test]
     fn scrolls_to_keep_the_selection_visible_and_refreshes_changes() -> Result<(), Box<dyn Error>> {
         let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "typst-tui-explorer-{}-{unique}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("oxyst-explorer-{}-{unique}", std::process::id()));
         fs::create_dir_all(&root)?;
         for index in 0..6 {
             fs::write(root.join(format!("file-{index}.typ")), "text")?;

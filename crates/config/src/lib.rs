@@ -77,7 +77,7 @@ pub struct Config {
 
 impl Config {
     pub fn load(explicit_path: Option<&Path>) -> Result<Self, Error> {
-        let environment_path = env::var_os("TYPST_TUI_CONFIG").map(PathBuf::from);
+        let environment_path = env::var_os("OXYST_CONFIG").map(PathBuf::from);
         let (path, required) = if let Some(path) = explicit_path {
             (Some(path.to_owned()), true)
         } else if let Some(path) = environment_path {
@@ -177,14 +177,14 @@ fn parse(source: &str, path: &Path) -> Result<Config, Error> {
 
 fn default_path() -> Option<PathBuf> {
     if let Some(path) = env::var_os("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(path).join("typst-tui/config.toml"));
+        return Some(PathBuf::from(path).join("oxyst/config.toml"));
     }
     if let Some(path) = env::var_os("APPDATA") {
-        return Some(PathBuf::from(path).join("typst-tui/config.toml"));
+        return Some(PathBuf::from(path).join("oxyst/config.toml"));
     }
     env::var_os("HOME")
         .map(PathBuf::from)
-        .map(|path| path.join(".config/typst-tui/config.toml"))
+        .map(|path| path.join(".config/oxyst/config.toml"))
 }
 
 #[cfg(test)]

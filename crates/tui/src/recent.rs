@@ -122,14 +122,14 @@ impl RecentFiles {
 
 fn state_path() -> Option<PathBuf> {
     if let Some(path) = env::var_os("XDG_STATE_HOME") {
-        return Some(PathBuf::from(path).join("typst-tui/recent.toml"));
+        return Some(PathBuf::from(path).join("oxyst/recent.toml"));
     }
     if let Some(path) = env::var_os("LOCALAPPDATA") {
-        return Some(PathBuf::from(path).join("typst-tui/recent.toml"));
+        return Some(PathBuf::from(path).join("oxyst/recent.toml"));
     }
     env::var_os("HOME")
         .map(PathBuf::from)
-        .map(|path| path.join(".local/state/typst-tui/recent.toml"))
+        .map(|path| path.join(".local/state/oxyst/recent.toml"))
 }
 
 #[cfg(test)]
@@ -169,6 +169,6 @@ mod tests {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
-        std::env::temp_dir().join(format!("typst-tui-{label}-{}-{unique}", std::process::id()))
+        std::env::temp_dir().join(format!("oxyst-{label}-{}-{unique}", std::process::id()))
     }
 }

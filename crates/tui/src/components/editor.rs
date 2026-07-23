@@ -1,5 +1,8 @@
 use std::{collections::BTreeMap, ops::Range};
 
+use oxyst_compiler::Severity;
+use oxyst_document::{Document, Motion, TextEdit};
+use oxyst_theme::{TextStyle, Theme};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -8,9 +11,6 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph},
 };
 use typst_syntax::{LinkedNode, Side, Source, Tag, highlight};
-use typst_tui_compiler::Severity;
-use typst_tui_document::{Document, Motion, TextEdit};
-use typst_tui_theme::{TextStyle, Theme};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -149,7 +149,7 @@ impl Editor {
                     match self.diagnostic_lines.get(&visual.logical_line).copied() {
                         Some(Severity::Error) => ("E", self.theme.error),
                         Some(Severity::Warning) => ("W", self.theme.warning),
-                        None => (" ", typst_tui_theme::Color::Reset),
+                        None => (" ", oxyst_theme::Color::Reset),
                     }
                 };
                 let number = if visual.continuation {
@@ -535,7 +535,7 @@ impl Editor {
         self.document.mark_saved();
     }
 
-    pub(crate) fn last_edit(&self) -> Option<&typst_tui_document::TextEdit> {
+    pub(crate) fn last_edit(&self) -> Option<&oxyst_document::TextEdit> {
         self.document.last_edit()
     }
 
@@ -543,7 +543,7 @@ impl Editor {
         self.document.cursor_byte_index()
     }
 
-    pub(crate) fn cursor_position(&self) -> typst_tui_document::CursorPosition {
+    pub(crate) fn cursor_position(&self) -> oxyst_document::CursorPosition {
         self.document.cursor_position()
     }
 
@@ -634,8 +634,8 @@ impl Default for Editor {
         Self::new(
             "",
             Theme::new(
-                typst_tui_theme::ThemeName::Dark,
-                typst_tui_theme::ColorDepth::Ansi16,
+                oxyst_theme::ThemeName::Dark,
+                oxyst_theme::ColorDepth::Ansi16,
             ),
         )
     }
@@ -1129,11 +1129,11 @@ fn scroll_as_u16(value: usize) -> u16 {
 mod tests {
     use std::{convert::Infallible, time::Instant};
 
+    use oxyst_compiler::{Diagnostic, Severity};
+    use oxyst_document::Motion;
+    use oxyst_theme::{ColorDepth, Theme, ThemeName};
     use ratatui::{Terminal, backend::TestBackend, style::Color};
     use typst_syntax::Source;
-    use typst_tui_compiler::{Diagnostic, Severity};
-    use typst_tui_document::Motion;
-    use typst_tui_theme::{ColorDepth, Theme, ThemeName};
 
     use super::{
         Component, Diagnostics, Editor, VisualPosition, line_row_count, matching_brackets,

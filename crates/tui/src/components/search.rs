@@ -1,10 +1,10 @@
+use oxyst_theme::Theme;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout},
     style::Style,
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
-use typst_tui_theme::Theme;
 use unicode_width::UnicodeWidthStr;
 
 use crate::style::{base, color};
@@ -175,8 +175,8 @@ fn draw_field(
 mod tests {
     use std::convert::Infallible;
 
+    use oxyst_theme::{ColorDepth, Theme, ThemeName};
     use ratatui::{Terminal, backend::TestBackend};
-    use typst_tui_theme::{ColorDepth, Theme, ThemeName};
 
     use super::{Search, SearchMode};
 

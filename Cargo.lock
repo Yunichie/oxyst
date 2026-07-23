@@ -2106,6 +2106,89 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 
 [[package]]
+name = "oxyst"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "oxyst-app",
+ "oxyst-config",
+]
+
+[[package]]
+name = "oxyst-app"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "crossterm",
+ "notify",
+ "oxyst-compiler",
+ "oxyst-config",
+ "oxyst-document",
+ "oxyst-render",
+ "oxyst-theme",
+ "ratatui",
+ "ratatui-image",
+ "serde",
+ "thiserror 2.0.19",
+ "tokio",
+ "toml 0.9.12+spec-1.1.0",
+ "typst-syntax",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
+name = "oxyst-compiler"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.19",
+ "typst",
+ "typst-ide",
+ "typst-kit",
+ "typst-layout",
+]
+
+[[package]]
+name = "oxyst-config"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.19",
+ "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
+name = "oxyst-document"
+version = "0.1.0"
+dependencies = [
+ "ropey",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
+name = "oxyst-render"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "oxyst-compiler",
+ "thiserror 2.0.19",
+ "typst",
+ "typst-pdf",
+ "typst-render",
+ "typst-svg",
+]
+
+[[package]]
+name = "oxyst-theme"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.19",
+ "typst-syntax",
+]
+
+[[package]]
 name = "palette"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3880,89 +3963,6 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "typst-tui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "typst-tui-app",
- "typst-tui-config",
-]
-
-[[package]]
-name = "typst-tui-app"
-version = "0.1.0"
-dependencies = [
- "arboard",
- "crossterm",
- "notify",
- "ratatui",
- "ratatui-image",
- "serde",
- "thiserror 2.0.19",
- "tokio",
- "toml 0.9.12+spec-1.1.0",
- "typst-syntax",
- "typst-tui-compiler",
- "typst-tui-config",
- "typst-tui-document",
- "typst-tui-render",
- "typst-tui-theme",
- "unicode-segmentation",
- "unicode-width",
-]
-
-[[package]]
-name = "typst-tui-compiler"
-version = "0.1.0"
-dependencies = [
- "thiserror 2.0.19",
- "typst",
- "typst-ide",
- "typst-kit",
- "typst-layout",
-]
-
-[[package]]
-name = "typst-tui-config"
-version = "0.1.0"
-dependencies = [
- "serde",
- "thiserror 2.0.19",
- "toml 0.9.12+spec-1.1.0",
-]
-
-[[package]]
-name = "typst-tui-document"
-version = "0.1.0"
-dependencies = [
- "ropey",
- "unicode-segmentation",
- "unicode-width",
-]
-
-[[package]]
-name = "typst-tui-render"
-version = "0.1.0"
-dependencies = [
- "image",
- "thiserror 2.0.19",
- "typst",
- "typst-pdf",
- "typst-render",
- "typst-svg",
- "typst-tui-compiler",
-]
-
-[[package]]
-name = "typst-tui-theme"
-version = "0.1.0"
-dependencies = [
- "thiserror 2.0.19",
- "typst-syntax",
 ]
 
 [[package]]

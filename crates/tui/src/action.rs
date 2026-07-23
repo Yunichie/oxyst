@@ -1,4 +1,4 @@
-use typst_tui_document::Motion;
+use oxyst_document::Motion;
 
 use crate::compile::{CompileResult, PreviewPageResult};
 use crate::export::ExportResult;

@@ -1,5 +1,5 @@
 [package]
-name = "typst-tui"
+name = "oxyst"
 description = "A terminal editor for Typst documents"
 version.workspace = true
 edition.workspace = true
@@ -48,12 +48,12 @@ typst-syntax = "0.15.1"
 typst-svg = "0.15.1"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
-typst-tui-app = { path = "crates/tui" }
-typst-tui-compiler = { path = "crates/compiler" }
-typst-tui-config = { path = "crates/config" }
-typst-tui-document = { path = "crates/document" }
-typst-tui-render = { path = "crates/render" }
-typst-tui-theme = { path = "crates/theme" }
+oxyst-app = { path = "crates/tui" }
+oxyst-compiler = { path = "crates/compiler" }
+oxyst-config = { path = "crates/config" }
+oxyst-document = { path = "crates/document" }
+oxyst-render = { path = "crates/render" }
+oxyst-theme = { path = "crates/theme" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -66,8 +66,8 @@ unwrap_used = "deny"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-typst-tui-app.workspace = true
-typst-tui-config.workspace = true
+oxyst-app.workspace = true
+oxyst-config.workspace = true
 
 [lints]
 workspace = true

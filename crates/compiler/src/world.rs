@@ -60,7 +60,7 @@ impl TypstWorld {
         font_store.extend(fonts::embedded());
 
         let packages = Arc::new(SystemPackages::new(SystemDownloader::new(concat!(
-            "typst-tui/",
+            "oxyst/",
             env!("CARGO_PKG_VERSION")
         ))));
         let resources = Arc::new(WorldResources {

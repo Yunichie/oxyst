@@ -1,6 +1,6 @@
 [package]
-name = "typst-tui-compiler"
-description = "Typst compiler integration for typst-tui"
+name = "oxyst-compiler"
+description = "Typst compiler integration for oxyst"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

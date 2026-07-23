@@ -1,6 +1,6 @@
 [package]
-name = "typst-tui-theme"
-description = "Color themes for typst-tui"
+name = "oxyst-theme"
+description = "Color themes for oxyst"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

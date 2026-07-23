@@ -1,13 +1,13 @@
 use std::path::PathBuf;
 
+use oxyst_render::ExportFormat;
+use oxyst_theme::Theme;
 use ratatui::{
     Frame,
     layout::Rect,
     style::Style,
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
-use typst_tui_render::ExportFormat;
-use typst_tui_theme::Theme;
 
 use super::{
     Command, CommandPalette, Component, Help, Prompt, PromptKind, RecentPicker, Search, SearchMode,
@@ -237,8 +237,8 @@ mod tests {
     use std::path::PathBuf;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use typst_tui_config::Config;
-    use typst_tui_theme::{ColorDepth, Theme, ThemeName};
+    use oxyst_config::Config;
+    use oxyst_theme::{ColorDepth, Theme, ThemeName};
 
     use super::{Component, Event, Keymap, OverlayHost, OverlaySubmission};
     use crate::action::Action;

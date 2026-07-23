@@ -231,7 +231,7 @@ mod tests {
             .duration_since(SystemTime::UNIX_EPOCH)?
             .as_nanos();
         let root =
-            std::env::temp_dir().join(format!("typst-tui-watch-{}-{unique}", std::process::id()));
+            std::env::temp_dir().join(format!("oxyst-watch-{}-{unique}", std::process::id()));
         fs::create_dir_all(&root)?;
         let (sender, receiver) = channel();
         let watcher = ProjectWatcher::new(&root, None, sender).map_err(std::io::Error::other)?;

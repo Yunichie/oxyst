@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use oxyst_compiler::{Diagnostic, DiagnosticNote, DiagnosticNoteKind, Severity};
+use oxyst_theme::Theme;
 use ratatui::{
     Frame,
     layout::Rect,
@@ -7,8 +9,6 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph},
 };
-use typst_tui_compiler::{Diagnostic, DiagnosticNote, DiagnosticNoteKind, Severity};
-use typst_tui_theme::Theme;
 
 use crate::{action::Action, style::color};
 
@@ -215,8 +215,8 @@ impl Diagnostics {
 impl Default for Diagnostics {
     fn default() -> Self {
         Self::new(Theme::new(
-            typst_tui_theme::ThemeName::Dark,
-            typst_tui_theme::ColorDepth::Ansi16,
+            oxyst_theme::ThemeName::Dark,
+            oxyst_theme::ColorDepth::Ansi16,
         ))
     }
 }
@@ -257,9 +257,9 @@ fn format_note(note: &DiagnosticNote) -> String {
 mod tests {
     use std::convert::Infallible;
 
+    use oxyst_compiler::{Diagnostic, DiagnosticNote, DiagnosticNoteKind, Severity};
+    use oxyst_theme::{ColorDepth, Theme, ThemeName};
     use ratatui::{Terminal, backend::TestBackend};
-    use typst_tui_compiler::{Diagnostic, DiagnosticNote, DiagnosticNoteKind, Severity};
-    use typst_tui_theme::{ColorDepth, Theme, ThemeName};
 
     use super::{Component, Diagnostics};
 

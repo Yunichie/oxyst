@@ -1,3 +1,5 @@
+use oxyst_render::ExportFormat;
+use oxyst_theme::Theme;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout},
@@ -5,8 +7,6 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
-use typst_tui_render::ExportFormat;
-use typst_tui_theme::Theme;
 use unicode_width::UnicodeWidthStr;
 
 use crate::style::{base, color};
@@ -186,8 +186,8 @@ fn fuzzy_match(candidate: &str, query: &str) -> bool {
 mod tests {
     use std::convert::Infallible;
 
+    use oxyst_theme::{ColorDepth, Theme, ThemeName};
     use ratatui::{Terminal, backend::TestBackend, style::Color};
-    use typst_tui_theme::{ColorDepth, Theme, ThemeName};
 
     use super::{Command, CommandPalette, fuzzy_match, visible_start};
 
@@ -200,7 +200,7 @@ mod tests {
         palette.input_text("png");
         assert_eq!(
             palette.selected(),
-            Some(Command::Export(typst_tui_render::ExportFormat::Png))
+            Some(Command::Export(oxyst_render::ExportFormat::Png))
         );
     }
 

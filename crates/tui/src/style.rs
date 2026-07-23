@@ -1,5 +1,5 @@
+use oxyst_theme::{Color, TextStyle, Theme};
 use ratatui::style::{Color as RatatuiColor, Modifier, Style};
-use typst_tui_theme::{Color, TextStyle, Theme};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 

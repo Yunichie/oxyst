@@ -1,8 +1,8 @@
 use std::{path::PathBuf, sync::mpsc::Sender};
 
+use oxyst_compiler::CompiledDocument;
+use oxyst_render::ExportFormat;
 use tokio::runtime::Handle;
-use typst_tui_compiler::CompiledDocument;
-use typst_tui_render::ExportFormat;
 
 use crate::event::Event;
 
@@ -25,8 +25,8 @@ impl ExportWorker {
     pub(crate) fn spawn(&self, document: CompiledDocument, format: ExportFormat, path: PathBuf) {
         let sender = self.sender.clone();
         drop(self.runtime.spawn_blocking(move || {
-            let result = typst_tui_render::export(&document, format, &path)
-                .map_err(|error| error.to_string());
+            let result =
+                oxyst_render::export(&document, format, &path).map_err(|error| error.to_string());
             let _ = sender.send(Event::ExportFinished(ExportResult {
                 format,
                 path,

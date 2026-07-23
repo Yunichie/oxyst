@@ -25,7 +25,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("could not initialize Typst compiler")]
-    Compiler(#[from] typst_tui_compiler::Error),
+    Compiler(#[from] oxyst_compiler::Error),
     #[error("terminal I/O failed")]
     Terminal(#[from] std::io::Error),
     #[error("invalid application configuration: {0}")]
@@ -37,10 +37,10 @@ pub fn run(
     root: PathBuf,
     root_is_explicit: bool,
     text: &str,
-    config: typst_tui_config::Config,
+    config: oxyst_config::Config,
 ) -> Result<(), Error> {
     let main = path.clone().unwrap_or_else(|| root.join("untitled.typ"));
-    let compiler = typst_tui_compiler::Compiler::new(&root, main)?;
+    let compiler = oxyst_compiler::Compiler::new(&root, main)?;
     let runtime = tokio::runtime::Builder::new_multi_thread().build()?;
     let mut terminal = ratatui::try_init()?;
     let picker = match Picker::from_query_stdio() {

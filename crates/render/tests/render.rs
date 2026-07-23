@@ -1,7 +1,7 @@
 use std::{error::Error, fs, io, path::PathBuf};
 
-use typst_tui_compiler::{CompileOutcome, Compiler};
-use typst_tui_render::{Error as RenderError, ExportFormat, export};
+use oxyst_compiler::{CompileOutcome, Compiler};
+use oxyst_render::{Error as RenderError, ExportFormat, export};
 
 #[test]
 fn renders_compiled_page_pixels() -> Result<(), Box<dyn Error>> {
@@ -13,7 +13,7 @@ fn renders_compiled_page_pixels() -> Result<(), Box<dyn Error>> {
         return Err("simple fixture failed to compile".into());
     };
 
-    let rendered = typst_tui_render::render(&compiled, 600)?;
+    let rendered = oxyst_render::render(&compiled, 600)?;
     assert_eq!(rendered.pages().len(), 1);
     let page = &rendered.pages()[0];
     assert_eq!(page.width(), 600);
@@ -37,7 +37,7 @@ fn exports_all_supported_formats() -> Result<(), Box<dyn Error>> {
         return Err(io::Error::other("multi-page fixture did not compile").into());
     };
     let output_root =
-        std::env::temp_dir().join(format!("typst-tui-export-test-{}", std::process::id()));
+        std::env::temp_dir().join(format!("oxyst-export-test-{}", std::process::id()));
     fs::create_dir_all(&output_root)?;
 
     for format in [ExportFormat::Pdf, ExportFormat::Png, ExportFormat::Svg] {

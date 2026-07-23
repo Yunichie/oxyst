@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use oxyst_document::CursorPosition;
+use oxyst_theme::Theme;
 use ratatui::{
     Frame,
     layout::Rect,
@@ -7,8 +9,6 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Paragraph},
 };
-use typst_tui_document::CursorPosition;
-use typst_tui_theme::Theme;
 use unicode_width::UnicodeWidthStr;
 
 use super::Component;
@@ -201,9 +201,9 @@ impl Component for StatusBar {
 mod tests {
     use std::{convert::Infallible, time::Duration};
 
+    use oxyst_document::CursorPosition;
+    use oxyst_theme::{ColorDepth, Theme, ThemeName};
     use ratatui::{Terminal, backend::TestBackend};
-    use typst_tui_document::CursorPosition;
-    use typst_tui_theme::{ColorDepth, Theme, ThemeName};
 
     use super::{Component, StatusBar, StatusBarState};
 

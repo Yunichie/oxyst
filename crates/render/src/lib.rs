@@ -12,9 +12,9 @@ use std::{
 };
 
 use image::{DynamicImage, RgbaImage};
+use oxyst_compiler::CompiledDocument;
 use thiserror::Error;
 use typst_render::RenderOptions;
-use typst_tui_compiler::CompiledDocument;
 
 const MAX_TARGET_WIDTH: u32 = 2_048;
 const MAX_DIMENSION: f64 = 16_384.0;
@@ -479,7 +479,7 @@ mod tests {
     };
 
     use image::RgbaImage;
-    use typst_tui_compiler::{CompileOutcome, Compiler};
+    use oxyst_compiler::{CompileOutcome, Compiler};
 
     use super::{
         MAX_CACHED_PAGES, RenderCache, render_cached_cancellable, render_manifest,
@@ -580,10 +580,8 @@ mod tests {
     #[ignore = "manual release-mode performance probe"]
     fn image_heavy_document_reports_first_page_latency() -> Result<(), Box<dyn Error>> {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "typst-tui-preview-perf-{}-{nonce}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("oxyst-preview-perf-{}-{nonce}", std::process::id()));
         fs::create_dir_all(&root)?;
         let result = (|| -> Result<(), Box<dyn Error>> {
             let image = RgbaImage::from_fn(1_024, 1_024, |x, y| {

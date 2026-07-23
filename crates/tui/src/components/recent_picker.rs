@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use oxyst_theme::Theme;
 use ratatui::{
     Frame,
     layout::Rect,
@@ -7,7 +8,6 @@ use ratatui::{
     text::Line,
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
-use typst_tui_theme::Theme;
 
 use super::{Component, modal_area};
 use crate::{
@@ -95,8 +95,8 @@ impl Component for RecentPicker {
 mod tests {
     use std::{convert::Infallible, path::PathBuf};
 
+    use oxyst_theme::{ColorDepth, Theme, ThemeName};
     use ratatui::{Terminal, backend::TestBackend};
-    use typst_tui_theme::{ColorDepth, Theme, ThemeName};
 
     use super::{Action, Component, RecentPicker};
 
