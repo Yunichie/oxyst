@@ -18,7 +18,7 @@ use typst_tui_render::RenderCache;
 
 use crate::{components::Preview, event::Event};
 
-const MAX_ACTIVE_COMPILES: usize = 2;
+const MAX_ACTIVE_NATIVE_COMPILES: usize = 2;
 
 pub(crate) struct CompileResult {
     pub(crate) generation: u64,
@@ -63,28 +63,30 @@ pub(crate) struct WorldRebuild {
 
 #[derive(Default)]
 struct Scheduler {
-    active: usize,
-    pending: Option<CompileRequest>,
+    active_native_compiles: usize,
+    latest_pending: Option<CompileRequest>,
 }
 
 impl Scheduler {
     fn enqueue(&mut self, request: CompileRequest) -> Option<CompileRequest> {
-        if self.active < MAX_ACTIVE_COMPILES {
-            self.active += 1;
+        if self.active_native_compiles < MAX_ACTIVE_NATIVE_COMPILES {
+            self.active_native_compiles += 1;
             Some(request)
         } else {
-            self.pending = Some(request);
+            self.latest_pending = Some(request);
             None
         }
     }
 
     fn cancel_pending(&mut self) {
-        self.pending = None;
+        self.latest_pending = None;
     }
 
     fn finish(&mut self) -> Option<CompileRequest> {
-        self.active = self.active.saturating_sub(1);
-        self.pending.take().inspect(|_| self.active += 1)
+        self.active_native_compiles = self.active_native_compiles.saturating_sub(1);
+        self.latest_pending
+            .take()
+            .inspect(|_| self.active_native_compiles += 1)
     }
 }
 
@@ -420,8 +422,8 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_starts_two_jobs_and_coalesces_to_the_latest_pending() -> Result<(), Box<dyn Error>>
-    {
+    fn scheduler_bounds_native_jobs_and_retains_only_the_latest_request()
+    -> Result<(), Box<dyn Error>> {
         let mut scheduler = Scheduler::default();
         assert_eq!(
             scheduler.enqueue(request(1)?).map(|job| job.generation),
@@ -436,7 +438,26 @@ mod tests {
 
         let next = scheduler.finish().ok_or("latest job was not retained")?;
         assert_eq!(next.generation, 4);
-        assert_eq!(scheduler.active, 2);
+        assert_eq!(scheduler.active_native_compiles, 2);
+
+        assert!(scheduler.finish().is_none());
+        assert_eq!(scheduler.active_native_compiles, 1);
+        assert!(scheduler.finish().is_none());
+        assert_eq!(scheduler.active_native_compiles, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn cancelling_drops_pending_work_without_changing_active_jobs() -> Result<(), Box<dyn Error>> {
+        let mut scheduler = Scheduler::default();
+        assert!(scheduler.enqueue(request(1)?).is_some());
+        assert!(scheduler.enqueue(request(2)?).is_some());
+        assert!(scheduler.enqueue(request(3)?).is_none());
+
+        scheduler.cancel_pending();
+
+        assert!(scheduler.finish().is_none());
+        assert_eq!(scheduler.active_native_compiles, 1);
         Ok(())
     }
 
