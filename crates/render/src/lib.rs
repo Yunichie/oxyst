@@ -5,8 +5,8 @@ mod export;
 pub use export::{ExportFormat, export};
 
 use std::{
-    collections::HashMap,
     collections::hash_map::DefaultHasher,
+    collections::{HashMap, VecDeque},
     hash::{Hash, Hasher},
     sync::Arc,
 };
@@ -18,9 +18,11 @@ use typst_tui_compiler::CompiledDocument;
 
 const MAX_TARGET_WIDTH: u32 = 2_048;
 const MAX_DIMENSION: f64 = 16_384.0;
-const MAX_TOTAL_PIXELS: f64 = 64.0 * 1_024.0 * 1_024.0;
+const MAX_TOTAL_PIXELS: u64 = 64 * 1_024 * 1_024;
 const MIN_PIXELS_PER_POINT: f64 = 0.25;
 const MAX_PIXELS_PER_POINT: f64 = 4.0;
+const MAX_CACHED_PAGES: usize = 5;
+const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -32,6 +34,10 @@ pub enum Error {
     PageTooLarge { page: usize },
     #[error("document exceeds the preview pixel budget")]
     DocumentTooLarge,
+    #[error("preview page {page} does not exist")]
+    PageOutOfBounds { page: usize },
+    #[error("preview manifest does not match the compiled document")]
+    ManifestMismatch,
     #[error("renderer returned invalid pixel data for page {page}")]
     InvalidPixelData { page: usize },
     #[error("preview rendering was cancelled")]
@@ -55,9 +61,23 @@ pub struct RenderedDocument {
     pixels_per_point: f64,
 }
 
+#[derive(Clone, Debug)]
+pub struct RenderManifest {
+    pages: Vec<PageMetadata>,
+    pixels_per_point: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PageMetadata {
+    width: u32,
+    height: u32,
+}
+
 #[derive(Clone, Default)]
 pub struct RenderCache {
     pages: HashMap<PageCacheKey, Arc<RgbaImage>>,
+    order: VecDeque<PageCacheKey>,
+    bytes: usize,
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -80,6 +100,30 @@ impl RenderedDocument {
     #[must_use]
     pub fn pixels_per_point(&self) -> f64 {
         self.pixels_per_point
+    }
+}
+
+impl RenderManifest {
+    #[must_use]
+    pub fn pages(&self) -> &[PageMetadata] {
+        &self.pages
+    }
+
+    #[must_use]
+    pub fn pixels_per_point(&self) -> f64 {
+        self.pixels_per_point
+    }
+}
+
+impl PageMetadata {
+    #[must_use]
+    pub fn width(self) -> u32 {
+        self.width
+    }
+
+    #[must_use]
+    pub fn height(self) -> u32 {
+        self.height
     }
 }
 
@@ -111,6 +155,59 @@ impl PageImage {
     }
 }
 
+pub struct RenderedPage {
+    index: usize,
+    image: PageImage,
+}
+
+impl RenderedPage {
+    #[must_use]
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    #[must_use]
+    pub fn into_image(self) -> PageImage {
+        self.image
+    }
+}
+
+impl RenderCache {
+    fn get(&mut self, key: PageCacheKey) -> Option<Arc<RgbaImage>> {
+        let image = Arc::clone(self.pages.get(&key)?);
+        self.order.retain(|candidate| *candidate != key);
+        self.order.push_back(key);
+        Some(image)
+    }
+
+    fn insert(&mut self, key: PageCacheKey, image: Arc<RgbaImage>) {
+        if let Some(previous) = self.pages.insert(key, Arc::clone(&image)) {
+            self.bytes = self.bytes.saturating_sub(image_bytes(&previous));
+        }
+        self.bytes = self.bytes.saturating_add(image_bytes(&image));
+        self.order.retain(|candidate| *candidate != key);
+        self.order.push_back(key);
+
+        while self.pages.len() > 1
+            && (self.pages.len() > MAX_CACHED_PAGES || self.bytes > MAX_CACHE_BYTES)
+        {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(removed) = self.pages.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(image_bytes(&removed));
+            }
+        }
+    }
+}
+
+fn image_bytes(image: &RgbaImage) -> usize {
+    usize::try_from(image.width())
+        .unwrap_or(usize::MAX)
+        .saturating_mul(usize::try_from(image.height()).unwrap_or(usize::MAX))
+        .saturating_mul(4)
+}
+
 pub fn render(document: &CompiledDocument, target_width: u32) -> Result<RenderedDocument, Error> {
     render_cancellable(document, target_width, || false)
 }
@@ -130,6 +227,25 @@ pub fn render_cached_cancellable(
     cache: &RenderCache,
     cancelled: impl Fn() -> bool,
 ) -> Result<(RenderedDocument, RenderCache), Error> {
+    let manifest = render_manifest(document, target_width)?;
+    validate_total_pixels(&manifest)?;
+    let indices = 0..manifest.pages.len();
+    let (pages, cache) =
+        render_pages_cached_cancellable(document, &manifest, indices, cache, cancelled)?;
+
+    Ok((
+        RenderedDocument {
+            pages: pages.into_iter().map(RenderedPage::into_image).collect(),
+            pixels_per_point: manifest.pixels_per_point,
+        },
+        cache,
+    ))
+}
+
+pub fn render_manifest(
+    document: &CompiledDocument,
+    target_width: u32,
+) -> Result<RenderManifest, Error> {
     if target_width == 0 || target_width > MAX_TARGET_WIDTH {
         return Err(Error::InvalidTargetWidth);
     }
@@ -144,77 +260,82 @@ pub fn render_cached_cancellable(
         .fold(0.0_f64, f64::max);
     let pixels_per_point =
         (f64::from(target_width) / widest_page).clamp(MIN_PIXELS_PER_POINT, MAX_PIXELS_PER_POINT);
-    let (pages, cache) =
-        render_at_cached_cancellable(document, pixels_per_point, cache, &cancelled)?;
-
-    Ok((
-        RenderedDocument {
-            pages,
-            pixels_per_point,
-        },
-        cache,
-    ))
+    manifest_at(document, pixels_per_point)
 }
 
-fn render_at(document: &CompiledDocument, pixels_per_point: f64) -> Result<Vec<PageImage>, Error> {
-    render_at_cached_cancellable(document, pixels_per_point, &RenderCache::default(), &|| {
-        false
-    })
-    .map(|(pages, _)| pages)
-}
-
-fn render_at_cached_cancellable(
+pub fn render_pages_cached_cancellable(
     document: &CompiledDocument,
-    pixels_per_point: f64,
+    manifest: &RenderManifest,
+    indices: impl IntoIterator<Item = usize>,
     cache: &RenderCache,
-    cancelled: &impl Fn() -> bool,
-) -> Result<(Vec<PageImage>, RenderCache), Error> {
-    if document.pages().is_empty() {
-        return Err(Error::EmptyDocument);
+    cancelled: impl Fn() -> bool,
+) -> Result<(Vec<RenderedPage>, RenderCache), Error> {
+    if manifest.pages.len() != document.pages().len() {
+        return Err(Error::ManifestMismatch);
     }
-    validate_dimensions(document, pixels_per_point)?;
     let options = RenderOptions {
-        pixel_per_pt: pixels_per_point.into(),
+        pixel_per_pt: manifest.pixels_per_point.into(),
         render_bleed: false,
     };
-    let mut pages = Vec::with_capacity(document.pages().len());
-    let mut next_cache = RenderCache::default();
-    for (index, page) in document.pages().iter().enumerate() {
+    let mut pages = Vec::new();
+    let mut next_cache = cache.clone();
+
+    for index in indices {
         if cancelled() {
             return Err(Error::Cancelled);
         }
+        let page = document
+            .pages()
+            .get(index)
+            .ok_or(Error::PageOutOfBounds { page: index + 1 })?;
         let key = PageCacheKey {
             page: page_hash(page),
-            pixels_per_point: pixels_per_point.to_bits(),
+            pixels_per_point: manifest.pixels_per_point.to_bits(),
         };
-        if let Some(image) = cache.pages.get(&key) {
-            next_cache.pages.insert(key, Arc::clone(image));
-            pages.push(PageImage {
-                image: Arc::clone(image),
-            });
-            continue;
-        }
-        let pixmap = typst_render::render(page, &options);
-        let (width, height) = (pixmap.width(), pixmap.height());
-        let mut rgba = pixmap.data().to_vec();
-        unpremultiply(&mut rgba);
-        let image = RgbaImage::from_raw(width, height, rgba)
-            .ok_or(Error::InvalidPixelData { page: index + 1 })?;
-        let image = Arc::new(image);
-        next_cache.pages.insert(key, Arc::clone(&image));
-        pages.push(PageImage { image });
+        let image = if let Some(image) = next_cache.get(key) {
+            image
+        } else {
+            let pixmap = typst_render::render(page, &options);
+            let (width, height) = (pixmap.width(), pixmap.height());
+            let mut rgba = pixmap.data().to_vec();
+            unpremultiply(&mut rgba);
+            let image = Arc::new(
+                RgbaImage::from_raw(width, height, rgba)
+                    .ok_or(Error::InvalidPixelData { page: index + 1 })?,
+            );
+            next_cache.insert(key, Arc::clone(&image));
+            image
+        };
+        pages.push(RenderedPage {
+            index,
+            image: PageImage { image },
+        });
     }
+
     Ok((pages, next_cache))
 }
 
-fn page_hash(page: &impl Hash) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    page.hash(&mut hasher);
-    hasher.finish()
+fn render_at(document: &CompiledDocument, pixels_per_point: f64) -> Result<Vec<PageImage>, Error> {
+    let manifest = manifest_at(document, pixels_per_point)?;
+    validate_total_pixels(&manifest)?;
+    render_pages_cached_cancellable(
+        document,
+        &manifest,
+        0..manifest.pages.len(),
+        &RenderCache::default(),
+        || false,
+    )
+    .map(|(pages, _)| pages.into_iter().map(RenderedPage::into_image).collect())
 }
 
-fn validate_dimensions(document: &CompiledDocument, pixels_per_point: f64) -> Result<(), Error> {
-    let mut total_pixels = 0.0;
+fn manifest_at(
+    document: &CompiledDocument,
+    pixels_per_point: f64,
+) -> Result<RenderManifest, Error> {
+    if document.pages().is_empty() {
+        return Err(Error::EmptyDocument);
+    }
+    let mut pages = Vec::with_capacity(document.pages().len());
     for (index, page) in document.pages().iter().enumerate() {
         let size = page.frame.size();
         let width = (size.x.to_pt() * pixels_per_point).round().max(1.0);
@@ -223,10 +344,32 @@ fn validate_dimensions(document: &CompiledDocument, pixels_per_point: f64) -> Re
             || !height.is_finite()
             || width > MAX_DIMENSION
             || height > MAX_DIMENSION
+            || width * height > MAX_TOTAL_PIXELS as f64
         {
             return Err(Error::PageTooLarge { page: index + 1 });
         }
-        total_pixels += width * height;
+        pages.push(PageMetadata {
+            width: width as u32,
+            height: height as u32,
+        });
+    }
+    Ok(RenderManifest {
+        pages,
+        pixels_per_point,
+    })
+}
+
+fn page_hash(page: &impl Hash) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    page.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn validate_total_pixels(manifest: &RenderManifest) -> Result<(), Error> {
+    let mut total_pixels = 0_u64;
+    for page in &manifest.pages {
+        total_pixels = total_pixels
+            .saturating_add(u64::from(page.width).saturating_mul(u64::from(page.height)));
         if total_pixels > MAX_TOTAL_PIXELS {
             return Err(Error::DocumentTooLarge);
         }
@@ -249,11 +392,21 @@ fn unpremultiply(rgba: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, path::PathBuf, sync::Arc};
+    use std::{
+        error::Error,
+        fs,
+        path::PathBuf,
+        sync::Arc,
+        time::{Instant, SystemTime, UNIX_EPOCH},
+    };
 
+    use image::RgbaImage;
     use typst_tui_compiler::{CompileOutcome, Compiler};
 
-    use super::{RenderCache, render_cached_cancellable, unpremultiply};
+    use super::{
+        MAX_CACHED_PAGES, RenderCache, render_cached_cancellable, render_manifest,
+        render_pages_cached_cancellable, unpremultiply,
+    };
 
     #[test]
     fn converts_premultiplied_alpha() {
@@ -285,5 +438,89 @@ mod tests {
         assert!(Arc::ptr_eq(&first.pages[0].image, &second.pages[0].image));
         assert!(!Arc::ptr_eq(&first.pages[1].image, &second.pages[1].image));
         Ok(())
+    }
+
+    #[test]
+    fn renders_only_requested_pages_and_bounds_the_cache() -> Result<(), Box<dyn Error>> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        let mut compiler = Compiler::new(&root, root.join("simple.typ"))?;
+        let source = (0..8)
+            .map(|page| format!("= Page {page}\n#pagebreak()"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let CompileOutcome::Success(document) = compiler.compile(&source) else {
+            return Err("fixture did not compile".into());
+        };
+        let manifest = render_manifest(&document, 320)?;
+
+        let (rendered, cache) = render_pages_cached_cancellable(
+            &document,
+            &manifest,
+            [1, 3, 5, 7, 0, 2, 4],
+            &RenderCache::default(),
+            || false,
+        )?;
+
+        assert_eq!(
+            rendered
+                .iter()
+                .map(super::RenderedPage::index)
+                .collect::<Vec<_>>(),
+            [1, 3, 5, 7, 0, 2, 4]
+        );
+        assert!(cache.pages.len() <= MAX_CACHED_PAGES);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "manual release-mode performance probe"]
+    fn image_heavy_document_reports_first_page_latency() -> Result<(), Box<dyn Error>> {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "typst-tui-preview-perf-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root)?;
+        let result = (|| -> Result<(), Box<dyn Error>> {
+            let image = RgbaImage::from_fn(1_024, 1_024, |x, y| {
+                image::Rgba([(x % 256) as u8, (y % 256) as u8, 128, 255])
+            });
+            image.save(root.join("sample.png"))?;
+            let source = (0..100)
+                .map(|_| "#image(\"sample.png\", width: 100%)")
+                .collect::<Vec<_>>()
+                .join("\n#pagebreak()\n");
+            let main = root.join("main.typ");
+            fs::write(&main, &source)?;
+            let mut compiler = Compiler::new(&root, &main)?;
+
+            let compile_started = Instant::now();
+            let CompileOutcome::Success(document) = compiler.compile(&source) else {
+                return Err("image-heavy fixture did not compile".into());
+            };
+            let compile_elapsed = compile_started.elapsed();
+            let manifest_started = Instant::now();
+            let manifest = render_manifest(&document, 800)?;
+            let manifest_elapsed = manifest_started.elapsed();
+            let first_page_started = Instant::now();
+            let (pages, cache) = render_pages_cached_cancellable(
+                &document,
+                &manifest,
+                [0],
+                &RenderCache::default(),
+                || false,
+            )?;
+            let first_page_elapsed = first_page_started.elapsed();
+
+            eprintln!(
+                "100 image pages: compile={compile_elapsed:?}, manifest={manifest_elapsed:?}, first_page={first_page_elapsed:?}"
+            );
+            assert_eq!(manifest.pages().len(), 100);
+            assert_eq!(pages.len(), 1);
+            assert_eq!(cache.pages.len(), 1);
+            Ok(())
+        })();
+        let _ = fs::remove_dir_all(&root);
+        result
     }
 }
