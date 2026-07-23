@@ -163,7 +163,7 @@ impl OverlayHost {
 impl Component for OverlayHost {
     fn handle_event(&mut self, event: &Event) -> Option<Action> {
         let mode = self.input_mode()?;
-        input::resolve(Self::clone_input(event)?, mode, &self.keymap)
+        input::resolve(Self::clone_input(event)?, mode, &self.keymap, true)
     }
 
     fn update(&mut self, action: Action) {

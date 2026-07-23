@@ -41,6 +41,10 @@ const AUTO_COMPILE_DELAY: Duration = Duration::from_millis(150);
 const CURSOR_SYNC_DELAY: Duration = Duration::from_millis(50);
 const COMPILE_STALLED_AFTER: Duration = Duration::from_secs(5);
 
+fn overlay_transition_requires_clear(action: &Action) -> bool {
+    matches!(action, Action::CloseOverlay | Action::OverlaySubmit)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompileState {
     NotStarted,
@@ -217,10 +221,17 @@ impl App {
             } else {
                 None
             };
+            let mode = self.input_mode();
+            let accepts_text = mode != InputMode::Normal || self.focus == Pane::Editor;
             if let Some(action) =
-                component_action.or_else(|| input::resolve(event, self.input_mode(), &self.keymap))
+                component_action.or_else(|| input::resolve(event, mode, &self.keymap, accepts_text))
             {
+                let clear_terminal =
+                    self.overlay.is_open() && overlay_transition_requires_clear(&action);
                 self.update(action);
+                if clear_terminal {
+                    terminal.clear()?;
+                }
             }
         }
 
@@ -1176,7 +1187,11 @@ mod tests {
     use typst_tui_compiler::Compiler;
     use typst_tui_config::Config;
 
-    use super::{App, AppInit, COMPILE_STALLED_AFTER, CompileDebounce, CompileState};
+    use super::{
+        App, AppInit, COMPILE_STALLED_AFTER, CompileDebounce, CompileState,
+        overlay_transition_requires_clear,
+    };
+    use crate::action::Action;
 
     #[test]
     fn compile_debounce_restarts_after_each_edit() {
@@ -1190,6 +1205,16 @@ mod tests {
         assert!(!debounce.take_due(start + Duration::from_millis(249)));
         assert!(debounce.take_due(start + Duration::from_millis(250)));
         assert!(!debounce.take_due(start + Duration::from_millis(300)));
+    }
+
+    #[test]
+    fn clearing_or_submitting_an_overlay_requests_a_full_redraw() {
+        assert!(overlay_transition_requires_clear(&Action::CloseOverlay));
+        assert!(overlay_transition_requires_clear(&Action::OverlaySubmit));
+        assert!(!overlay_transition_requires_clear(&Action::OverlayInput(
+            'x'
+        )));
+        assert!(!overlay_transition_requires_clear(&Action::OverlayMove(1)));
     }
 
     #[test]

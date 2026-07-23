@@ -68,7 +68,12 @@ impl Keymap {
     }
 }
 
-pub(crate) fn resolve(event: Event, mode: InputMode, keymap: &Keymap) -> Option<Action> {
+pub(crate) fn resolve(
+    event: Event,
+    mode: InputMode,
+    keymap: &Keymap,
+    accepts_text: bool,
+) -> Option<Action> {
     match event {
         Event::CompileFinished(result) => Some(Action::CompileFinished(result)),
         Event::ExportFinished(result) => Some(Action::ExportFinished(result)),
@@ -76,17 +81,31 @@ pub(crate) fn resolve(event: Event, mode: InputMode, keymap: &Keymap) -> Option<
         Event::ProjectFilesChanged => Some(Action::ProjectFilesChanged),
         Event::FileWatchFailed(error) => Some(Action::FileWatchFailed(error)),
         Event::Tick => Some(Action::Tick),
-        Event::Paste(text) if matches!(mode, InputMode::Normal) => Some(Action::InsertText(text)),
+        Event::Paste(text) if matches!(mode, InputMode::Normal) && accepts_text => {
+            Some(Action::InsertText(text))
+        }
         Event::Paste(text) if matches!(mode, InputMode::Overlay | InputMode::Search) => {
             Some(Action::OverlayInputText(text))
         }
         Event::Mouse(mouse) if matches!(mode, InputMode::Normal) => resolve_mouse(mouse),
-        Event::Key(key) if is_press(key) => resolve_key(key, mode, keymap),
+        Event::Key(key) if is_press(key) => {
+            resolve_key_with_context(key, mode, keymap, accepts_text)
+        }
         Event::Paste(_) | Event::Key(_) | Event::Mouse(_) | Event::Ignored => None,
     }
 }
 
+#[cfg(test)]
 fn resolve_key(key: KeyEvent, mode: InputMode, keymap: &Keymap) -> Option<Action> {
+    resolve_key_with_context(key, mode, keymap, true)
+}
+
+fn resolve_key_with_context(
+    key: KeyEvent,
+    mode: InputMode,
+    keymap: &Keymap,
+    accepts_text: bool,
+) -> Option<Action> {
     match mode {
         InputMode::QuitConfirmation => {
             if keymap.matches("confirm", key) {
@@ -122,6 +141,8 @@ fn resolve_key(key: KeyEvent, mode: InputMode, keymap: &Keymap) -> Option<Action
         InputMode::Welcome => {
             if keymap.matches("help", key) {
                 Some(Action::OpenHelp)
+            } else if keymap.matches("command_palette", key) {
+                Some(Action::OpenCommandPalette)
             } else if keymap.matches("quit", key) {
                 Some(Action::RequestQuit)
             } else if keymap.matches("welcome_new", key) {
@@ -132,7 +153,7 @@ fn resolve_key(key: KeyEvent, mode: InputMode, keymap: &Keymap) -> Option<Action
                 resolve_overlay_key(key, keymap)
             }
         }
-        InputMode::Normal => resolve_normal_key(key, keymap),
+        InputMode::Normal => resolve_normal_key(key, keymap, accepts_text),
     }
 }
 
@@ -174,9 +195,9 @@ fn resolve_overlay_key(key: KeyEvent, keymap: &Keymap) -> Option<Action> {
     }
 }
 
-fn resolve_normal_key(key: KeyEvent, keymap: &Keymap) -> Option<Action> {
+fn resolve_normal_key(key: KeyEvent, keymap: &Keymap, accepts_text: bool) -> Option<Action> {
     let binding = |name| keymap.matches(name, key);
-    if let Some(character) = printable_character(key) {
+    if accepts_text && let Some(character) = printable_character(key) {
         Some(Action::Insert(character))
     } else if binding("quit") {
         Some(Action::RequestQuit)
@@ -293,7 +314,12 @@ fn printable_character(key: KeyEvent) -> Option<char> {
 fn allows_printable_binding(action: &str) -> bool {
     matches!(
         action,
-        "confirm" | "cancel_confirmation" | "welcome_new" | "welcome_open"
+        "command_palette"
+            | "help"
+            | "confirm"
+            | "cancel_confirmation"
+            | "welcome_new"
+            | "welcome_open"
     )
 }
 
@@ -508,11 +534,9 @@ mod tests {
     }
 
     #[test]
-    fn printable_command_bindings_are_rejected_in_text_modes() {
+    fn printable_bindings_are_limited_to_context_aware_commands() {
         let mut config = Config::default();
-        config
-            .keys
-            .insert("command_palette".to_owned(), vec![":".to_owned()]);
+        config.keys.insert("save".to_owned(), vec![":".to_owned()]);
 
         let result = Keymap::new(&config);
 
@@ -523,6 +547,70 @@ mod tests {
     }
 
     #[test]
+    fn printable_shortcuts_trigger_only_outside_text_contexts() -> Result<(), String> {
+        let keymap = Keymap::new(&Config::default())?;
+        let key = |character| {
+            super::Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::SHIFT))
+        };
+
+        assert!(matches!(
+            super::resolve(key(':'), InputMode::Normal, &keymap, true),
+            Some(Action::Insert(':'))
+        ));
+        assert!(matches!(
+            super::resolve(key('?'), InputMode::Normal, &keymap, true),
+            Some(Action::Insert('?'))
+        ));
+        assert!(matches!(
+            super::resolve(key(':'), InputMode::Normal, &keymap, false),
+            Some(Action::OpenCommandPalette)
+        ));
+        assert!(matches!(
+            super::resolve(key('?'), InputMode::Normal, &keymap, false),
+            Some(Action::OpenHelp)
+        ));
+        assert!(matches!(
+            super::resolve(key(':'), InputMode::Welcome, &keymap, false),
+            Some(Action::OpenCommandPalette)
+        ));
+        assert!(matches!(
+            super::resolve(key('?'), InputMode::Welcome, &keymap, false),
+            Some(Action::OpenHelp)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn printable_contextual_shortcuts_are_remappable() -> Result<(), String> {
+        let mut config = Config::default();
+        config
+            .keys
+            .insert("command_palette".to_owned(), vec![";".to_owned()]);
+        config.keys.insert("help".to_owned(), vec!["!".to_owned()]);
+        let keymap = Keymap::new(&config)?;
+
+        assert!(matches!(
+            super::resolve(
+                super::Event::Key(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::NONE)),
+                InputMode::Normal,
+                &keymap,
+                false
+            ),
+            Some(Action::OpenCommandPalette)
+        ));
+        assert!(matches!(
+            super::resolve(
+                super::Event::Key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::SHIFT)),
+                InputMode::Normal,
+                &keymap,
+                false
+            ),
+            Some(Action::OpenHelp)
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn paste_is_delivered_as_one_text_action() -> Result<(), String> {
         let keymap = Keymap::new(&Config::default())?;
         let text = ":\n?界";
@@ -530,11 +618,13 @@ mod tests {
             super::Event::Paste(text.to_owned()),
             InputMode::Normal,
             &keymap,
+            true,
         );
         let overlay = super::resolve(
             super::Event::Paste(text.to_owned()),
             InputMode::Overlay,
             &keymap,
+            true,
         );
 
         assert!(matches!(
@@ -596,14 +686,15 @@ mod tests {
     fn internal_layout_and_file_events_bypass_input_modes() -> Result<(), String> {
         let keymap = Keymap::new(&Config::default())?;
         assert!(matches!(
-            super::resolve(super::Event::Resize, InputMode::Help, &keymap),
+            super::resolve(super::Event::Resize, InputMode::Help, &keymap, true),
             Some(Action::Resize)
         ));
         assert!(matches!(
             super::resolve(
                 super::Event::ProjectFilesChanged,
                 InputMode::Confirmation,
-                &keymap
+                &keymap,
+                true
             ),
             Some(Action::ProjectFilesChanged)
         ));
