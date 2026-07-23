@@ -25,6 +25,8 @@ pub(crate) enum WelcomeChoice {
 pub(crate) struct Welcome {
     selected: usize,
     recent_count: usize,
+    choose_binding: String,
+    help_binding: String,
     theme: Theme,
 }
 
@@ -35,10 +37,12 @@ impl Welcome {
         (WelcomeChoice::OpenRecent, "Open recent"),
     ];
 
-    pub(crate) fn new(theme: Theme) -> Self {
+    pub(crate) fn new(theme: Theme, choose_binding: String, help_binding: String) -> Self {
         Self {
             selected: 0,
             recent_count: 0,
+            choose_binding,
+            help_binding,
             theme,
         }
     }
@@ -90,8 +94,11 @@ impl Welcome {
         }));
         lines.extend([
             Line::raw(""),
-            Line::raw("Enter to choose  |  ? for help")
-                .style(Style::default().fg(color(self.theme.muted))),
+            Line::raw(format!(
+                "{} choose  |  {} help",
+                self.choose_binding, self.help_binding
+            ))
+            .style(Style::default().fg(color(self.theme.muted))),
         ]);
         frame.render_widget(
             Paragraph::new(lines)
@@ -109,10 +116,14 @@ impl Welcome {
 
 impl Default for Welcome {
     fn default() -> Self {
-        Self::new(Theme::new(
-            typst_tui_theme::ThemeName::Dark,
-            typst_tui_theme::ColorDepth::Ansi16,
-        ))
+        Self::new(
+            Theme::new(
+                typst_tui_theme::ThemeName::Dark,
+                typst_tui_theme::ColorDepth::Ansi16,
+            ),
+            "enter".to_owned(),
+            "?".to_owned(),
+        )
     }
 }
 
@@ -140,7 +151,7 @@ mod tests {
     #[test]
     fn draws_and_selects_available_recent_files() -> Result<(), Infallible> {
         let theme = Theme::new(ThemeName::Dark, ColorDepth::Ansi16);
-        let mut welcome = Welcome::new(theme);
+        let mut welcome = Welcome::new(theme, "ctrl+enter".to_owned(), "alt+h".to_owned());
         welcome.set_recent_count(2);
         welcome.update(Action::OverlayMove(2));
         assert_eq!(welcome.selected(), WelcomeChoice::OpenRecent);
@@ -155,6 +166,8 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Open recent (2)"));
+        assert!(rendered.contains("ctrl+enter choose"));
+        assert!(rendered.contains("alt+h help"));
         Ok(())
     }
 }

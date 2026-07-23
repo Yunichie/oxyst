@@ -26,12 +26,18 @@ impl Help {
 
     pub(crate) fn draw(&self, frame: &mut Frame, area: Rect, keymap: &Keymap, theme: &Theme) {
         frame.render_widget(Clear, area);
+        let title = format!(
+            " Help | scroll: {} / {} | close: {} ",
+            keymap.display("move_up"),
+            keymap.display("move_down"),
+            keymap.display("close_overlay")
+        );
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(color(theme.accent)))
             .style(base(theme))
-            .title(" Help | Up/Down to scroll | Esc to close ");
+            .title(title);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -163,4 +169,43 @@ fn four(keymap: &Keymap, first: &str, second: &str, third: &str, fourth: &str) -
         keymap.display(third),
         keymap.display(fourth)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::{Terminal, backend::TestBackend};
+    use typst_tui_config::Config;
+    use typst_tui_theme::{ColorDepth, Theme, ThemeName};
+
+    use super::{Help, Keymap};
+
+    #[test]
+    fn title_uses_configured_navigation_bindings() -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = Config::default();
+        config
+            .keys
+            .insert("move_up".to_owned(), vec!["alt+k".to_owned()]);
+        config
+            .keys
+            .insert("move_down".to_owned(), vec!["alt+j".to_owned()]);
+        config
+            .keys
+            .insert("close_overlay".to_owned(), vec!["alt+x".to_owned()]);
+        let keymap = Keymap::new(&config).map_err(std::io::Error::other)?;
+        let theme = Theme::new(ThemeName::Dark, ColorDepth::Ansi16);
+        let help = Help::default();
+        let mut terminal = Terminal::new(TestBackend::new(80, 12))?;
+        terminal.draw(|frame| help.draw(frame, frame.area(), &keymap, &theme))?;
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("scroll: alt+k / alt+j"));
+        assert!(rendered.contains("close: alt+x"));
+        Ok(())
+    }
 }

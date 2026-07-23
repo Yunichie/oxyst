@@ -152,7 +152,8 @@ impl App {
             keymap.display("cancel_confirmation"),
         );
         let welcome = path.is_none().then(|| {
-            let mut welcome = Welcome::new(theme);
+            let mut welcome =
+                Welcome::new(theme, keymap.display("newline"), keymap.display("help"));
             welcome.set_recent_count(recent.entries().len());
             welcome
         });
