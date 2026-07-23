@@ -1,0 +1,78 @@
+# oxyst configuration
+# This template contains every configurable value with its built-in default.
+
+# Available themes: "dark" and "light".
+theme = "dark"
+
+[keys]
+# Session
+quit = ["ctrl+q"]
+save = ["ctrl+s"]
+recompile = ["ctrl+r"]
+
+# Editing
+undo = ["ctrl+z"]
+redo = ["ctrl+y", "ctrl+shift+z"]
+backspace = ["backspace"]
+delete = ["delete"]
+newline = ["enter"]
+select_all = ["ctrl+a"]
+copy = ["ctrl+c"]
+cut = ["ctrl+x"]
+paste = ["ctrl+v"]
+
+# Cursor movement
+move_left = ["left"]
+move_right = ["right"]
+move_up = ["up"]
+move_down = ["down"]
+word_left = ["ctrl+left"]
+word_right = ["ctrl+right"]
+line_start = ["home"]
+line_end = ["end"]
+document_start = ["ctrl+home"]
+document_end = ["ctrl+end"]
+
+# Selection
+select_left = ["shift+left"]
+select_right = ["shift+right"]
+select_up = ["shift+up"]
+select_down = ["shift+down"]
+select_word_left = ["ctrl+shift+left"]
+select_word_right = ["ctrl+shift+right"]
+select_line_start = ["shift+home"]
+select_line_end = ["shift+end"]
+select_document_start = ["ctrl+shift+home"]
+select_document_end = ["ctrl+shift+end"]
+
+# Search and replace
+find = ["ctrl+f"]
+find_replace = ["ctrl+h"]
+find_next = ["enter"]
+find_previous = ["shift+enter"]
+search_toggle_field = ["tab"]
+replace_current = ["ctrl+enter"]
+
+# Layout and preview
+switch_focus = ["tab", "f6"]
+fullscreen = ["f2"]
+zoom_in = ["ctrl+="]
+zoom_out = ["ctrl+-"]
+preview_page_up = ["ctrl+pageup"]
+preview_page_down = ["ctrl+pagedown"]
+
+# Tools and overlays
+command_palette = ["ctrl+shift+p", ":"]
+toggle_diagnostics = ["ctrl+j"]
+next_diagnostic = ["f8"]
+previous_diagnostic = ["shift+f8"]
+toggle_file_explorer = ["ctrl+b"]
+go_to_line = ["ctrl+g"]
+help = ["f1", "?"]
+close_overlay = ["esc"]
+
+# Prompts and welcome screen
+confirm = ["y"]
+cancel_confirmation = ["n", "esc"]
+welcome_new = ["n"]
+welcome_open = ["o"]
