@@ -15,7 +15,7 @@ pub enum ColorDepth {
 impl ColorDepth {
     #[must_use]
     pub fn detect() -> Self {
-        if env::var_os("WT_SESSION").is_some() || env::var_os("TERM_PROGRAM").is_some() {
+        if env::var_os("WT_SESSION").is_some() {
             return Self::TrueColor;
         }
         Self::from_environment(
@@ -26,11 +26,14 @@ impl ColorDepth {
 
     #[must_use]
     pub fn from_environment(term: Option<&str>, color_term: Option<&str>) -> Self {
+        let term = term.map(str::to_ascii_lowercase);
         if color_term.is_some_and(|value| {
             value.eq_ignore_ascii_case("truecolor") || value.eq_ignore_ascii_case("24bit")
+        }) || term.as_deref().is_some_and(|value| {
+            value.contains("truecolor") || value.contains("24bit") || value.ends_with("-direct")
         }) {
             Self::TrueColor
-        } else if term.is_some_and(|value| value.to_ascii_lowercase().contains("256color")) {
+        } else if term.is_some_and(|value| value.contains("256color")) {
             Self::Ansi256
         } else {
             Self::Ansi16
@@ -333,6 +336,19 @@ mod tests {
             ColorDepth::from_environment(Some("vt100"), None),
             ColorDepth::Ansi16
         );
+        assert_eq!(
+            ColorDepth::from_environment(Some("xterm-direct"), None),
+            ColorDepth::TrueColor
+        );
+        assert_eq!(
+            ColorDepth::from_environment(Some("XTERM-24BIT"), None),
+            ColorDepth::TrueColor
+        );
+        assert_eq!(
+            ColorDepth::from_environment(Some("xterm"), Some("TRUECOLOR")),
+            ColorDepth::TrueColor
+        );
+        assert_eq!(ColorDepth::from_environment(None, None), ColorDepth::Ansi16);
     }
 
     #[test]
