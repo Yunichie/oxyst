@@ -1,5 +1,7 @@
 use ratatui::style::{Color as RatatuiColor, Modifier, Style};
 use typst_tui_theme::{Color, TextStyle, Theme};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 pub(crate) fn color(color: Color) -> RatatuiColor {
     match color {
@@ -46,4 +48,27 @@ pub(crate) fn base(theme: &Theme) -> Style {
     Style::default()
         .fg(color(theme.foreground))
         .bg(color(theme.background))
+}
+
+pub(crate) fn truncate(text: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+
+    let content_width = width - 1;
+    let mut result = String::new();
+    let mut used = 0;
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if used + grapheme_width > content_width {
+            break;
+        }
+        result.push_str(grapheme);
+        used += grapheme_width;
+    }
+    result.push('…');
+    result
 }
