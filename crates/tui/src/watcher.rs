@@ -1,7 +1,11 @@
 use std::{
     env, fs,
     path::{Component, Path, PathBuf},
-    sync::mpsc::Sender,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::Sender,
+    },
 };
 
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher, event::ModifyKind};
@@ -11,6 +15,7 @@ use crate::event::Event as AppEvent;
 pub(crate) struct ProjectWatcher {
     _watcher: RecommendedWatcher,
     sender: Sender<AppEvent>,
+    project_change_pending: Arc<AtomicBool>,
 }
 
 impl ProjectWatcher {
@@ -24,8 +29,16 @@ impl ProjectWatcher {
         let main = main.map(|path| absolute_path(path, &root));
         let callback_sender = sender.clone();
         let callback_root = root.clone();
+        let project_change_pending = Arc::new(AtomicBool::new(false));
+        let callback_pending = Arc::clone(&project_change_pending);
         let mut watcher = notify::recommended_watcher(move |result| {
-            forward(result, &callback_root, main.as_deref(), &callback_sender);
+            forward(
+                result,
+                &callback_root,
+                main.as_deref(),
+                &callback_sender,
+                &callback_pending,
+            );
         })
         .map_err(|error| format!("could not initialize project watcher: {error}"))?;
         watcher
@@ -35,12 +48,17 @@ impl ProjectWatcher {
         Ok(Self {
             _watcher: watcher,
             sender,
+            project_change_pending,
         })
     }
 
     pub(crate) fn retarget(&mut self, root: &Path, main: Option<&Path>) -> Result<(), String> {
         *self = Self::new(root, main, self.sender.clone())?;
         Ok(())
+    }
+
+    pub(crate) fn acknowledge_project_files_changed(&self) {
+        self.project_change_pending.store(false, Ordering::Release);
     }
 }
 
@@ -49,10 +67,15 @@ fn forward(
     root: &Path,
     main: Option<&Path>,
     sender: &Sender<AppEvent>,
+    project_change_pending: &AtomicBool,
 ) {
     match result {
         Ok(event) if event_requires_compile(&event, root, main) => {
-            let _ = sender.send(AppEvent::ProjectFilesChanged);
+            if !project_change_pending.swap(true, Ordering::AcqRel)
+                && sender.send(AppEvent::ProjectFilesChanged).is_err()
+            {
+                project_change_pending.store(false, Ordering::Release);
+            }
         }
         Ok(_) => {}
         Err(error) => {
@@ -106,7 +129,10 @@ mod tests {
     use std::{
         error::Error,
         fs,
-        sync::mpsc::channel,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc::{TryRecvError, channel},
+        },
         time::{Duration, SystemTime},
     };
 
@@ -115,7 +141,7 @@ mod tests {
         event::{AccessKind, AccessMode, DataChange, Flag, MetadataKind, ModifyKind},
     };
 
-    use super::{ProjectWatcher, event_requires_compile};
+    use super::{ProjectWatcher, event_requires_compile, forward};
     use crate::event::Event as AppEvent;
 
     #[test]
@@ -167,6 +193,35 @@ mod tests {
 
         let rescan = Event::new(EventKind::Other).set_flag(Flag::Rescan);
         assert!(event_requires_compile(&rescan, &root, None));
+        Ok(())
+    }
+
+    #[test]
+    fn coalesces_project_change_bursts_until_acknowledged() -> Result<(), Box<dyn Error>> {
+        let root = std::env::current_dir()?;
+        let changed = || {
+            Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+                .add_path(root.join("included.typ"))
+        };
+        let (sender, receiver) = channel();
+        let pending = AtomicBool::new(false);
+
+        for _ in 0..100 {
+            forward(Ok(changed()), &root, None, &sender, &pending);
+        }
+
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(1))?,
+            AppEvent::ProjectFilesChanged
+        ));
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+
+        pending.store(false, Ordering::Release);
+        forward(Ok(changed()), &root, None, &sender, &pending);
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(1))?,
+            AppEvent::ProjectFilesChanged
+        ));
         Ok(())
     }
 

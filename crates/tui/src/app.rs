@@ -39,6 +39,7 @@ use crate::{
 const NARROW_WIDTH: u16 = 80;
 const AUTO_COMPILE_DELAY: Duration = Duration::from_millis(150);
 const CURSOR_SYNC_DELAY: Duration = Duration::from_millis(50);
+const COMPILE_STALLED_AFTER: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompileState {
@@ -46,6 +47,7 @@ enum CompileState {
     Compiling,
     Ready,
     Stale,
+    Stalled,
     Failed(usize),
     Error,
 }
@@ -99,6 +101,7 @@ pub(crate) struct App {
     compiled_document: Option<(u64, CompiledDocument)>,
     document_sync: Option<(u64, DocumentSync)>,
     cursor_sync_deadline: Option<Instant>,
+    compile_started_at: Option<Instant>,
     compile_state: CompileState,
     diagnostics: Diagnostics,
     last_compile_time: Option<Duration>,
@@ -180,6 +183,7 @@ impl App {
             compiled_document: None,
             document_sync: None,
             cursor_sync_deadline: None,
+            compile_started_at: None,
             compile_state: CompileState::NotStarted,
             diagnostics: Diagnostics::new(theme),
             last_compile_time: None,
@@ -264,6 +268,7 @@ impl App {
             Action::ExportFinished(result) => self.finish_export(result),
             Action::Resize => {}
             Action::ProjectFilesChanged => {
+                self.watcher.acknowledge_project_files_changed();
                 self.explorer.mark_dirty();
                 self.schedule_compile(true, true);
             }
@@ -647,6 +652,7 @@ impl App {
             match generation {
                 Ok(generation) => self.compile_generation = generation,
                 Err(error) => {
+                    self.compile_started_at = None;
                     self.compile_state = CompileState::Error;
                     self.status = Some(error);
                     return;
@@ -654,6 +660,7 @@ impl App {
             }
             self.compile_debounce.schedule(Instant::now());
             self.cursor_sync_deadline = None;
+            self.compile_started_at = None;
             self.compile_state = CompileState::Stale;
             self.preview_stale = true;
         } else if self.editor.cursor_byte_index() != cursor {
@@ -779,12 +786,21 @@ impl App {
     }
 
     fn tick(&mut self) {
-        if self.compile_debounce.take_due(Instant::now()) {
+        let now = Instant::now();
+        if self.compile_debounce.take_due(now) {
             self.start_compile();
+        }
+        if self.compile_state == CompileState::Compiling
+            && self
+                .compile_started_at
+                .is_some_and(|started| now.duration_since(started) >= COMPILE_STALLED_AFTER)
+        {
+            self.compile_state = CompileState::Stalled;
+            self.status = Some("Compilation is taking longer than expected".to_owned());
         }
         if self
             .cursor_sync_deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
+            .is_some_and(|deadline| now >= deadline)
         {
             self.cursor_sync_deadline = None;
             self.sync_cursor_to_preview();
@@ -814,12 +830,14 @@ impl App {
         match invalidated {
             Ok(generation) => self.compile_generation = generation,
             Err(error) => {
+                self.compile_started_at = None;
                 self.compile_state = CompileState::Error;
                 self.status = Some(error);
                 return;
             }
         }
         self.compile_debounce.schedule(Instant::now());
+        self.compile_started_at = None;
         self.compile_state = CompileState::Stale;
         self.preview_stale |= mark_preview_stale;
     }
@@ -837,6 +855,7 @@ impl App {
             self.preview.target_width(),
             self.preview_render_cache.clone(),
         );
+        self.compile_started_at = Some(Instant::now());
         self.compile_state = CompileState::Compiling;
         self.status = None;
     }
@@ -857,6 +876,7 @@ impl App {
                 source: self.editor.text(),
             },
         );
+        self.compile_started_at = Some(Instant::now());
         self.compile_state = CompileState::Compiling;
         self.status = None;
     }
@@ -865,6 +885,7 @@ impl App {
         if result.generation != self.compile_generation {
             return;
         }
+        self.compile_started_at = None;
         if result.revision != self.editor.revision() {
             self.compile_state = CompileState::Stale;
             self.status = None;
@@ -1122,6 +1143,7 @@ impl App {
             CompileState::Compiling => "● compiling".to_owned(),
             CompileState::Ready => "✓ up to date".to_owned(),
             CompileState::Stale => "● preview stale".to_owned(),
+            CompileState::Stalled => "● compilation stalled".to_owned(),
             CompileState::Failed(errors) => format!("✕ {errors} errors"),
             CompileState::Error => "✕ preview error".to_owned(),
         }
@@ -1130,7 +1152,9 @@ impl App {
     fn compile_color(&self) -> Color {
         match self.compile_state {
             CompileState::Failed(_) | CompileState::Error => self.theme.error,
-            CompileState::Stale | CompileState::Compiling => self.theme.warning,
+            CompileState::Stale | CompileState::Compiling | CompileState::Stalled => {
+                self.theme.warning
+            }
             CompileState::Ready => self.theme.success,
             CompileState::NotStarted => self.theme.muted,
         }
@@ -1151,7 +1175,7 @@ mod tests {
     use typst_tui_compiler::Compiler;
     use typst_tui_config::Config;
 
-    use super::{App, AppInit, CompileDebounce, CompileState};
+    use super::{App, AppInit, COMPILE_STALLED_AFTER, CompileDebounce, CompileState};
 
     #[test]
     fn compile_debounce_restarts_after_each_edit() {
@@ -1168,7 +1192,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_and_width_changes_invalidate_and_debounce() -> Result<(), Box<dyn Error>> {
+    fn resource_width_and_stalled_compile_states_are_tracked() -> Result<(), Box<dyn Error>> {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
         let main = root.join("simple.typ");
         let source = fs::read_to_string(&main)?;
@@ -1202,6 +1226,16 @@ mod tests {
         assert!(app.compile_generation > resource_generation);
         assert!(app.compile_debounce.deadline.is_some());
         assert!(!app.preview_stale);
+
+        app.compile_debounce.cancel();
+        app.compile_state = CompileState::Compiling;
+        app.compile_started_at = Some(Instant::now() - COMPILE_STALLED_AFTER);
+        app.tick();
+        assert_eq!(app.compile_state, CompileState::Stalled);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Compilation is taking longer than expected")
+        );
 
         drop(app);
         runtime.shutdown_timeout(Duration::from_millis(100));
