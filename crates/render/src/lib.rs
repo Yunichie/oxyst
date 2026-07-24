@@ -317,10 +317,12 @@ pub fn render_pages_cached_cancellable(
             image
         } else {
             let pixmap = typst_render::render(page, &options);
+            let width = pixmap.width();
+            let height = pixmap.height();
             let image = Arc::new(rendered_image(
-                pixmap.width(),
-                pixmap.height(),
-                pixmap.data(),
+                width,
+                height,
+                pixmap.take_demultiplied(),
                 index,
             )?);
             next_cache.insert(key, Arc::clone(&image));
@@ -364,13 +366,15 @@ pub fn render_pages_cancellable(
             .ok_or(Error::PageOutOfBounds { page: index + 1 })?;
         validate_page_fingerprint(page, *metadata)?;
         let pixmap = typst_render::render(page, &options);
+        let width = pixmap.width();
+        let height = pixmap.height();
         pages.push(RenderedPage {
             index,
             image: PageImage {
                 image: Arc::new(rendered_image(
-                    pixmap.width(),
-                    pixmap.height(),
-                    pixmap.data(),
+                    width,
+                    height,
+                    pixmap.take_demultiplied(),
                     index,
                 )?),
             },
@@ -378,19 +382,6 @@ pub fn render_pages_cancellable(
     }
 
     Ok(pages)
-}
-
-fn render_at(document: &CompiledDocument, pixels_per_point: f64) -> Result<Vec<PageImage>, Error> {
-    let manifest = manifest_at(document, pixels_per_point)?;
-    validate_total_pixels(&manifest)?;
-    render_pages_cached_cancellable(
-        document,
-        &manifest,
-        0..manifest.pages.len(),
-        &RenderCache::default(),
-        || false,
-    )
-    .map(|(pages, _)| pages.into_iter().map(RenderedPage::into_image).collect())
 }
 
 fn manifest_at(
@@ -437,9 +428,12 @@ fn validate_page_fingerprint(page: &impl Hash, metadata: PageMetadata) -> Result
         .ok_or(Error::ManifestMismatch)
 }
 
-fn rendered_image(width: u32, height: u32, data: &[u8], index: usize) -> Result<RgbaImage, Error> {
-    let mut rgba = data.to_vec();
-    unpremultiply(&mut rgba);
+fn rendered_image(
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+    index: usize,
+) -> Result<RgbaImage, Error> {
     RgbaImage::from_raw(width, height, rgba).ok_or(Error::InvalidPixelData { page: index + 1 })
 }
 
@@ -453,19 +447,6 @@ fn validate_total_pixels(manifest: &RenderManifest) -> Result<(), Error> {
         }
     }
     Ok(())
-}
-
-fn unpremultiply(rgba: &mut [u8]) {
-    for pixel in rgba.chunks_exact_mut(4) {
-        let alpha = u32::from(pixel[3]);
-        if alpha == 0 || alpha == 255 {
-            continue;
-        }
-
-        for channel in &mut pixel[..3] {
-            *channel = ((u32::from(*channel) * 255 + alpha / 2) / alpha).min(255) as u8;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -483,15 +464,8 @@ mod tests {
 
     use super::{
         MAX_CACHED_PAGES, RenderCache, render_cached_cancellable, render_manifest,
-        render_pages_cached_cancellable, render_pages_cancellable, unpremultiply,
+        render_pages_cached_cancellable, render_pages_cancellable,
     };
-
-    #[test]
-    fn converts_premultiplied_alpha() {
-        let mut pixel = [64, 32, 16, 128];
-        unpremultiply(&mut pixel);
-        assert_eq!(pixel, [128, 64, 32, 128]);
-    }
 
     #[test]
     fn reuses_unchanged_page_images_at_the_same_scale() -> Result<(), Box<dyn Error>> {
