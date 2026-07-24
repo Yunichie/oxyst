@@ -56,6 +56,7 @@ impl Editor {
 
     pub(crate) fn from_source(source: Source, theme: Theme, soft_wrap: bool) -> Self {
         let line_count = source.lines().len_lines();
+        let word_count = source.text().unicode_words().count();
         Self {
             document: Document::new(source.text()),
             scroll: VisualPosition::default(),
@@ -69,7 +70,7 @@ impl Editor {
             layout_width: 0,
             horizontal_scroll: 0,
             soft_wrap,
-            word_count: 0,
+            word_count,
             preferred_visual_column: None,
             diagnostic_lines: BTreeMap::new(),
             bracket_cache: None,
@@ -112,6 +113,7 @@ impl Editor {
                 self.apply_source_edit(&edit);
             } else {
                 self.source.replace(&self.document.text());
+                self.word_count = self.source.text().unicode_words().count();
                 self.reset_layout();
             }
         }
@@ -383,10 +385,15 @@ impl Editor {
             .byte_to_line(range.end)
             .unwrap_or(old_line_count.saturating_sub(1));
         let metrics_match = self.line_rows.len() == old_line_count;
+        let word_count_window = edit_word_count_window(&self.source, range.clone());
+        let removed_words = self.source.text()[word_count_window.clone()]
+            .unicode_words()
+            .count();
 
         self.source.edit(range.clone(), edit.replacement());
 
         if !metrics_match {
+            self.word_count = self.source.text().unicode_words().count();
             self.reset_layout();
             return;
         }
@@ -401,6 +408,17 @@ impl Editor {
             .lines()
             .byte_to_line(replacement_end)
             .unwrap_or(new_line_count.saturating_sub(1));
+        let replacement_window_end = word_count_window
+            .end
+            .saturating_sub(range.end.saturating_sub(range.start))
+            .saturating_add(edit.replacement().len());
+        let added_words = self.source.text()[word_count_window.start..replacement_window_end]
+            .unicode_words()
+            .count();
+        self.word_count = self
+            .word_count
+            .saturating_sub(removed_words)
+            .saturating_add(added_words);
         let replacement_rows = (start_line..=new_end_line)
             .map(|line| {
                 if self.layout_width == 0 || !self.soft_wrap {
@@ -692,12 +710,6 @@ impl Editor {
         self.word_count
     }
 
-    pub(crate) fn set_word_count(&mut self, revision: u64, word_count: usize) {
-        if revision == self.revision() {
-            self.word_count = word_count;
-        }
-    }
-
     pub(crate) fn find(&self, query: &str, reverse: bool) -> Option<Range<usize>> {
         let cursor = if reverse {
             self.selection_byte_range()
@@ -804,6 +816,33 @@ fn source_line_content(source: &Source, line: usize) -> Option<(usize, &str)> {
         '\r', '\n', '\u{000B}', '\u{000C}', '\u{0085}', '\u{2028}', '\u{2029}',
     ]);
     Some((range.start, content))
+}
+
+fn edit_word_count_window(source: &Source, edit: Range<usize>) -> Range<usize> {
+    let line_count = source.lines().len_lines();
+    if line_count == 0 {
+        return 0..source.text().len();
+    }
+    let start_line = source
+        .lines()
+        .byte_to_line(edit.start)
+        .unwrap_or(line_count - 1)
+        .saturating_sub(1);
+    let end_line = source
+        .lines()
+        .byte_to_line(edit.end)
+        .unwrap_or(line_count - 1)
+        .saturating_add(1)
+        .min(line_count - 1);
+    let start = source
+        .lines()
+        .line_to_range(start_line)
+        .map_or(0, |range| range.start);
+    let end = source
+        .lines()
+        .line_to_range(end_line)
+        .map_or(source.text().len(), |range| range.end);
+    start..end
 }
 
 fn find_from(text: &str, query: &str, cursor: usize, reverse: bool) -> Option<Range<usize>> {
@@ -1383,6 +1422,7 @@ mod tests {
     use oxyst_theme::{ColorDepth, Theme, ThemeName};
     use ratatui::{Terminal, backend::TestBackend, style::Color};
     use typst_syntax::Source;
+    use unicode_segmentation::UnicodeSegmentation;
 
     use super::{
         Component, Diagnostics, Editor, VisualPosition, find_from, line_row_count,
@@ -1735,15 +1775,59 @@ mod tests {
     }
 
     #[test]
-    fn stale_background_word_counts_do_not_replace_the_current_count() {
-        let mut editor = Editor::new("one two", theme(), false);
-        let original_revision = editor.revision();
-        editor.set_word_count(original_revision, 2);
+    fn word_count_tracks_local_multiline_and_history_edits() -> Result<(), &'static str> {
+        let mut editor = Editor::new("one two\r\nnaïve cafe\u{301}\nthree", theme(), false);
+        let assert_count = |editor: &Editor| {
+            assert_eq!(
+                editor.word_count(),
+                editor.source.text().unicode_words().count()
+            );
+        };
+        assert_count(&editor);
 
-        editor.update(Action::Insert('x'));
-        editor.set_word_count(original_revision, 99);
+        editor.update(Action::Move(Motion::DocumentEnd));
+        editor.update(Action::InsertText("\nnew words".to_owned()));
+        assert_count(&editor);
 
-        assert_eq!(editor.word_count(), 2);
+        let newline = editor
+            .source
+            .text()
+            .find("\r\n")
+            .ok_or("test source does not contain CRLF")?;
+        assert!(editor.select_byte_range(newline..newline + 2));
+        editor.update(Action::Delete);
+        assert_count(&editor);
+
+        editor.update(Action::Undo);
+        assert_count(&editor);
+        editor.update(Action::Redo);
+        assert_count(&editor);
+        Ok(())
+    }
+
+    #[test]
+    fn word_count_matches_full_count_across_edit_boundaries() {
+        let original = "alpha\r\nnaive cafe\u{301}\ncan't_stop Tokyo\nomega";
+        let mut boundaries = original
+            .char_indices()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        boundaries.push(original.len());
+
+        for &start in &boundaries {
+            for &end in boundaries.iter().filter(|&&end| end >= start) {
+                for replacement in ["", "x", "two words", "\n", "\r\njoined", "\u{301}mark"] {
+                    let mut editor = Editor::new(original, theme(), false);
+                    assert!(editor.select_byte_range(start..end));
+                    editor.update(Action::InsertText(replacement.to_owned()));
+                    assert_eq!(
+                        editor.word_count(),
+                        editor.source.text().unicode_words().count(),
+                        "range {start}..{end}, replacement {replacement:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1950,5 +2034,38 @@ mod tests {
         assert_eq!(editor.line_rows.len(), 100_000);
         assert!(editor.viewport_rows.len() <= usize::from(editor.text_area.height));
         Ok(())
+    }
+
+    #[test]
+    #[ignore = "manual release-mode performance probe"]
+    fn incremental_word_count_reports_latency() {
+        let text = "alpha beta gamma delta\n".repeat(400_000);
+        let source = Source::detached(&text);
+        let line = source.lines().len_lines().saturating_sub(1);
+        let mut full_samples = Vec::new();
+        let mut local_samples = Vec::new();
+
+        for _ in 0..31 {
+            let started = Instant::now();
+            let full = std::hint::black_box(source.text()).unicode_words().count();
+            full_samples.push(started.elapsed());
+            assert_eq!(full, 1_600_000);
+
+            let started = Instant::now();
+            let line_start = source
+                .lines()
+                .line_to_range(line)
+                .map_or(source.text().len(), |range| range.start);
+            let window = super::edit_word_count_window(&source, line_start..line_start);
+            let local = source.text()[window].unicode_words().count();
+            local_samples.push(started.elapsed());
+            assert!(local <= 8);
+        }
+        full_samples.sort_unstable();
+        local_samples.sort_unstable();
+        eprintln!(
+            "9 MiB word count: full_p50={:?}, full_p95={:?}, local_p50={:?}, local_p95={:?}",
+            full_samples[15], full_samples[29], local_samples[15], local_samples[29]
+        );
     }
 }
