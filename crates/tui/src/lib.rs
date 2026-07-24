@@ -6,6 +6,7 @@ mod clipboard;
 mod compile;
 mod components;
 mod event;
+mod explorer;
 mod export;
 mod input;
 mod recent;

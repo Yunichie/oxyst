@@ -31,6 +31,7 @@ use crate::{
         StatusBarState, Welcome, WelcomeChoice, format_diagnostic,
     },
     event::{self, Event},
+    explorer::{ExplorerScanResult, ExplorerWorker},
     export::{ExportResult, ExportWorker},
     input::{self, InputMode, Keymap},
     recent::RecentFiles,
@@ -108,6 +109,8 @@ pub(crate) struct App {
     workspace: Workspace,
     picker: Picker,
     compile_worker: CompileWorker,
+    explorer_worker: ExplorerWorker,
+    explorer_scan_generation: u64,
     export_worker: ExportWorker,
     watcher: ProjectWatcher,
     internal_events: Receiver<Event>,
@@ -181,6 +184,7 @@ impl App {
         });
         let (sender, internal_events) = channel();
         let watcher = ProjectWatcher::new(&root, path.as_deref(), sender.clone())?;
+        let explorer_worker = ExplorerWorker::new(sender.clone(), runtime.clone());
         let mut source = compiler.main_source();
         source.replace(text);
 
@@ -196,6 +200,8 @@ impl App {
             workspace: Workspace::new(path, root, root_is_explicit),
             picker,
             compile_worker: CompileWorker::new(compiler, sender.clone(), runtime.clone()),
+            explorer_worker,
+            explorer_scan_generation: 0,
             export_worker: ExportWorker::new(sender, runtime),
             watcher,
             internal_events,
@@ -299,18 +305,11 @@ impl App {
             Action::Save => self.save(),
             Action::Recompile => self.start_compile(),
             Action::CompileFinished(result) => self.finish_compile(result),
-            Action::WordCountFinished(result) if result.generation == self.compile_generation => {
-                self.editor.set_word_count(result.revision, result.count);
-            }
-            Action::WordCountFinished(_) => {}
             Action::PreviewPagesFinished(result) => self.finish_preview_pages(result),
+            Action::ExplorerScanFinished(result) => self.finish_explorer_scan(result),
             Action::ExportFinished(result) => self.finish_export(result),
             Action::Resize => {}
-            Action::ProjectFilesChanged => {
-                self.watcher.acknowledge_project_files_changed();
-                self.explorer.mark_dirty();
-                self.schedule_compile(true, true);
-            }
+            Action::ProjectFilesChanged => self.project_files_changed(),
             Action::FileWatchFailed(error) => {
                 self.status = Some(format!("File watch failed: {error}"));
             }
@@ -518,7 +517,7 @@ impl App {
         self.document_sync = None;
         self.compiled_document = None;
         self.workspace.opened(path.clone(), root.clone());
-        self.explorer.set_root(root);
+        self.set_explorer_root(root);
         self.welcome = None;
         self.focus = Pane::Editor;
         self.fullscreen = false;
@@ -568,7 +567,7 @@ impl App {
             .watcher
             .retarget(self.workspace.root(), Some(&path))
             .err();
-        self.explorer.set_root(self.workspace.root().to_owned());
+        self.set_explorer_root(self.workspace.root().to_owned());
         self.start_compile_with_world();
         self.record_recent(&path);
         if let Some(error) = watch_error {
@@ -676,8 +675,49 @@ impl App {
         self.explorer.toggle();
         if self.explorer.is_visible() {
             self.focus = Pane::Explorer;
+            if !self.explorer.is_loaded() {
+                self.start_explorer_scan();
+            }
         } else if self.focus == Pane::Explorer {
             self.focus = Pane::Editor;
+        }
+    }
+
+    fn project_files_changed(&mut self) {
+        match self.watcher.take_project_changes() {
+            Ok(changes) => {
+                let paths = changes.paths();
+                if changes.requires_rescan() || self.explorer.apply_paths(&paths) {
+                    self.explorer.invalidate();
+                    self.explorer_scan_generation = 0;
+                    if self.explorer.is_visible() {
+                        self.start_explorer_scan();
+                    }
+                }
+            }
+            Err(error) => self.status = Some(error),
+        }
+        self.schedule_compile(true, true);
+    }
+
+    fn set_explorer_root(&mut self, root: PathBuf) {
+        self.explorer.set_root(root);
+        self.explorer_scan_generation = 0;
+        if self.explorer.is_visible() {
+            self.start_explorer_scan();
+        }
+    }
+
+    fn start_explorer_scan(&mut self) {
+        self.explorer_scan_generation =
+            self.explorer_worker.spawn(self.workspace.root().to_owned());
+    }
+
+    fn finish_explorer_scan(&mut self, result: ExplorerScanResult) {
+        if result.generation == self.explorer_scan_generation
+            && result.root == self.workspace.root()
+        {
+            self.explorer.install_files(result.files);
         }
     }
 
@@ -1485,12 +1525,9 @@ mod tests {
         app.preview.set_viewport(Rect::new(0, 0, 52, 20));
         app.observe_preview_width();
         assert_eq!(app.compile_generation, generation);
-        let result = loop {
-            match app.internal_events.recv_timeout(Duration::from_secs(30))? {
-                Event::CompileFinished(result) => break result,
-                Event::WordCountFinished(_) => {}
-                _ => return Err("worker returned an unexpected event".into()),
-            }
+        let result = match app.internal_events.recv_timeout(Duration::from_secs(30))? {
+            Event::CompileFinished(result) => result,
+            _ => return Err("worker returned an unexpected event".into()),
         };
         app.finish_compile(result);
         assert_eq!(app.compile_generation, generation);
@@ -1633,7 +1670,6 @@ mod tests {
             startup_status: None,
         })
         .map_err(std::io::Error::other)?;
-        app.editor.set_word_count(app.editor.revision(), 2);
         crate::components::Component::update(&mut app.editor, crate::action::Action::Insert('x'));
         app.compile_state = CompileState::Ready;
         let mut terminal = Terminal::new(TestBackend::new(100, 20))?;

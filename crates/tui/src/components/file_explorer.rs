@@ -12,12 +12,9 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph},
 };
 
-use crate::{action::Action, style::color};
+use crate::{action::Action, explorer::MAX_FILES, style::color};
 
 use super::Component;
-
-const MAX_FILES: usize = 512;
-const MAX_DEPTH: usize = 8;
 
 #[derive(Debug)]
 pub(crate) struct FileExplorer {
@@ -27,31 +24,30 @@ pub(crate) struct FileExplorer {
     scroll: usize,
     viewport_height: usize,
     visible: bool,
-    dirty: bool,
+    loaded: bool,
     theme: Theme,
 }
 
 impl FileExplorer {
     pub(crate) fn new(root: PathBuf, theme: Theme) -> Self {
-        let mut explorer = Self {
+        Self {
             root,
             files: Vec::new(),
             selected: 0,
             scroll: 0,
             viewport_height: 0,
             visible: false,
-            dirty: false,
+            loaded: false,
             theme,
-        };
-        explorer.refresh();
-        explorer
+        }
     }
 
     pub(crate) fn set_root(&mut self, root: PathBuf) {
         self.root = root;
+        self.files.clear();
         self.selected = 0;
         self.scroll = 0;
-        self.refresh();
+        self.loaded = false;
     }
 
     pub(crate) fn set_theme(&mut self, theme: Theme) {
@@ -82,14 +78,53 @@ impl FileExplorer {
         self.files.get(self.selected).cloned()
     }
 
-    pub(crate) fn mark_dirty(&mut self) {
-        self.dirty = true;
+    pub(crate) fn is_loaded(&self) -> bool {
+        self.loaded
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        self.loaded = false;
+    }
+
+    pub(crate) fn install_files(&mut self, mut files: Vec<PathBuf>) {
+        let selected = self.selected_path();
+        files.sort();
+        files.dedup();
+        files.truncate(MAX_FILES);
+        self.files = files;
+        self.loaded = true;
+        self.restore_selection(selected);
+    }
+
+    pub(crate) fn apply_paths(&mut self, paths: &[PathBuf]) -> bool {
+        if !self.loaded {
+            return true;
+        }
+        let selected = self.selected_path();
+        let mut needs_rescan = false;
+        for path in paths {
+            if !is_typst_path(path) || !path.starts_with(&self.root) {
+                continue;
+            }
+            let include = fs::symlink_metadata(path)
+                .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink());
+            match (self.files.binary_search(path), include) {
+                (Ok(_), true) | (Err(_), false) => {}
+                (Ok(index), false) => {
+                    needs_rescan |= self.files.len() == MAX_FILES;
+                    self.files.remove(index);
+                }
+                (Err(index), true) if self.files.len() < MAX_FILES => {
+                    self.files.insert(index, path.clone());
+                }
+                (Err(_), true) => needs_rescan = true,
+            }
+        }
+        self.restore_selection(selected);
+        needs_rescan
     }
 
     fn draw_explorer(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
-        if self.dirty {
-            self.refresh();
-        }
         let border = if focused {
             self.theme.accent
         } else {
@@ -126,15 +161,10 @@ impl FileExplorer {
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
-    fn refresh(&mut self) {
-        let selected = self.selected_path();
-        self.files.clear();
-        scan(&self.root, 0, &mut self.files);
-        self.files.sort();
+    fn restore_selection(&mut self, selected: Option<PathBuf>) {
         self.selected = selected
             .and_then(|selected| self.files.iter().position(|path| path == &selected))
             .unwrap_or_else(|| self.selected.min(self.files.len().saturating_sub(1)));
-        self.dirty = false;
         self.keep_selection_visible();
     }
 
@@ -171,34 +201,8 @@ impl Component for FileExplorer {
     }
 }
 
-fn scan(directory: &Path, depth: usize, files: &mut Vec<PathBuf>) {
-    if depth > MAX_DEPTH || files.len() >= MAX_FILES {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if files.len() >= MAX_FILES {
-            return;
-        }
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_symlink() {
-            continue;
-        }
-        if file_type.is_dir() {
-            if !entry.file_name().to_string_lossy().starts_with('.')
-                && entry.file_name() != "target"
-            {
-                scan(&path, depth + 1, files);
-            }
-        } else if path.extension().is_some_and(|extension| extension == "typ") {
-            files.push(path);
-        }
-    }
+fn is_typst_path(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "typ")
 }
 
 #[cfg(test)]
@@ -225,6 +229,11 @@ mod tests {
         }
         let theme = Theme::new(ThemeName::Dark, ColorDepth::Ansi16);
         let mut explorer = FileExplorer::new(root.clone(), theme);
+        explorer.install_files(
+            (0..6)
+                .map(|index| root.join(format!("file-{index}.typ")))
+                .collect(),
+        );
         let mut terminal = Terminal::new(TestBackend::new(24, 4))?;
         terminal.draw(|frame| explorer.draw(frame, frame.area(), true))?;
 
@@ -241,8 +250,9 @@ mod tests {
         assert!(!rendered.contains("file-0.typ"));
 
         let selected = explorer.selected_path();
-        fs::write(root.join("file-new.typ"), "text")?;
-        explorer.mark_dirty();
+        let new_file = root.join("file-new.typ");
+        fs::write(&new_file, "text")?;
+        assert!(!explorer.apply_paths(&[new_file]));
         terminal.draw(|frame| explorer.draw(frame, frame.area(), true))?;
         assert!(
             explorer
@@ -252,7 +262,79 @@ mod tests {
         );
         assert_eq!(explorer.selected_path(), selected);
 
+        fs::remove_file(root.join("file-new.typ"))?;
+        assert!(!explorer.apply_paths(&[root.join("file-new.typ")]));
+        assert!(
+            !explorer
+                .files
+                .iter()
+                .any(|path| path.ends_with("file-new.typ"))
+        );
+
         drop(terminal);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn full_incremental_cache_requests_a_rescan_for_new_files() -> Result<(), Box<dyn Error>> {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("oxyst-explorer-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&root)?;
+        let mut explorer = FileExplorer::new(
+            root.clone(),
+            Theme::new(ThemeName::Dark, ColorDepth::Ansi16),
+        );
+        explorer.install_files(
+            (0..crate::explorer::MAX_FILES)
+                .map(|index| root.join(format!("file-{index:03}.typ")))
+                .collect(),
+        );
+        let added = root.join("added.typ");
+        fs::write(&added, "")?;
+
+        assert!(explorer.apply_paths(&[added]));
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn incremental_updates_ignore_symlinks_and_directories() -> Result<(), Box<dyn Error>> {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("oxyst-explorer-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&root)?;
+        let target = root.join("target.typ");
+        let link = root.join("link.typ");
+        let directory = root.join("directory.typ");
+        fs::write(&target, "")?;
+        fs::create_dir(&directory)?;
+        let linked = {
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&target, &link)
+            }
+            #[cfg(windows)]
+            {
+                std::os::windows::fs::symlink_file(&target, &link)
+            }
+        };
+        let mut explorer = FileExplorer::new(
+            root.clone(),
+            Theme::new(ThemeName::Dark, ColorDepth::Ansi16),
+        );
+        explorer.install_files(Vec::new());
+
+        assert!(!explorer.apply_paths(&[target.clone(), directory]));
+        assert_eq!(explorer.files, vec![target]);
+        if linked.is_ok() {
+            assert!(!explorer.apply_paths(&[link]));
+            assert_eq!(explorer.files.len(), 1);
+        }
+
         fs::remove_dir_all(root)?;
         Ok(())
     }
