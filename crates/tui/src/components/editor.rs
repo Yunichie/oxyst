@@ -43,10 +43,13 @@ pub(crate) struct Editor {
 
 impl Editor {
     pub(crate) fn new(text: &str, theme: Theme, soft_wrap: bool) -> Self {
-        let source = Source::detached(text);
+        Self::from_source(Source::detached(text), theme, soft_wrap)
+    }
+
+    pub(crate) fn from_source(source: Source, theme: Theme, soft_wrap: bool) -> Self {
         let line_count = source.lines().len_lines();
         Self {
-            document: Document::new(text),
+            document: Document::new(source.text()),
             scroll: VisualPosition::default(),
             follow_cursor: true,
             inner: Rect::default(),
@@ -591,6 +594,18 @@ impl Editor {
         *self = Self::new(text, self.theme, self.soft_wrap);
     }
 
+    pub(crate) fn source(&self) -> Source {
+        self.source.clone()
+    }
+
+    pub(crate) fn replace_source(&mut self, source: Source) -> Result<(), String> {
+        if source.text() != self.source.text() {
+            return Err("compiler source does not match the editor document".to_owned());
+        }
+        self.source = source;
+        Ok(())
+    }
+
     pub(crate) fn text(&self) -> String {
         self.document.text()
     }
@@ -605,10 +620,6 @@ impl Editor {
 
     pub(crate) fn mark_saved(&mut self) {
         self.document.mark_saved();
-    }
-
-    pub(crate) fn last_edit(&self) -> Option<&oxyst_document::TextEdit> {
-        self.document.last_edit()
     }
 
     pub(crate) fn cursor_byte_index(&self) -> usize {

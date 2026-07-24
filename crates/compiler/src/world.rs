@@ -88,11 +88,22 @@ impl TypstWorld {
     }
 
     pub(crate) fn snapshot(&self) -> Self {
+        self.build_snapshot(self.main_source.clone())
+    }
+
+    pub(crate) fn snapshot_with_source(&self, source: Source) -> Result<Self, Error> {
+        if source.id() != self.main {
+            return Err(Error::MismatchedMainSource);
+        }
+        Ok(self.build_snapshot(source))
+    }
+
+    fn build_snapshot(&self, main_source: Source) -> Self {
         Self {
             resources: Arc::clone(&self.resources),
             files: Arc::clone(&self.files),
             main: self.main,
-            main_source: self.main_source.clone(),
+            main_source,
             now: Time::system(),
         }
     }

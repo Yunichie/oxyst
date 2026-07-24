@@ -13,6 +13,7 @@ pub use diagnostics::{Diagnostic, DiagnosticNote, DiagnosticNoteKind, Severity};
 pub use sync::{DocumentSync, PagePosition};
 use thiserror::Error;
 use typst::diag::Warned;
+use typst::syntax::Source;
 use typst_layout::{Page, PagedDocument};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -42,6 +43,8 @@ pub enum Error {
     },
     #[error("source edit {start}..{end} is not on valid UTF-8 boundaries")]
     InvalidSourceEdit { start: usize, end: usize },
+    #[error("source does not belong to the compiler's main file")]
+    MismatchedMainSource,
 }
 
 pub struct Compiler {
@@ -86,10 +89,21 @@ impl Compiler {
     }
 
     #[must_use]
+    pub fn main_source(&self) -> Source {
+        self.world.main_source()
+    }
+
+    #[must_use]
     pub fn snapshot(&self) -> CompileSnapshot {
         CompileSnapshot {
             world: self.world.snapshot(),
         }
+    }
+
+    pub fn snapshot_with_source(&self, source: Source) -> Result<CompileSnapshot, Error> {
+        Ok(CompileSnapshot {
+            world: self.world.snapshot_with_source(source)?,
+        })
     }
 }
 

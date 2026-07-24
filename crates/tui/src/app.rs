@@ -176,9 +176,11 @@ impl App {
         });
         let (sender, internal_events) = channel();
         let watcher = ProjectWatcher::new(&root, path.as_deref(), sender.clone())?;
+        let mut source = compiler.main_source();
+        source.replace(text);
 
         Ok(Self {
-            editor: Editor::new(text, theme, config.soft_wrap),
+            editor: Editor::from_source(source, theme, config.soft_wrap),
             header,
             status_bar,
             clipboard: Clipboard::new(),
@@ -188,7 +190,7 @@ impl App {
             fullscreen: false,
             workspace: Workspace::new(path, root, root_is_explicit),
             picker,
-            compile_worker: CompileWorker::new(compiler, text, sender.clone(), runtime.clone()),
+            compile_worker: CompileWorker::new(compiler, sender.clone(), runtime.clone()),
             export_worker: ExportWorker::new(sender, runtime),
             watcher,
             internal_events,
@@ -688,13 +690,7 @@ impl App {
         let cursor = self.editor.cursor_byte_index();
         self.editor.update(action);
         if self.editor.revision() != revision {
-            let generation = if self.world_rebuild_pending {
-                self.compile_worker.invalidate()
-            } else if let Some(edit) = self.editor.last_edit() {
-                self.compile_worker.apply_edit(edit)
-            } else {
-                self.compile_worker.invalidate()
-            };
+            let generation = self.compile_worker.invalidate();
             match generation {
                 Ok(generation) => self.compile_generation = generation,
                 Err(error) => {
@@ -919,7 +915,9 @@ impl App {
         }
         self.compile_debounce.cancel();
         self.preview_target_width = self.preview.target_width();
-        self.compile_generation = self.compile_worker.spawn(self.editor.revision());
+        self.compile_generation = self
+            .compile_worker
+            .spawn(self.editor.revision(), self.editor.source());
         self.preview_page_request = None;
         self.compile_started_at = Some(Instant::now());
         self.compile_state = CompileState::Compiling;
@@ -957,6 +955,11 @@ impl App {
         }
 
         if let Some(compiler) = result.rebuilt_compiler.take() {
+            if let Err(error) = self.editor.replace_source(compiler.main_source()) {
+                self.compile_state = CompileState::Error;
+                self.status = Some(error);
+                return;
+            }
             if let Err(error) = self.compile_worker.install(compiler) {
                 self.compile_state = CompileState::Error;
                 self.status = Some(error);

@@ -11,10 +11,10 @@ use std::{
 use oxyst_compiler::{
     CompileOutcome, CompileSnapshot, CompiledDocument, Compiler, Diagnostic, DocumentSync,
 };
-use oxyst_document::TextEdit;
 use oxyst_render::RenderManifest;
 use ratatui_image::{picker::Picker, sliced::SlicedProtocol};
 use tokio::runtime::Handle;
+use typst_syntax::Source;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{components::Preview, event::Event};
@@ -176,13 +176,7 @@ pub(crate) struct CompileWorker {
 }
 
 impl CompileWorker {
-    pub(crate) fn new(
-        mut compiler: Compiler,
-        source: &str,
-        sender: Sender<Event>,
-        runtime: Handle,
-    ) -> Self {
-        compiler.replace_source(source);
+    pub(crate) fn new(compiler: Compiler, sender: Sender<Event>, runtime: Handle) -> Self {
         Self {
             compiler: Mutex::new(compiler),
             runner: Runner {
@@ -194,18 +188,6 @@ impl CompileWorker {
                 preview_scheduler: Arc::new(Mutex::new(PreviewScheduler::default())),
             },
         }
-    }
-
-    pub(crate) fn apply_edit(&self, edit: &TextEdit) -> Result<u64, String> {
-        let generation = self.advance_and_cancel_pending()?;
-        let mut compiler = self
-            .compiler
-            .lock()
-            .map_err(|_| "compiler coordinator is unavailable".to_owned())?;
-        compiler
-            .apply_edit(edit.range(), edit.replacement())
-            .map_err(|error| error.to_string())?;
-        Ok(generation)
     }
 
     pub(crate) fn invalidate(&self) -> Result<u64, String> {
@@ -222,13 +204,19 @@ impl CompileWorker {
         Ok(generation)
     }
 
-    pub(crate) fn spawn(&self, revision: u64) -> u64 {
+    pub(crate) fn spawn(&self, revision: u64, source: Source) -> u64 {
         let generation = match self.advance_and_cancel_pending() {
             Ok(generation) => generation,
             Err(error) => return self.report_preparation_error(revision, error),
         };
         let snapshot = match self.compiler.lock() {
-            Ok(compiler) => compiler.snapshot(),
+            Ok(compiler) => match compiler.snapshot_with_source(source) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    self.send_error(revision, generation, &error.to_string());
+                    return generation;
+                }
+            },
             Err(_) => {
                 self.send_error(revision, generation, "compiler coordinator is unavailable");
                 return generation;
@@ -594,7 +582,7 @@ mod tests {
         let compiler = Compiler::new(&root, root.join("simple.typ"))?;
         let runtime = tokio::runtime::Builder::new_multi_thread().build()?;
         let (sender, receiver) = channel();
-        let worker = CompileWorker::new(compiler, "= old world", sender, runtime.handle().clone());
+        let worker = CompileWorker::new(compiler, sender, runtime.handle().clone());
 
         let source = "= rebuilt world";
         worker.spawn_with_world(
@@ -631,14 +619,11 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_multi_thread().build()?;
         let (sender, receiver) = channel();
         let picker = Picker::halfblocks();
-        let worker = CompileWorker::new(
-            compiler,
-            "= One\n#pagebreak()\n= Two",
-            sender,
-            runtime.handle().clone(),
-        );
+        let mut source = compiler.main_source();
+        source.replace("= One\n#pagebreak()\n= Two");
+        let worker = CompileWorker::new(compiler, sender, runtime.handle().clone());
 
-        let generation = worker.spawn(7);
+        let generation = worker.spawn(7, source);
         let result = receive_compile(&receiver)?;
         let CompileResultKind::Success { document, .. } = result.outcome else {
             return Err("document did not compile".into());

@@ -115,3 +115,30 @@ fn snapshots_keep_the_source_revision_they_were_created_from() -> Result<(), Box
     assert!(matches!(invalid.compile(), CompileOutcome::Failure(_)));
     Ok(())
 }
+
+#[test]
+fn snapshots_accept_a_caller_owned_main_source() -> Result<(), Box<dyn Error>> {
+    let root = fixtures();
+    let compiler = Compiler::new(&root, root.join("simple.typ"))?;
+    let mut source = compiler.main_source();
+    source.replace("= Editor-owned source");
+
+    assert!(matches!(
+        compiler.snapshot_with_source(source)?.compile(),
+        CompileOutcome::Success(_)
+    ));
+    Ok(())
+}
+
+#[test]
+fn snapshots_reject_a_source_for_another_file() -> Result<(), Box<dyn Error>> {
+    let root = fixtures();
+    let compiler = Compiler::new(&root, root.join("simple.typ"))?;
+    let source = typst::syntax::Source::detached("= Wrong file");
+
+    assert!(matches!(
+        compiler.snapshot_with_source(source),
+        Err(CompilerError::MismatchedMainSource)
+    ));
+    Ok(())
+}
