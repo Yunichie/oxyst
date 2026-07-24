@@ -38,7 +38,15 @@ pub(crate) struct Editor {
     word_count: usize,
     preferred_visual_column: Option<usize>,
     diagnostic_lines: BTreeMap<usize, Severity>,
+    bracket_cache: Option<BracketMatchCache>,
     theme: Theme,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BracketMatchCache {
+    revision: u64,
+    cursor: usize,
+    matches: Option<[Range<usize>; 2]>,
 }
 
 impl Editor {
@@ -64,6 +72,7 @@ impl Editor {
             word_count: 0,
             preferred_visual_column: None,
             diagnostic_lines: BTreeMap::new(),
+            bracket_cache: None,
             theme,
         }
     }
@@ -177,7 +186,7 @@ impl Editor {
             })
             .collect::<Vec<_>>();
         let selection = self.document.selection_byte_range();
-        let brackets = matching_brackets(&self.source, self.document.cursor_byte_index());
+        let brackets = self.cached_bracket_matches();
         let text = self
             .viewport_rows
             .iter()
@@ -590,6 +599,25 @@ impl Editor {
         self.diagnostic_lines = diagnostics.line_severities().collect();
     }
 
+    fn cached_bracket_matches(&mut self) -> Option<[Range<usize>; 2]> {
+        let revision = self.document.revision();
+        let cursor = self.document.cursor_byte_index();
+        if let Some(cache) = &self.bracket_cache
+            && cache.revision == revision
+            && cache.cursor == cursor
+        {
+            return cache.matches.clone();
+        }
+
+        let matches = matching_brackets(&self.source, cursor);
+        self.bracket_cache = Some(BracketMatchCache {
+            revision,
+            cursor,
+            matches: matches.clone(),
+        });
+        matches
+    }
+
     pub(crate) fn replace_document(&mut self, text: &str) {
         *self = Self::new(text, self.theme, self.soft_wrap);
     }
@@ -800,6 +828,14 @@ fn line_row_count(source: &Source, line: usize, width: usize) -> usize {
 }
 
 fn wrapped_row_count(content: &str, width: usize) -> usize {
+    let width = width.max(1);
+    if content
+        .bytes()
+        .all(|byte| byte == b' ' || byte.is_ascii_graphic())
+    {
+        return content.len().div_ceil(width).max(1);
+    }
+
     let mut rows = 1_usize;
     let mut row_width = 0_usize;
     for grapheme in content.graphemes(true) {
@@ -1010,7 +1046,11 @@ fn matching_brackets(source: &Source, cursor: usize) -> Option<[Range<usize>; 2]
             .filter(|(_, character)| is_bracket(*character))
     })?;
     let (start, bracket) = candidate;
-    if is_non_code(source, start) {
+    let root = LinkedNode::new(source.root());
+    let leaf = root
+        .leaf_at(start, Side::After)
+        .or_else(|| root.leaf_at(start, Side::Before))?;
+    if is_non_code(&leaf) {
         return None;
     }
     let (matching, forward) = match bracket {
@@ -1023,9 +1063,9 @@ fn matching_brackets(source: &Source, cursor: usize) -> Option<[Range<usize>; 2]
         _ => return None,
     };
     let found = if forward {
-        find_forward_match(source, start, bracket, matching)
+        find_forward_match(text, leaf, start, bracket, matching)
     } else {
-        find_backward_match(source, start, bracket, matching)
+        find_backward_match(text, leaf, start, bracket, matching)
     }?;
     Some([
         start..start + bracket.len_utf8(),
@@ -1042,70 +1082,68 @@ fn is_bracket(character: char) -> bool {
     matches!(character, '(' | ')' | '[' | ']' | '{' | '}')
 }
 
-fn is_non_code(source: &Source, byte: usize) -> bool {
-    let root = LinkedNode::new(source.root());
-    root.leaf_at(byte, Side::After)
-        .or_else(|| root.leaf_at(byte, Side::Before))
-        .is_some_and(|leaf| {
-            node_has_tag(&leaf, |tag| {
-                matches!(tag, Tag::Comment | Tag::Raw | Tag::String)
-            })
-        })
+fn is_non_code(leaf: &LinkedNode<'_>) -> bool {
+    node_has_tag(leaf, |tag| {
+        matches!(tag, Tag::Comment | Tag::Raw | Tag::String)
+    })
 }
 
-fn find_forward_match(
-    source: &Source,
+fn find_forward_match<'a>(
+    text: &str,
+    mut leaf: LinkedNode<'a>,
     start: usize,
     opening: char,
     closing: char,
 ) -> Option<usize> {
-    let text = source.text();
     let mut depth = 1_usize;
-    for (offset, character) in text.get(start + opening.len_utf8()..)?.char_indices() {
-        let byte = start + opening.len_utf8() + offset;
-        if character != opening && character != closing {
-            continue;
-        }
-        if is_non_code(source, byte) {
-            continue;
-        }
-        if character == opening {
-            depth += 1;
-        } else {
-            depth -= 1;
-            if depth == 0 {
-                return Some(byte);
+    let mut scan_start = start + opening.len_utf8();
+    loop {
+        let range = leaf.range();
+        let range_start = range.start.max(scan_start);
+        if range_start < range.end && !is_non_code(&leaf) {
+            for (offset, character) in text.get(range_start..range.end)?.char_indices() {
+                if character == opening {
+                    depth += 1;
+                } else if character == closing {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(range_start + offset);
+                    }
+                }
             }
         }
+        leaf = next_leaf_with_trivia(&leaf)?;
+        scan_start = leaf.offset();
     }
-    None
 }
 
-fn find_backward_match(
-    source: &Source,
+fn find_backward_match<'a>(
+    text: &str,
+    mut leaf: LinkedNode<'a>,
     start: usize,
     closing: char,
     opening: char,
 ) -> Option<usize> {
-    let text = source.text();
     let mut depth = 1_usize;
-    for (byte, character) in text.get(..start)?.char_indices().rev() {
-        if character != closing && character != opening {
-            continue;
-        }
-        if is_non_code(source, byte) {
-            continue;
-        }
-        if character == closing {
-            depth += 1;
-        } else {
-            depth -= 1;
-            if depth == 0 {
-                return Some(byte);
+    let mut scan_end = start;
+    loop {
+        let range = leaf.range();
+        let range_end = range.end.min(scan_end);
+        if range.start < range_end && !is_non_code(&leaf) {
+            for (offset, character) in text.get(range.start..range_end)?.char_indices().rev() {
+                if character == closing {
+                    depth += 1;
+                } else if character == opening {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(range.start + offset);
+                    }
+                }
             }
         }
+        leaf = previous_leaf_with_trivia(&leaf)?;
+        scan_end = leaf.range().end;
     }
-    None
 }
 
 fn node_has_tag(node: &LinkedNode<'_>, predicate: impl Fn(Tag) -> bool) -> bool {
@@ -1145,11 +1183,30 @@ fn leftmost_leaf_with_trivia(mut node: LinkedNode<'_>) -> LinkedNode<'_> {
     }
 }
 
+fn rightmost_leaf_with_trivia(mut node: LinkedNode<'_>) -> LinkedNode<'_> {
+    loop {
+        let Some(child) = node.children().next_back() else {
+            return node;
+        };
+        node = child;
+    }
+}
+
 fn next_leaf_with_trivia<'a>(node: &LinkedNode<'a>) -> Option<LinkedNode<'a>> {
     let mut current = node.clone();
     loop {
         if let Some(next) = current.next_sibling_with_trivia() {
             return Some(leftmost_leaf_with_trivia(next));
+        }
+        current = current.parent()?.clone();
+    }
+}
+
+fn previous_leaf_with_trivia<'a>(node: &LinkedNode<'a>) -> Option<LinkedNode<'a>> {
+    let mut current = node.clone();
+    loop {
+        if let Some(previous) = current.prev_sibling_with_trivia() {
+            return Some(rightmost_leaf_with_trivia(previous));
         }
         current = current.parent()?.clone();
     }
@@ -1329,7 +1386,7 @@ mod tests {
 
     use super::{
         Component, Diagnostics, Editor, VisualPosition, find_from, line_row_count,
-        matching_brackets,
+        matching_brackets, wrapped_row_count,
     };
     use crate::action::Action;
 
@@ -1704,6 +1761,89 @@ mod tests {
     }
 
     #[test]
+    fn bracket_matching_handles_markup_math_comments_and_both_directions()
+    -> Result<(), &'static str> {
+        for (text, opening, closing) in [
+            ("Plain (nested [markup]) text", '(', ')'),
+            ("$[x + (y)]$", '[', ']'),
+            ("#let value = (([1]), { nested: [2] })", '(', ')'),
+        ] {
+            let source = Source::detached(text);
+            let opening = text.find(opening).ok_or("opening bracket is missing")?;
+            let closing = text.rfind(closing).ok_or("closing bracket is missing")?;
+            let forward =
+                matching_brackets(&source, opening).ok_or("forward brackets did not match")?;
+            let backward =
+                matching_brackets(&source, closing).ok_or("backward brackets did not match")?;
+            assert_eq!(forward[0].start, opening);
+            assert_eq!(forward[1].start, closing);
+            assert_eq!(backward[0].start, closing);
+            assert_eq!(backward[1].start, opening);
+        }
+
+        let comment = "#let value = (1 /* ignored ) */ + 2)";
+        let source = Source::detached(comment);
+        let opening = comment.find('(').ok_or("comment opening is missing")?;
+        let closing = comment.rfind(')').ok_or("comment closing is missing")?;
+        let ignored = comment.find(") */").ok_or("comment bracket is missing")?;
+        assert_eq!(
+            matching_brackets(&source, opening).ok_or("commented brackets affected the match")?[1]
+                .start,
+            closing
+        );
+        assert!(matching_brackets(&source, ignored).is_none());
+
+        let raw = "`ignored )` and (shown)";
+        let source = Source::detached(raw);
+        let ignored = raw.find(')').ok_or("raw bracket is missing")?;
+        assert!(matching_brackets(&source, ignored).is_none());
+        assert!(matching_brackets(&Source::detached("unmatched ("), 10).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn bracket_cache_tracks_cursor_revision_and_document_replacement() {
+        let mut editor = Editor::new("(x)", theme(), false);
+        let initial = editor.cached_bracket_matches();
+        assert_eq!(initial.as_ref().map(|ranges| ranges[1].start), Some(2));
+        let initial_cache = editor.bracket_cache.clone();
+        assert_eq!(editor.cached_bracket_matches(), initial);
+        assert_eq!(editor.bracket_cache, initial_cache);
+
+        editor.update(Action::Move(Motion::Right));
+        let _ = editor.cached_bracket_matches();
+        assert_eq!(
+            editor.bracket_cache.as_ref().map(|cache| cache.cursor),
+            Some(1)
+        );
+
+        let revision = editor.revision();
+        editor.update(Action::Insert('y'));
+        let _ = editor.cached_bracket_matches();
+        assert_ne!(editor.revision(), revision);
+        assert_eq!(
+            editor.bracket_cache.as_ref().map(|cache| cache.revision),
+            Some(editor.revision())
+        );
+
+        editor.replace_document("[]");
+        assert!(editor.bracket_cache.is_none());
+    }
+
+    #[test]
+    fn wrapped_row_count_preserves_unicode_and_control_widths() {
+        assert_eq!(wrapped_row_count("", 4), 1);
+        assert_eq!(wrapped_row_count("abcd", 4), 1);
+        assert_eq!(wrapped_row_count("abcde", 4), 2);
+        assert_eq!(wrapped_row_count("abcdefgh", 4), 2);
+        assert_eq!(wrapped_row_count("abc", 0), 3);
+        assert_eq!(wrapped_row_count("a\tb", 1), 3);
+        assert_eq!(wrapped_row_count("a\u{301}", 1), 1);
+        assert_eq!(wrapped_row_count("界界", 2), 2);
+        assert_eq!(wrapped_row_count("👩‍💻👩‍💻", 2), 2);
+    }
+
+    #[test]
     #[ignore = "manual release-mode performance probe"]
     fn massive_search_uses_the_existing_source_buffer() {
         let source = format!("{}needle", "x".repeat(10 * 1024 * 1024));
@@ -1715,6 +1855,61 @@ mod tests {
             );
         }
         eprintln!("20 searches across 10 MiB: {:?}", started.elapsed());
+    }
+
+    #[test]
+    #[ignore = "manual release-mode performance probe"]
+    fn bracket_dense_document_reports_matching_latency() -> Result<(), &'static str> {
+        for terms in [1_000, 2_500, 5_000, 10_000] {
+            let text = format!("#({})", "(0,),".repeat(terms));
+            let source = Source::detached(&text);
+            let opening = text.find('(').ok_or("opening bracket is missing")?;
+
+            let started = Instant::now();
+            let matched =
+                matching_brackets(&source, opening).ok_or("outer brackets did not match")?;
+            let syntax_scan = started.elapsed();
+            assert_eq!(matched[1].start, text.len() - 1);
+
+            let mut editor = Editor::from_source(source, theme(), false);
+            assert!(editor.set_cursor_byte_index(opening));
+            let _ = editor.cached_bracket_matches();
+            let started = Instant::now();
+            let cached = editor.cached_bracket_matches();
+            let cache_hit = started.elapsed();
+            assert_eq!(
+                cached.as_ref().map(|ranges| ranges[1].start),
+                Some(text.len() - 1)
+            );
+
+            eprintln!(
+                "{terms} bracket pairs ({} KiB): syntax_scan={syntax_scan:?}, cache_hit={cache_hit:?}",
+                text.len() / 1024
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "manual release-mode performance probe"]
+    fn massive_ascii_soft_wrap_reports_layout_latency() {
+        let line = "x".repeat(120);
+        let text = std::iter::repeat_n(line.as_str(), 100_000)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut editor = Editor::new(&text, theme(), true);
+        let width = 80_usize;
+
+        let started = Instant::now();
+        editor.ensure_layout(width as u16);
+        let layout = started.elapsed();
+        assert_eq!(editor.line_rows.len(), 100_000);
+        assert!(editor.line_rows.iter().all(|rows| *rows == 2));
+
+        eprintln!(
+            "100k ASCII lines ({} MiB): layout={layout:?}",
+            text.len() / (1024 * 1024)
+        );
     }
 
     #[test]

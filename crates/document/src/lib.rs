@@ -845,10 +845,13 @@ fn char_offset_at_visual_column(text: &str, target: usize) -> usize {
 mod tests {
     use std::time::Instant;
 
+    use ropey::RopeSlice;
     use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
 
     use super::{
         CursorPosition, Document, Edit, HISTORY_BYTE_LIMIT, Motion, TextEdit, count_graphemes,
+        rope_grapheme_boundary,
     };
 
     #[test]
@@ -1110,6 +1113,49 @@ mod tests {
         );
         assert_eq!(document.selection_graphemes(), 0);
         assert_eq!(document.cursor_char_index(), source.len());
+    }
+
+    #[test]
+    #[ignore = "manual release-mode performance probe"]
+    fn massive_destination_line_reports_vertical_motion_latency() {
+        let long_line = "x".repeat(5 * 1024 * 1024);
+        let mut document = Document::new(&format!("{long_line}\nshort"));
+        document.move_cursor(Motion::DocumentEnd);
+
+        let started = Instant::now();
+        document.move_cursor(Motion::Up);
+        let materialized = started.elapsed();
+        assert_eq!(document.cursor_position().visual_column, 5);
+
+        let line = document.text.line(0);
+        let started = Instant::now();
+        let offset = rope_char_offset_at_visual_column(line, 5);
+        let traversed = started.elapsed();
+        assert_eq!(offset, 5);
+
+        eprintln!(
+            "5 MiB destination line at column 5: materialized={materialized:?}, chunk_traversal={traversed:?}"
+        );
+    }
+
+    fn rope_char_offset_at_visual_column(text: RopeSlice<'_>, target: usize) -> usize {
+        let mut byte = 0_usize;
+        let mut width = 0_usize;
+        let mut chars = 0_usize;
+        while byte < text.len_bytes() {
+            let Some(next) = rope_grapheme_boundary(text, byte, true) else {
+                break;
+            };
+            let grapheme = text.byte_slice(byte..next).to_string();
+            let next_width = width.saturating_add(UnicodeWidthStr::width(grapheme.as_str()));
+            if next_width > target {
+                break;
+            }
+            width = next_width;
+            chars = chars.saturating_add(text.byte_slice(byte..next).len_chars());
+            byte = next;
+        }
+        chars
     }
 
     #[test]
