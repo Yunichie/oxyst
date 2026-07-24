@@ -15,7 +15,7 @@ use ratatui::{
     style::Style,
     widgets::{Block, Paragraph},
 };
-use ratatui_image::picker::Picker;
+use ratatui_image::picker::{Picker, ProtocolType};
 use tokio::runtime::Handle;
 
 use crate::{
@@ -43,12 +43,17 @@ const NARROW_WIDTH: u16 = 80;
 const AUTO_COMPILE_DELAY: Duration = Duration::from_millis(150);
 const CURSOR_SYNC_DELAY: Duration = Duration::from_millis(50);
 const COMPILE_STALLED_AFTER: Duration = Duration::from_secs(5);
+const HALFBLOCK_PIXELS_PER_COLUMN: u32 = 4;
 
 fn preview_dimensions(picker: &Picker, width: u16) -> (u16, u32) {
     let font_width = picker.font_size().width.max(1);
     let max_columns = (2_048 / font_width).max(1);
     let width = width.clamp(1, max_columns);
-    (width, u32::from(width) * u32::from(font_width))
+    let pixels_per_column = match picker.protocol_type() {
+        ProtocolType::Halfblocks => HALFBLOCK_PIXELS_PER_COLUMN,
+        ProtocolType::Sixel | ProtocolType::Kitty | ProtocolType::Iterm2 => u32::from(font_width),
+    };
+    (width, u32::from(width) * pixels_per_column)
 }
 
 fn overlay_transition_requires_clear(action: &Action) -> bool {
@@ -1346,7 +1351,7 @@ mod tests {
     use oxyst_compiler::{CompileOutcome, Compiler};
     use oxyst_config::Config;
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
-    use ratatui_image::picker::Picker;
+    use ratatui_image::picker::{Picker, ProtocolType};
 
     use super::{
         App, AppInit, COMPILE_STALLED_AFTER, CompileDebounce, CompileState, Preview,
@@ -1376,6 +1381,28 @@ mod tests {
             'x'
         )));
         assert!(!overlay_transition_requires_clear(&Action::OverlayMove(1)));
+    }
+
+    #[test]
+    fn halfblock_previews_render_at_four_pixels_per_column() {
+        let picker = Picker::halfblocks();
+
+        assert_eq!(preview_dimensions(&picker, 80), (80, 320));
+        assert_eq!(preview_dimensions(&picker, u16::MAX), (204, 816));
+    }
+
+    #[test]
+    fn native_preview_protocols_render_at_terminal_pixel_width() {
+        let mut picker = Picker::halfblocks();
+
+        for protocol in [
+            ProtocolType::Sixel,
+            ProtocolType::Kitty,
+            ProtocolType::Iterm2,
+        ] {
+            picker.set_protocol_type(protocol);
+            assert_eq!(preview_dimensions(&picker, 80), (80, 800));
+        }
     }
 
     #[test]

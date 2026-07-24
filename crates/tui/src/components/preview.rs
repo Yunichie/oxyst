@@ -14,7 +14,8 @@ use ratatui::{
     },
 };
 use ratatui_image::{
-    picker::Picker,
+    picker::{Picker, ProtocolType},
+    protocol::halfblocks::Halfblocks,
     sliced::{SignedPosition, SlicedImage, SlicedProtocol},
 };
 
@@ -590,8 +591,16 @@ fn encode_page(picker: &Picker, page: PageImage, width: u16) -> Result<SlicedPro
     let rows = scaled_height
         .div_ceil(u64::from(font.height.max(1)))
         .clamp(1, u64::from(u16::MAX)) as u16;
-    SlicedProtocol::new(picker, page.into_image(), Some(Size::new(width, rows)))
-        .map_err(|error| error.to_string())
+    let size = Size::new(width, rows);
+    let image = page.into_image();
+    match picker.protocol_type() {
+        ProtocolType::Halfblocks => Halfblocks::new(image, size)
+            .map(SlicedProtocol::Halfblocks)
+            .map_err(|error| error.to_string()),
+        ProtocolType::Sixel | ProtocolType::Kitty | ProtocolType::Iterm2 => {
+            SlicedProtocol::new(picker, image, Some(size)).map_err(|error| error.to_string())
+        }
+    }
 }
 
 impl Default for Preview {
@@ -672,7 +681,7 @@ mod tests {
         let CompileOutcome::Success(document) = compiler.compile(&source) else {
             return Err(io::Error::other("fixture did not compile").into());
         };
-        let rendered = oxyst_render::render(&document, 280)?;
+        let rendered = oxyst_render::render(&document, 112)?;
         let pages =
             Preview::encode_pages(&Picker::halfblocks(), rendered, 28).map_err(io::Error::other)?;
         let mut preview = Preview::new(theme());
@@ -694,6 +703,10 @@ mod tests {
         });
         assert!(rendered.contains("Page 1 / 1"));
         assert!(has_raster_color);
+        assert!(matches!(
+            buffer[(29, 2)].bg,
+            Color::Rgb(red, green, blue) if red > 0 || green > 0 || blue > 0
+        ));
         assert!(
             terminal
                 .backend()
