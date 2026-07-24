@@ -33,13 +33,16 @@ pub(crate) struct Editor {
     total_visual_rows: usize,
     viewport_rows: Vec<VisualRow>,
     layout_width: u16,
+    horizontal_scroll: usize,
+    soft_wrap: bool,
+    word_count: usize,
     preferred_visual_column: Option<usize>,
     diagnostic_lines: BTreeMap<usize, Severity>,
     theme: Theme,
 }
 
 impl Editor {
-    pub(crate) fn new(text: &str, theme: Theme) -> Self {
+    pub(crate) fn new(text: &str, theme: Theme, soft_wrap: bool) -> Self {
         let source = Source::detached(text);
         let line_count = source.lines().len_lines();
         Self {
@@ -53,6 +56,9 @@ impl Editor {
             total_visual_rows: line_count,
             viewport_rows: Vec::new(),
             layout_width: 0,
+            horizontal_scroll: 0,
+            soft_wrap,
+            word_count: 0,
             preferred_visual_column: None,
             diagnostic_lines: BTreeMap::new(),
             theme,
@@ -134,11 +140,12 @@ impl Editor {
         let cursor_row = self.visual_position(cursor.line, cursor.visual_column);
         if self.follow_cursor {
             self.keep_cursor_visible(cursor_row, text_area);
+            self.keep_cursor_horizontally_visible(cursor.visual_column, text_area.width);
         } else {
             self.clamp_scroll(text_area.height);
         }
 
-        self.viewport_rows = self.build_viewport_rows(usize::from(text_area.height));
+        self.viewport_rows = self.build_viewport_rows(usize::from(text_area.height), cursor);
         let gutter = self
             .viewport_rows
             .iter()
@@ -221,6 +228,19 @@ impl Editor {
         self.clamp_scroll(area.height);
     }
 
+    fn keep_cursor_horizontally_visible(&mut self, cursor: usize, width: u16) {
+        if self.soft_wrap {
+            self.horizontal_scroll = 0;
+            return;
+        }
+        let width = usize::from(width.max(1));
+        if cursor < self.horizontal_scroll {
+            self.horizontal_scroll = cursor;
+        } else if cursor >= self.horizontal_scroll.saturating_add(width) {
+            self.horizontal_scroll = cursor.saturating_add(1).saturating_sub(width);
+        }
+    }
+
     pub(crate) fn contains(&self, column: u16, row: u16) -> bool {
         column >= self.inner.x
             && column < self.inner.right()
@@ -279,23 +299,32 @@ impl Editor {
         }
         self.layout_width = width;
         self.preferred_visual_column = None;
-        self.line_rows = (0..self.source.lines().len_lines())
-            .map(|line| line_row_count(&self.source, line, usize::from(width)))
-            .collect();
+        self.line_rows = if self.soft_wrap {
+            (0..self.source.lines().len_lines())
+                .map(|line| line_row_count(&self.source, line, usize::from(width)))
+                .collect()
+        } else {
+            vec![1; self.source.lines().len_lines()]
+        };
         self.total_visual_rows = self.line_rows.iter().sum();
         self.clamp_scroll(self.text_area.height);
     }
 
     fn visual_position(&self, logical_line: usize, visual_column: usize) -> VisualPosition {
         let line = logical_line.min(self.line_rows.len().saturating_sub(1));
-        let subrow = source_line_content(&self.source, line).map_or(0, |(_, content)| {
-            visual_row_at_column(
-                content,
-                usize::from(self.layout_width.max(1)),
-                visual_column,
-            )
+        let subrow = self.soft_wrap.then(|| {
+            source_line_content(&self.source, line).map_or(0, |(_, content)| {
+                visual_row_at_column(
+                    content,
+                    usize::from(self.layout_width.max(1)),
+                    visual_column,
+                )
+            })
         });
-        VisualPosition { line, subrow }
+        VisualPosition {
+            line,
+            subrow: subrow.unwrap_or(0),
+        }
     }
 
     fn move_vertically(&mut self, direction: isize, selecting: bool) {
@@ -360,13 +389,12 @@ impl Editor {
             .lines()
             .byte_to_line(replacement_end)
             .unwrap_or(new_line_count.saturating_sub(1));
-        let width = usize::from(self.layout_width.max(1));
         let replacement_rows = (start_line..=new_end_line)
             .map(|line| {
-                if self.layout_width == 0 {
+                if self.layout_width == 0 || !self.soft_wrap {
                     1
                 } else {
-                    line_row_count(&self.source, line, width)
+                    line_row_count(&self.source, line, usize::from(self.layout_width.max(1)))
                 }
             })
             .collect::<Vec<_>>();
@@ -402,27 +430,58 @@ impl Editor {
         self.total_visual_rows = line_count;
         self.viewport_rows.clear();
         self.layout_width = 0;
+        self.horizontal_scroll = 0;
         self.scroll = VisualPosition::default();
     }
 
-    fn build_viewport_rows(&self, height: usize) -> Vec<VisualRow> {
+    fn build_viewport_rows(
+        &self,
+        height: usize,
+        cursor: oxyst_document::CursorPosition,
+    ) -> Vec<VisualRow> {
         let mut rows = Vec::with_capacity(height);
         let mut line = self.scroll.line;
         let mut skip = self.scroll.subrow;
 
         while rows.len() < height && line < self.line_rows.len() {
-            rows.extend(wrap_line_window(
-                &self.source,
-                line,
-                usize::from(self.layout_width.max(1)),
-                skip,
-                height - rows.len(),
-            ));
+            if self.soft_wrap {
+                rows.extend(wrap_line_window(
+                    &self.source,
+                    line,
+                    usize::from(self.layout_width.max(1)),
+                    skip,
+                    height - rows.len(),
+                ));
+            } else if skip == 0
+                && let Some(row) = horizontal_line_window(
+                    &self.source,
+                    line,
+                    usize::from(self.layout_width.max(1)),
+                    self.horizontal_scroll,
+                    (line == cursor.line)
+                        .then(|| (self.document.cursor_byte_index(), cursor.visual_column)),
+                )
+            {
+                rows.push(row);
+            }
             line += 1;
             skip = 0;
         }
 
-        if let (Some(first), Some(last)) = (rows.first(), rows.last()) {
+        let compact_range = rows.first().zip(rows.last()).is_some_and(|(first, last)| {
+            let covered = last.byte_end.saturating_sub(first.byte_start);
+            let visible = rows
+                .iter()
+                .map(|row| row.byte_end.saturating_sub(row.byte_start))
+                .sum::<usize>();
+            covered
+                <= visible
+                    .saturating_mul(4)
+                    .saturating_add(rows.len().saturating_mul(8))
+        });
+        if (self.soft_wrap || compact_range)
+            && let (Some(first), Some(last)) = (rows.first(), rows.last())
+        {
             let ranges = styled_ranges(&self.source, first.byte_start..last.byte_end, self.theme);
             let mut first_range = 0;
             for row in &mut rows {
@@ -433,11 +492,24 @@ impl Editor {
                     &mut first_range,
                 );
             }
+        } else {
+            for row in &mut rows {
+                let ranges = styled_ranges(&self.source, row.byte_start..row.byte_end, self.theme);
+                row.content = highlighted_range(
+                    self.source.text(),
+                    row.byte_start..row.byte_end,
+                    &ranges,
+                    &mut 0,
+                );
+            }
         }
         rows
     }
 
     fn visual_row_start(&self, position: VisualPosition) -> usize {
+        if !self.soft_wrap {
+            return 0;
+        }
         source_line_content(&self.source, position.line).map_or(0, |(_, content)| {
             visual_column_at_row(
                 content,
@@ -516,7 +588,7 @@ impl Editor {
     }
 
     pub(crate) fn replace_document(&mut self, text: &str) {
-        *self = Self::new(text, self.theme);
+        *self = Self::new(text, self.theme, self.soft_wrap);
     }
 
     pub(crate) fn text(&self) -> String {
@@ -578,11 +650,24 @@ impl Editor {
     }
 
     pub(crate) fn word_count(&self) -> usize {
-        self.document.word_count()
+        self.word_count
+    }
+
+    pub(crate) fn set_word_count(&mut self, revision: u64, word_count: usize) {
+        if revision == self.revision() {
+            self.word_count = word_count;
+        }
     }
 
     pub(crate) fn find(&self, query: &str, reverse: bool) -> Option<Range<usize>> {
-        self.document.find(query, reverse)
+        let cursor = if reverse {
+            self.selection_byte_range()
+                .map_or_else(|| self.cursor_byte_index(), |range| range.start)
+        } else {
+            self.selection_byte_range()
+                .map_or_else(|| self.cursor_byte_index(), |range| range.end)
+        };
+        find_from(self.source.text(), query, cursor, reverse)
     }
 
     pub(crate) fn select_byte_range(&mut self, range: Range<usize>) -> bool {
@@ -637,6 +722,7 @@ impl Default for Editor {
                 oxyst_theme::ThemeName::Dark,
                 oxyst_theme::ColorDepth::Ansi16,
             ),
+            false,
         )
     }
 }
@@ -679,6 +765,23 @@ fn source_line_content(source: &Source, line: usize) -> Option<(usize, &str)> {
         '\r', '\n', '\u{000B}', '\u{000C}', '\u{0085}', '\u{2028}', '\u{2029}',
     ]);
     Some((range.start, content))
+}
+
+fn find_from(text: &str, query: &str, cursor: usize, reverse: bool) -> Option<Range<usize>> {
+    if query.is_empty() || cursor > text.len() || !text.is_char_boundary(cursor) {
+        return None;
+    }
+    let start = if reverse {
+        text[..cursor]
+            .rfind(query)
+            .or_else(|| text[cursor..].rfind(query).map(|offset| cursor + offset))
+    } else {
+        text[cursor..]
+            .find(query)
+            .map(|offset| cursor + offset)
+            .or_else(|| text[..cursor].find(query))
+    }?;
+    Some(start..start + query.len())
 }
 
 fn line_row_count(source: &Source, line: usize, width: usize) -> usize {
@@ -738,6 +841,84 @@ fn visual_column_at_row(content: &str, width: usize, target: usize) -> usize {
         visual_column = visual_column.saturating_add(grapheme_width);
     }
     visual_column
+}
+
+fn horizontal_line_window(
+    source: &Source,
+    logical_line: usize,
+    width: usize,
+    target_visual_column: usize,
+    cursor: Option<(usize, usize)>,
+) -> Option<VisualRow> {
+    let (line_byte_start, content) = source_line_content(source, logical_line)?;
+    let (row_byte_start, row_visual_start) = if let Some((cursor_byte, cursor_visual_column)) =
+        cursor
+        && cursor_visual_column >= target_visual_column
+    {
+        let cursor_byte = cursor_byte
+            .saturating_sub(line_byte_start)
+            .min(content.len());
+        let target_width = cursor_visual_column - target_visual_column;
+        let mut covered = 0_usize;
+        let mut start = cursor_byte;
+        if target_width > 0 {
+            for (byte, grapheme) in content[..cursor_byte].grapheme_indices(true).rev() {
+                start = byte;
+                covered = covered.saturating_add(UnicodeWidthStr::width(grapheme));
+                if covered >= target_width {
+                    break;
+                }
+            }
+        }
+        (start, cursor_visual_column.saturating_sub(covered))
+    } else {
+        byte_at_visual_column(content, target_visual_column)
+    };
+
+    let mut row_byte_end = row_byte_start;
+    let mut row_width = 0_usize;
+    for (offset, grapheme) in content[row_byte_start..].grapheme_indices(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if row_width > 0 && row_width.saturating_add(grapheme_width) > width {
+            break;
+        }
+        row_byte_end = row_byte_start + offset + grapheme.len();
+        row_width = row_width.saturating_add(grapheme_width);
+        if row_width >= width {
+            break;
+        }
+    }
+
+    Some(VisualRow {
+        logical_line,
+        subrow: 0,
+        start_visual_column: row_visual_start,
+        byte_start: line_byte_start + row_byte_start,
+        byte_end: line_byte_start + row_byte_end,
+        content: Line::default(),
+        continuation: false,
+    })
+}
+
+fn byte_at_visual_column(content: &str, target: usize) -> (usize, usize) {
+    if content.is_ascii() {
+        let byte = target.min(content.len());
+        return (byte, byte);
+    }
+    let mut byte = 0_usize;
+    let mut visual_column = 0_usize;
+    for (offset, grapheme) in content.grapheme_indices(true) {
+        let next = visual_column.saturating_add(UnicodeWidthStr::width(grapheme));
+        if next > target {
+            return (offset, visual_column);
+        }
+        byte = offset + grapheme.len();
+        visual_column = next;
+        if visual_column == target {
+            break;
+        }
+    }
+    (byte, visual_column)
 }
 
 fn wrap_line_window(
@@ -1136,7 +1317,8 @@ mod tests {
     use typst_syntax::Source;
 
     use super::{
-        Component, Diagnostics, Editor, VisualPosition, line_row_count, matching_brackets,
+        Component, Diagnostics, Editor, VisualPosition, find_from, line_row_count,
+        matching_brackets,
     };
     use crate::action::Action;
 
@@ -1148,7 +1330,7 @@ mod tests {
     fn draws_line_numbers_and_buffer_text() -> Result<(), Infallible> {
         let backend = TestBackend::new(30, 6);
         let mut terminal = Terminal::new(backend)?;
-        let mut editor = Editor::new("first\nsecond", theme());
+        let mut editor = Editor::new("first\nsecond", theme(), false);
 
         terminal.draw(|frame| {
             editor.draw(frame, frame.area(), true);
@@ -1172,7 +1354,7 @@ mod tests {
     #[test]
     fn applies_typst_syntax_styles() -> Result<(), Infallible> {
         let source = "= Heading\n#let answer = 42";
-        let mut editor = Editor::new(source, theme());
+        let mut editor = Editor::new(source, theme(), false);
         let backend = TestBackend::new(40, 6);
         let mut terminal = Terminal::new(backend)?;
 
@@ -1190,7 +1372,7 @@ mod tests {
     #[test]
     fn applies_document_edits_to_the_syntax_source() {
         let source = "#let value = 1";
-        let mut editor = Editor::new(source, theme());
+        let mut editor = Editor::new(source, theme(), false);
         editor.update(Action::Move(Motion::DocumentEnd));
 
         editor.update(Action::Insert('0'));
@@ -1202,7 +1384,7 @@ mod tests {
 
     #[test]
     fn edits_splice_only_the_affected_line_metrics() -> Result<(), Infallible> {
-        let mut editor = Editor::new("abcdefghi\nshort\nthird", theme());
+        let mut editor = Editor::new("abcdefghi\nshort\nthird", theme(), true);
         let mut terminal = Terminal::new(TestBackend::new(12, 6))?;
         terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
 
@@ -1229,7 +1411,7 @@ mod tests {
             .map(|line| format!("line-{line}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let mut editor = Editor::new(&source, theme());
+        let mut editor = Editor::new(&source, theme(), false);
         let mut terminal = Terminal::new(TestBackend::new(30, 6))?;
         terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
         editor.scroll_lines(10);
@@ -1264,7 +1446,7 @@ mod tests {
 
     #[test]
     fn draws_main_source_diagnostic_markers() -> Result<(), Infallible> {
-        let mut editor = Editor::new("first\nsecond", theme());
+        let mut editor = Editor::new("first\nsecond", theme(), false);
         let mut diagnostics = Diagnostics::default();
         diagnostics.set_items(vec![Diagnostic {
             severity: Severity::Error,
@@ -1296,7 +1478,7 @@ mod tests {
 
     #[test]
     fn selection_background_preserves_the_editor_content() -> Result<(), Infallible> {
-        let mut editor = Editor::new("first", theme());
+        let mut editor = Editor::new("first", theme(), false);
         editor.update(Action::Select(Motion::Right));
         editor.update(Action::Select(Motion::Right));
         let backend = TestBackend::new(30, 5);
@@ -1316,8 +1498,18 @@ mod tests {
     }
 
     #[test]
+    fn search_uses_source_text_and_wraps_in_both_directions() {
+        let text = "α界 beta α界";
+        assert_eq!(find_from(text, "α界", 0, false), Some(0..5));
+        assert_eq!(find_from(text, "α界", 5, false), Some(11..16));
+        assert_eq!(find_from(text, "α界", text.len(), false), Some(0..5));
+        assert_eq!(find_from(text, "α界", 11, true), Some(0..5));
+        assert_eq!(find_from(text, "α界", 0, true), Some(11..16));
+    }
+
+    #[test]
     fn mouse_position_uses_visual_columns_for_wide_text() -> Result<(), Infallible> {
-        let mut editor = Editor::new("one\n界two", theme());
+        let mut editor = Editor::new("one\n界two", theme(), false);
         let backend = TestBackend::new(30, 6);
         let mut terminal = Terminal::new(backend)?;
         terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
@@ -1331,7 +1523,7 @@ mod tests {
     #[test]
     fn soft_wraps_wide_text_and_maps_continuation_clicks() -> Result<(), Infallible> {
         let source = "ab\u{754c}cdefgh";
-        let mut editor = Editor::new(source, theme());
+        let mut editor = Editor::new(source, theme(), true);
         let backend = TestBackend::new(12, 6);
         let mut terminal = Terminal::new(backend)?;
         terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
@@ -1358,7 +1550,7 @@ mod tests {
     #[test]
     fn vertical_motion_preserves_the_column_across_short_lines() -> Result<(), Infallible> {
         let source = "abcd\nx\nabcd";
-        let mut editor = Editor::new(source, theme());
+        let mut editor = Editor::new(source, theme(), false);
         let backend = TestBackend::new(30, 7);
         let mut terminal = Terminal::new(backend)?;
         terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
@@ -1378,7 +1570,7 @@ mod tests {
             .map(|line| format!("line-{line}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let mut editor = Editor::new(&source, theme());
+        let mut editor = Editor::new(&source, theme(), false);
         let mut terminal = Terminal::new(TestBackend::new(24, 6))?;
         terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
 
@@ -1410,7 +1602,7 @@ mod tests {
             .map(|line| format!("#let value{line} = {line}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let mut editor = Editor::new(&source, theme());
+        let mut editor = Editor::new(&source, theme(), false);
         let mut terminal = Terminal::new(TestBackend::new(40, 8))?;
         terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
 
@@ -1432,7 +1624,7 @@ mod tests {
         );
 
         let long_source = "a".repeat(100_000);
-        let mut long_editor = Editor::new(&long_source, theme());
+        let mut long_editor = Editor::new(&long_source, theme(), false);
         terminal.draw(|frame| long_editor.draw(frame, frame.area(), true))?;
         let materialized_bytes = long_editor
             .viewport_rows
@@ -1443,6 +1635,47 @@ mod tests {
         assert!(materialized_bytes < long_source.len());
         assert!(long_editor.viewport_rows.len() <= usize::from(long_editor.text_area.height));
         Ok(())
+    }
+
+    #[test]
+    fn horizontal_window_follows_the_cursor_without_wrapping_the_line() -> Result<(), Infallible> {
+        let source = format!("{}visible-tail", "x".repeat(100_000));
+        let mut editor = Editor::new(&source, theme(), false);
+        editor.update(Action::Move(Motion::DocumentEnd));
+        let mut terminal = Terminal::new(TestBackend::new(30, 5))?;
+
+        terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
+
+        assert_eq!(editor.line_rows, [1]);
+        assert!(editor.horizontal_scroll > 0);
+        let materialized = editor
+            .viewport_rows
+            .iter()
+            .flat_map(|row| &row.content.spans)
+            .map(|span| span.content.len())
+            .sum::<usize>();
+        assert!(materialized < 40);
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("visible-tail"));
+        Ok(())
+    }
+
+    #[test]
+    fn stale_background_word_counts_do_not_replace_the_current_count() {
+        let mut editor = Editor::new("one two", theme(), false);
+        let original_revision = editor.revision();
+        editor.set_word_count(original_revision, 2);
+
+        editor.update(Action::Insert('x'));
+        editor.set_word_count(original_revision, 99);
+
+        assert_eq!(editor.word_count(), 2);
     }
 
     #[test]
@@ -1461,13 +1694,27 @@ mod tests {
 
     #[test]
     #[ignore = "manual release-mode performance probe"]
+    fn massive_search_uses_the_existing_source_buffer() {
+        let source = format!("{}needle", "x".repeat(10 * 1024 * 1024));
+        let started = Instant::now();
+        for _ in 0..20 {
+            assert_eq!(
+                find_from(&source, "needle", 0, false),
+                Some(source.len() - 6..source.len())
+            );
+        }
+        eprintln!("20 searches across 10 MiB: {:?}", started.elapsed());
+    }
+
+    #[test]
+    #[ignore = "manual release-mode performance probe"]
     fn massive_document_edit_and_draw_is_viewport_bound() -> Result<(), Infallible> {
         let source = (0..100_000)
             .map(|line| format!("#let value{line} = ({line} + 1)"))
             .collect::<Vec<_>>()
             .join("\n");
         let started = Instant::now();
-        let mut editor = Editor::new(&source, theme());
+        let mut editor = Editor::new(&source, theme(), false);
         let initialized = started.elapsed();
         let mut terminal = Terminal::new(TestBackend::new(100, 30))?;
         terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;

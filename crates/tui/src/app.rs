@@ -178,7 +178,7 @@ impl App {
         let watcher = ProjectWatcher::new(&root, path.as_deref(), sender.clone())?;
 
         Ok(Self {
-            editor: Editor::new(text, theme),
+            editor: Editor::new(text, theme, config.soft_wrap),
             header,
             status_bar,
             clipboard: Clipboard::new(),
@@ -292,6 +292,10 @@ impl App {
             Action::Save => self.save(),
             Action::Recompile => self.start_compile(),
             Action::CompileFinished(result) => self.finish_compile(result),
+            Action::WordCountFinished(result) if result.generation == self.compile_generation => {
+                self.editor.set_word_count(result.revision, result.count);
+            }
+            Action::WordCountFinished(_) => {}
             Action::PreviewPagesFinished(result) => self.finish_preview_pages(result),
             Action::ExportFinished(result) => self.finish_export(result),
             Action::Resize => {}
@@ -1451,10 +1455,12 @@ mod tests {
         app.preview.set_viewport(Rect::new(0, 0, 52, 20));
         app.observe_preview_width();
         assert_eq!(app.compile_generation, generation);
-        let Event::CompileFinished(result) =
-            app.internal_events.recv_timeout(Duration::from_secs(30))?
-        else {
-            return Err("worker returned an unexpected event".into());
+        let result = loop {
+            match app.internal_events.recv_timeout(Duration::from_secs(30))? {
+                Event::CompileFinished(result) => break result,
+                Event::WordCountFinished(_) => {}
+                _ => return Err("worker returned an unexpected event".into()),
+            }
         };
         app.finish_compile(result);
         assert_eq!(app.compile_generation, generation);
@@ -1597,6 +1603,7 @@ mod tests {
             startup_status: None,
         })
         .map_err(std::io::Error::other)?;
+        app.editor.set_word_count(app.editor.revision(), 2);
         crate::components::Component::update(&mut app.editor, crate::action::Action::Insert('x'));
         app.compile_state = CompileState::Ready;
         let mut terminal = Terminal::new(TestBackend::new(100, 20))?;

@@ -72,6 +72,7 @@ const ACTIONS: &[(&str, &[&str])] = &[
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
     pub theme: String,
+    pub soft_wrap: bool,
     pub keys: BTreeMap<String, Vec<String>>,
 }
 
@@ -105,6 +106,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             theme: "dark".to_owned(),
+            soft_wrap: false,
             keys: ACTIONS
                 .iter()
                 .map(|(action, bindings)| {
@@ -145,6 +147,7 @@ pub enum Error {
 #[serde(default, deny_unknown_fields)]
 struct FileConfig {
     theme: Option<String>,
+    soft_wrap: Option<bool>,
     keys: BTreeMap<String, Vec<String>>,
 }
 
@@ -156,6 +159,9 @@ fn parse(source: &str, path: &Path) -> Result<Config, Error> {
     let mut config = Config::default();
     if let Some(theme) = parsed.theme {
         config.theme = theme;
+    }
+    if let Some(soft_wrap) = parsed.soft_wrap {
+        config.soft_wrap = soft_wrap;
     }
     for (action, bindings) in parsed.keys {
         if !ACTIONS.iter().any(|(known, _)| *known == action) {
@@ -196,11 +202,12 @@ mod tests {
     #[test]
     fn partial_config_inherits_defaults() -> Result<(), Error> {
         let config = parse(
-            "theme = \"light\"\n[keys]\nsave = [\"alt+s\"]\n",
+            "theme = \"light\"\nsoft_wrap = true\n[keys]\nsave = [\"alt+s\"]\n",
             Path::new("config.toml"),
         )?;
 
         assert_eq!(config.theme, "light");
+        assert!(config.soft_wrap);
         assert_eq!(config.keys["save"], ["alt+s"]);
         assert_eq!(config.keys["quit"], Config::default().keys["quit"]);
         Ok(())

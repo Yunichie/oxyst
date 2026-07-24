@@ -3,6 +3,7 @@
 
 # Available themes: "dark" and "light".
 theme = "dark"
+soft_wrap = false
 
 [keys]
 # Session
