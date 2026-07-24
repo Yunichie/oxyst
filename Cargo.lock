@@ -2147,6 +2147,7 @@ dependencies = [
  "typst-ide",
  "typst-kit",
  "typst-layout",
+ "unicode-segmentation",
 ]
 
 [[package]]

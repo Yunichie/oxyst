@@ -15,6 +15,7 @@ use oxyst_document::TextEdit;
 use oxyst_render::RenderManifest;
 use ratatui_image::{picker::Picker, sliced::SlicedProtocol};
 use tokio::runtime::Handle;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{components::Preview, event::Event};
 
@@ -58,9 +59,24 @@ pub(crate) struct PreviewPageSuccess {
     pub(crate) pages: Vec<(usize, SlicedProtocol)>,
 }
 
+pub(crate) struct WordCountResult {
+    pub(crate) generation: u64,
+    pub(crate) revision: u64,
+    pub(crate) count: usize,
+}
+
 enum CompileInput {
     Snapshot(CompileSnapshot),
     Rebuild(WorldRebuild),
+}
+
+impl CompileInput {
+    fn word_count(&self) -> usize {
+        match self {
+            Self::Snapshot(snapshot) => snapshot.word_count(),
+            Self::Rebuild(rebuild) => rebuild.source.unicode_words().count(),
+        }
+    }
 }
 
 pub(crate) struct WorldRebuild {
@@ -397,6 +413,18 @@ fn start_request(runner: Runner, request: CompileRequest) {
     let runtime = runner.runtime.clone();
     drop(runtime.spawn_blocking(move || {
         let started = Instant::now();
+        if is_current(&runner.generation, request.generation) {
+            let word_count = request.input.word_count();
+            if is_current(&runner.generation, request.generation) {
+                let _ = runner
+                    .sender
+                    .send(Event::WordCountFinished(WordCountResult {
+                        generation: request.generation,
+                        revision: request.revision,
+                        count: word_count,
+                    }));
+            }
+        }
         let result = compile(request, &runner.generation, started);
         if let Some(result) = result
             && is_current(&runner.generation, result.generation)
@@ -491,16 +519,21 @@ mod tests {
     use std::{
         error::Error,
         path::PathBuf,
-        sync::{atomic::AtomicU64, mpsc::channel},
+        sync::{
+            atomic::AtomicU64,
+            mpsc::{Receiver, channel},
+        },
         time::Duration,
     };
 
     use oxyst_compiler::Compiler;
     use ratatui_image::picker::Picker;
+    use unicode_segmentation::UnicodeSegmentation;
 
     use super::{
-        CompileInput, CompileRequest, CompileResultKind, CompileWorker, PreviewPageRequest,
-        PreviewScheduler, QueuedPreviewRequest, Scheduler, WorldRebuild, advance, is_current,
+        CompileInput, CompileRequest, CompileResult, CompileResultKind, CompileWorker,
+        PreviewPageRequest, PreviewScheduler, QueuedPreviewRequest, Scheduler, WorldRebuild,
+        advance, is_current,
     };
     use crate::event::Event;
 
@@ -563,18 +596,22 @@ mod tests {
         let (sender, receiver) = channel();
         let worker = CompileWorker::new(compiler, "= old world", sender, runtime.handle().clone());
 
+        let source = "= rebuilt world";
         worker.spawn_with_world(
             0,
             WorldRebuild {
                 root: root.clone(),
                 main: root.join("simple.typ"),
-                source: "= rebuilt world".to_owned(),
+                source: source.to_owned(),
             },
         );
-        let Event::CompileFinished(mut result) = receiver.recv_timeout(Duration::from_secs(30))?
+        let Event::WordCountFinished(word_count) =
+            receiver.recv_timeout(Duration::from_secs(30))?
         else {
-            return Err("worker returned an unexpected event".into());
+            return Err("worker did not report the word count first".into());
         };
+        assert_eq!(word_count.count, source.unicode_words().count());
+        let mut result = receive_compile(&receiver)?;
         assert!(result.rebuild_attempted);
         let rebuilt = result
             .rebuilt_compiler
@@ -602,9 +639,7 @@ mod tests {
         );
 
         let generation = worker.spawn(7);
-        let Event::CompileFinished(result) = receiver.recv_timeout(Duration::from_secs(30))? else {
-            return Err("worker returned an unexpected event".into());
-        };
+        let result = receive_compile(&receiver)?;
         let CompileResultKind::Success { document, .. } = result.outcome else {
             return Err("document did not compile".into());
         };
@@ -684,5 +719,15 @@ mod tests {
             revision: generation,
             input: CompileInput::Snapshot(compiler.snapshot()),
         })
+    }
+
+    fn receive_compile(receiver: &Receiver<Event>) -> Result<CompileResult, Box<dyn Error>> {
+        loop {
+            match receiver.recv_timeout(Duration::from_secs(30))? {
+                Event::CompileFinished(result) => return Ok(result),
+                Event::WordCountFinished(_) => {}
+                _ => return Err("worker returned an unexpected event".into()),
+            }
+        }
     }
 }

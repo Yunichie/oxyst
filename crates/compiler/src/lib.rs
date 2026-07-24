@@ -14,6 +14,7 @@ pub use sync::{DocumentSync, PagePosition};
 use thiserror::Error;
 use typst::diag::Warned;
 use typst_layout::{Page, PagedDocument};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{diagnostics::convert_diagnostics, world::TypstWorld};
 
@@ -97,6 +98,11 @@ pub struct CompileSnapshot {
 }
 
 impl CompileSnapshot {
+    #[must_use]
+    pub fn word_count(&self) -> usize {
+        self.world.source_text().unicode_words().count()
+    }
+
     #[must_use]
     pub fn compile(self) -> CompileOutcome {
         let Warned { output, warnings } = typst::compile::<PagedDocument>(&self.world);

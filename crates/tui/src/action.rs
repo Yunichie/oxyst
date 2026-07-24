@@ -1,6 +1,6 @@
 use oxyst_document::Motion;
 
-use crate::compile::{CompileResult, PreviewPageResult};
+use crate::compile::{CompileResult, PreviewPageResult, WordCountResult};
 use crate::export::ExportResult;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25,6 +25,7 @@ pub(crate) enum Action {
     Redo,
     Recompile,
     CompileFinished(CompileResult),
+    WordCountFinished(WordCountResult),
     PreviewPagesFinished(PreviewPageResult),
     ExportFinished(ExportResult),
     Resize,

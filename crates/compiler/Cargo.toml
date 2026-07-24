@@ -12,6 +12,7 @@ typst.workspace = true
 typst-ide.workspace = true
 typst-kit.workspace = true
 typst-layout.workspace = true
+unicode-segmentation.workspace = true
 
 [lints]
 workspace = true

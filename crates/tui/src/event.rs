@@ -7,7 +7,7 @@ use std::{
 use crossterm::event::{self, KeyEvent, MouseEvent};
 
 use crate::{
-    compile::{CompileResult, PreviewPageResult},
+    compile::{CompileResult, PreviewPageResult, WordCountResult},
     export::ExportResult,
 };
 
@@ -19,6 +19,7 @@ pub(crate) enum Event {
     ProjectFilesChanged,
     FileWatchFailed(String),
     CompileFinished(CompileResult),
+    WordCountFinished(WordCountResult),
     PreviewPagesFinished(PreviewPageResult),
     ExportFinished(ExportResult),
     Tick,
