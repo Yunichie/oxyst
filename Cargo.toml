@@ -8,6 +8,7 @@ license.workspace = true
 
 [workspace]
 members = [
+    "benchmarks",
     "crates/compiler",
     "crates/config",
     "crates/document",

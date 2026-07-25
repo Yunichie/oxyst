@@ -1,0 +1,21 @@
+[package]
+name = "oxyst-benchmarks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dev-dependencies]
+criterion = { version = "=0.8.2", features = ["csv_output"] }
+oxyst-compiler.workspace = true
+oxyst-config.workspace = true
+oxyst-document.workspace = true
+oxyst-render.workspace = true
+
+[[bench]]
+name = "operations"
+harness = false
+
+[lints]
+workspace = true

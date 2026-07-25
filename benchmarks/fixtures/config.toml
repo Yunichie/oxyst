@@ -1,0 +1,7 @@
+theme = "light"
+soft_wrap = true
+
+[keys]
+save = ["alt+s"]
+command_palette = ["ctrl+shift+p", ":"]
+toggle_file_explorer = ["ctrl+e"]
