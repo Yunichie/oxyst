@@ -20,7 +20,7 @@ cargo install --git https://github.com/Yunichie/oxyst.git
 
 To install from a local checkout:
 
-```console
+```bash
 git clone https://github.com/Yunichie/oxyst.git
 cd oxyst
 cargo install --path .
@@ -29,7 +29,7 @@ cargo install --path .
 Upgrade an existing installation by adding `--force` to either `cargo install` command. Verify the
 installation with:
 
-```console
+```bash
 oxyst --version
 ```
 
