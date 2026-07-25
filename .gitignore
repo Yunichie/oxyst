@@ -1,3 +1,5 @@
 /target/
 *.log
 /refs
+/benchmarks/results/
+__pycache__/
