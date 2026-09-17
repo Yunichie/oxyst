@@ -2197,6 +2197,7 @@ dependencies = [
  "oxyst-compiler",
  "oxyst-config",
  "oxyst-document",
+ "oxyst-pipeline",
  "oxyst-render",
  "oxyst-theme",
  "ratatui",
@@ -2249,6 +2250,18 @@ dependencies = [
  "ropey",
  "unicode-segmentation",
  "unicode-width",
+]
+
+[[package]]
+name = "oxyst-pipeline"
+version = "0.1.0"
+dependencies = [
+ "oxyst-compiler",
+ "oxyst-render",
+ "ratatui",
+ "ratatui-image",
+ "tokio",
+ "typst-syntax",
 ]
 
 [[package]]

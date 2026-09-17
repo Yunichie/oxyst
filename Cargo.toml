@@ -12,6 +12,7 @@ members = [
     "crates/compiler",
     "crates/config",
     "crates/document",
+    "crates/pipeline",
     "crates/render",
     "crates/theme",
     "crates/tui",
@@ -53,6 +54,7 @@ oxyst-app = { path = "crates/tui" }
 oxyst-compiler = { path = "crates/compiler" }
 oxyst-config = { path = "crates/config" }
 oxyst-document = { path = "crates/document" }
+oxyst-pipeline = { path = "crates/pipeline" }
 oxyst-render = { path = "crates/render" }
 oxyst-theme = { path = "crates/theme" }
 

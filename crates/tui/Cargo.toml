@@ -19,6 +19,7 @@ toml.workspace = true
 oxyst-compiler.workspace = true
 oxyst-config.workspace = true
 oxyst-document.workspace = true
+oxyst-pipeline.workspace = true
 oxyst-render.workspace = true
 oxyst-theme.workspace = true
 typst-syntax.workspace = true

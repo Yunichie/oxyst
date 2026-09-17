@@ -1,0 +1,18 @@
+[package]
+name = "oxyst-pipeline"
+description = "Compilation and preview pipeline for oxyst"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ratatui.workspace = true
+ratatui-image.workspace = true
+tokio.workspace = true
+typst-syntax.workspace = true
+oxyst-compiler.workspace = true
+oxyst-render.workspace = true
+
+[lints]
+workspace = true
