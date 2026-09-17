@@ -10,64 +10,9 @@ use std::{
 use serde::Deserialize;
 use thiserror::Error;
 
-const ACTIONS: &[(&str, &[&str])] = &[
-    ("quit", &["ctrl+q"]),
-    ("save", &["ctrl+s"]),
-    ("recompile", &["ctrl+r"]),
-    ("undo", &["ctrl+z"]),
-    ("redo", &["ctrl+y", "ctrl+shift+z"]),
-    ("move_left", &["left"]),
-    ("move_right", &["right"]),
-    ("move_up", &["up"]),
-    ("move_down", &["down"]),
-    ("select_left", &["shift+left"]),
-    ("select_right", &["shift+right"]),
-    ("select_up", &["shift+up"]),
-    ("select_down", &["shift+down"]),
-    ("word_left", &["ctrl+left"]),
-    ("word_right", &["ctrl+right"]),
-    ("select_word_left", &["ctrl+shift+left"]),
-    ("select_word_right", &["ctrl+shift+right"]),
-    ("line_start", &["home"]),
-    ("line_end", &["end"]),
-    ("select_line_start", &["shift+home"]),
-    ("select_line_end", &["shift+end"]),
-    ("document_start", &["ctrl+home"]),
-    ("document_end", &["ctrl+end"]),
-    ("select_document_start", &["ctrl+shift+home"]),
-    ("select_document_end", &["ctrl+shift+end"]),
-    ("select_all", &["ctrl+a"]),
-    ("copy", &["ctrl+c"]),
-    ("cut", &["ctrl+x"]),
-    ("paste", &["ctrl+v"]),
-    ("find", &["ctrl+f"]),
-    ("find_replace", &["ctrl+h"]),
-    ("find_next", &["enter"]),
-    ("find_previous", &["shift+enter"]),
-    ("search_toggle_field", &["tab"]),
-    ("replace_current", &["ctrl+enter"]),
-    ("backspace", &["backspace"]),
-    ("delete", &["delete"]),
-    ("newline", &["enter"]),
-    ("switch_focus", &["tab", "f6"]),
-    ("fullscreen", &["f2"]),
-    ("zoom_in", &["ctrl+="]),
-    ("zoom_out", &["ctrl+-"]),
-    ("preview_page_up", &["ctrl+pageup"]),
-    ("preview_page_down", &["ctrl+pagedown"]),
-    ("command_palette", &["ctrl+shift+p", ":"]),
-    ("toggle_diagnostics", &["ctrl+j"]),
-    ("next_diagnostic", &["f8"]),
-    ("previous_diagnostic", &["shift+f8"]),
-    ("toggle_file_explorer", &["ctrl+b"]),
-    ("go_to_line", &["ctrl+g"]),
-    ("help", &["f1", "?"]),
-    ("close_overlay", &["esc"]),
-    ("confirm", &["y"]),
-    ("cancel_confirmation", &["n", "esc"]),
-    ("welcome_new", &["n"]),
-    ("welcome_open", &["o"]),
-];
+mod command;
+
+pub use command::{CommandContext, CommandId};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
@@ -107,12 +52,12 @@ impl Default for Config {
         Self {
             theme: "dark".to_owned(),
             soft_wrap: false,
-            keys: ACTIONS
-                .iter()
-                .map(|(action, bindings)| {
+            keys: CommandId::all()
+                .map(|command| {
                     (
-                        (*action).to_owned(),
-                        bindings
+                        command.name().to_owned(),
+                        command
+                            .default_bindings()
                             .iter()
                             .map(|binding| (*binding).to_owned())
                             .collect(),
@@ -164,7 +109,7 @@ fn parse(source: &str, path: &Path) -> Result<Config, Error> {
         config.soft_wrap = soft_wrap;
     }
     for (action, bindings) in parsed.keys {
-        if !ACTIONS.iter().any(|(known, _)| *known == action) {
+        if CommandId::from_name(&action).is_none() {
             return Err(Error::UnknownAction {
                 path: path.to_owned(),
                 action,
