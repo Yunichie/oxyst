@@ -1,9 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 
 use oxyst_compiler::PagePosition;
+use oxyst_render::RenderManifest;
 #[cfg(test)]
-use oxyst_render::RenderedDocument;
-use oxyst_render::{PageImage, RenderManifest, RenderedPage};
+use oxyst_render::{RenderedDocument, RenderedPage};
 use oxyst_theme::Theme;
 use ratatui::{
     Frame,
@@ -14,12 +14,11 @@ use ratatui::{
     },
 };
 use ratatui_image::{
-    picker::{Picker, ProtocolType},
-    protocol::halfblocks::Halfblocks,
+    picker::Picker,
     sliced::{SignedPosition, SlicedImage, SlicedProtocol},
 };
 
-use crate::{action::Action, style::color};
+use crate::style::color;
 
 use super::Component;
 
@@ -71,46 +70,21 @@ impl Preview {
         rendered: RenderedDocument,
         width: u16,
     ) -> Result<Vec<SlicedProtocol>, String> {
-        rendered
-            .into_pages()
-            .into_iter()
-            .map(|page| encode_page(picker, page, width))
-            .collect()
+        oxyst_pipeline::encode_document(picker, rendered, width)
     }
 
+    #[cfg(test)]
     pub(crate) fn encode_rendered_pages_cancellable(
         picker: &Picker,
         rendered: Vec<RenderedPage>,
         width: u16,
         cancelled: impl Fn() -> bool,
     ) -> Result<Option<Vec<(usize, SlicedProtocol)>>, String> {
-        let mut pages = Vec::with_capacity(rendered.len());
-        for page in rendered {
-            if cancelled() {
-                return Ok(None);
-            }
-            let index = page.index();
-            pages.push((index, encode_page(picker, page.into_image(), width)?));
-        }
-        Ok(Some(pages))
+        oxyst_pipeline::encode_rendered_pages_cancellable(picker, rendered, width, cancelled)
     }
 
     pub(crate) fn page_sizes(picker: &Picker, manifest: &RenderManifest, width: u16) -> Vec<Size> {
-        let width = width.max(1);
-        let font = picker.font_size();
-        manifest
-            .pages()
-            .iter()
-            .map(|page| {
-                let pixel_width = u64::from(page.width().max(1));
-                let target_pixel_width = u64::from(width) * u64::from(font.width.max(1));
-                let scaled_height = u64::from(page.height()) * target_pixel_width / pixel_width;
-                let rows = scaled_height
-                    .div_ceil(u64::from(font.height.max(1)))
-                    .clamp(1, u64::from(u16::MAX)) as u16;
-                Size::new(width, rows)
-            })
-            .collect()
+        oxyst_pipeline::page_sizes(picker, manifest, width)
     }
 
     pub(crate) fn replace_render_manifest(
@@ -583,27 +557,6 @@ fn encoded_page_keys(
         .collect()
 }
 
-fn encode_page(picker: &Picker, page: PageImage, width: u16) -> Result<SlicedProtocol, String> {
-    let width = width.max(1);
-    let font = picker.font_size();
-    let pixel_width = u64::from(page.width().max(1));
-    let target_pixel_width = u64::from(width) * u64::from(font.width.max(1));
-    let scaled_height = u64::from(page.height()) * target_pixel_width / pixel_width;
-    let rows = scaled_height
-        .div_ceil(u64::from(font.height.max(1)))
-        .clamp(1, u64::from(u16::MAX)) as u16;
-    let size = Size::new(width, rows);
-    let image = page.into_image();
-    match picker.protocol_type() {
-        ProtocolType::Halfblocks => Halfblocks::new(image, size)
-            .map(SlicedProtocol::Halfblocks)
-            .map_err(|error| error.to_string()),
-        ProtocolType::Sixel | ProtocolType::Kitty | ProtocolType::Iterm2 => {
-            SlicedProtocol::new(picker, image, Some(size)).map_err(|error| error.to_string())
-        }
-    }
-}
-
 impl Default for Preview {
     fn default() -> Self {
         Self::new(Theme::new(
@@ -614,15 +567,6 @@ impl Default for Preview {
 }
 
 impl Component for Preview {
-    fn update(&mut self, action: Action) {
-        match action {
-            Action::ScrollPreviewPages(pages) => self.scroll_pages(pages),
-            Action::Move(oxyst_document::Motion::Up) => self.scroll_lines(-1),
-            Action::Move(oxyst_document::Motion::Down) => self.scroll_lines(1),
-            _ => {}
-        }
-    }
-
     fn draw(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
         self.draw_preview(frame, area, focused, false);
     }

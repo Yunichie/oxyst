@@ -1,4 +1,4 @@
-use oxyst_render::ExportFormat;
+use oxyst_config::CommandId;
 use oxyst_theme::Theme;
 use ratatui::{
     Frame,
@@ -12,54 +12,6 @@ use unicode_width::UnicodeWidthStr;
 use crate::style::{base, color};
 
 use super::modal_area;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Command {
-    OpenFile,
-    Export(ExportFormat),
-    GoToLine,
-    GoToPage,
-    ToggleDiagnostics,
-    ToggleFileExplorer,
-    UseDarkTheme,
-    UseLightTheme,
-    ReloadFonts,
-    Quit,
-}
-
-impl Command {
-    const ALL: &[Self] = &[
-        Self::OpenFile,
-        Self::Export(ExportFormat::Pdf),
-        Self::Export(ExportFormat::Png),
-        Self::Export(ExportFormat::Svg),
-        Self::GoToLine,
-        Self::GoToPage,
-        Self::ToggleDiagnostics,
-        Self::ToggleFileExplorer,
-        Self::UseDarkTheme,
-        Self::UseLightTheme,
-        Self::ReloadFonts,
-        Self::Quit,
-    ];
-
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::OpenFile => "Open file",
-            Self::Export(ExportFormat::Pdf) => "Export as PDF",
-            Self::Export(ExportFormat::Png) => "Export as PNG",
-            Self::Export(ExportFormat::Svg) => "Export as SVG",
-            Self::GoToLine => "Go to line",
-            Self::GoToPage => "Go to page",
-            Self::ToggleDiagnostics => "Toggle diagnostics",
-            Self::ToggleFileExplorer => "Toggle file explorer",
-            Self::UseDarkTheme => "Use dark theme",
-            Self::UseLightTheme => "Use light theme",
-            Self::ReloadFonts => "Reload fonts",
-            Self::Quit => "Quit",
-        }
-    }
-}
 
 #[derive(Debug, Default)]
 pub(crate) struct CommandPalette {
@@ -95,7 +47,7 @@ impl CommandPalette {
         }
     }
 
-    pub(crate) fn selected(&self) -> Option<Command> {
+    pub(crate) fn selected(&self) -> Option<CommandId> {
         self.matches().get(self.selected).copied()
     }
 
@@ -159,10 +111,9 @@ impl CommandPalette {
         ));
     }
 
-    fn matches(&self) -> Vec<Command> {
-        Command::ALL
-            .iter()
-            .copied()
+    fn matches(&self) -> Vec<CommandId> {
+        CommandId::all()
+            .filter(|command| command.show_in_palette())
             .filter(|command| fuzzy_match(command.label(), &self.query))
             .collect()
     }
@@ -189,7 +140,9 @@ mod tests {
     use oxyst_theme::{ColorDepth, Theme, ThemeName};
     use ratatui::{Terminal, backend::TestBackend, style::Color};
 
-    use super::{Command, CommandPalette, fuzzy_match, visible_start};
+    use oxyst_config::CommandId;
+
+    use super::{CommandPalette, fuzzy_match, visible_start};
 
     #[test]
     fn fuzzy_search_matches_subsequences() {
@@ -198,28 +151,31 @@ mod tests {
 
         let mut palette = CommandPalette::default();
         palette.input_text("png");
-        assert_eq!(
-            palette.selected(),
-            Some(Command::Export(oxyst_render::ExportFormat::Png))
-        );
+        assert_eq!(palette.selected(), Some(CommandId::ExportPng));
     }
 
     #[test]
     fn result_window_tracks_the_selection() {
-        assert_eq!(visible_start(0, Command::ALL.len(), 2), 0);
-        assert_eq!(visible_start(5, Command::ALL.len(), 2), 4);
+        let command_count = CommandId::all()
+            .filter(|command| command.show_in_palette())
+            .count();
+        assert_eq!(visible_start(0, command_count, 2), 0);
+        assert_eq!(visible_start(5, command_count, 2), 4);
         assert_eq!(
-            visible_start(Command::ALL.len() - 1, Command::ALL.len(), 2),
-            Command::ALL.len() - 2
+            visible_start(command_count - 1, command_count, 2),
+            command_count - 2
         );
-        assert_eq!(visible_start(0, Command::ALL.len(), 0), 0);
+        assert_eq!(visible_start(0, command_count, 0), 0);
     }
 
     #[test]
     fn draws_selected_results_in_short_terminals() -> Result<(), Infallible> {
         let theme = Theme::new(ThemeName::Dark, ColorDepth::Ansi16);
         let mut palette = CommandPalette::default();
-        for _ in 1..Command::ALL.len() {
+        let command_count = CommandId::all()
+            .filter(|command| command.show_in_palette())
+            .count();
+        for _ in 1..command_count {
             palette.move_selection(1);
         }
         let mut terminal = Terminal::new(TestBackend::new(40, 8))?;

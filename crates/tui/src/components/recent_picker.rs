@@ -35,6 +35,12 @@ impl RecentPicker {
         self.entries.get(self.selected).cloned()
     }
 
+    pub(crate) fn update(&mut self, action: Action) {
+        if let Action::OverlayMove(direction) = action {
+            self.move_selection(direction);
+        }
+    }
+
     fn move_selection(&mut self, direction: isize) {
         if self.entries.is_empty() {
             self.selected = 0;
@@ -48,12 +54,6 @@ impl RecentPicker {
 }
 
 impl Component for RecentPicker {
-    fn update(&mut self, action: Action) {
-        if let Action::OverlayMove(direction) = action {
-            self.move_selection(direction);
-        }
-    }
-
     fn draw(&mut self, frame: &mut Frame, _area: Rect, _focused: bool) {
         let height = u16::try_from(self.entries.len())
             .unwrap_or(u16::MAX)

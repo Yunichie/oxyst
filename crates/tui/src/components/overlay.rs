@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use oxyst_config::CommandId;
 use oxyst_render::ExportFormat;
 use oxyst_theme::Theme;
 use ratatui::{
@@ -10,13 +11,12 @@ use ratatui::{
 };
 
 use super::{
-    Command, CommandPalette, Component, Help, Prompt, PromptKind, RecentPicker, Search, SearchMode,
+    CommandPalette, Component, Help, Prompt, PromptKind, RecentPicker, Search, SearchMode,
     modal_area,
 };
 use crate::{
     action::Action,
-    event::Event,
-    input::{self, InputMode, Keymap},
+    input::{InputMode, Keymap},
     style::{base, color},
 };
 
@@ -46,7 +46,7 @@ enum Overlay {
 }
 
 pub(crate) enum OverlaySubmission {
-    Command(Command),
+    Command(CommandId),
     Prompt(Prompt),
     Confirm(ConfirmIntent),
     Recent(PathBuf),
@@ -150,23 +150,7 @@ impl OverlayHost {
         self.theme = theme;
     }
 
-    fn clone_input(event: &Event) -> Option<Event> {
-        match event {
-            Event::Key(key) => Some(Event::Key(*key)),
-            Event::Mouse(mouse) => Some(Event::Mouse(*mouse)),
-            Event::Paste(text) => Some(Event::Paste(text.clone())),
-            _ => None,
-        }
-    }
-}
-
-impl Component for OverlayHost {
-    fn handle_event(&mut self, event: &Event) -> Option<Action> {
-        let mode = self.input_mode()?;
-        input::resolve(Self::clone_input(event)?, mode, &self.keymap, true)
-    }
-
-    fn update(&mut self, action: Action) {
+    pub(crate) fn update(&mut self, action: Action) {
         match (&mut self.current, action) {
             (Overlay::Palette(palette), Action::OverlayInput(character)) => {
                 palette.input(character);
@@ -197,7 +181,9 @@ impl Component for OverlayHost {
             _ => {}
         }
     }
+}
 
+impl Component for OverlayHost {
     fn draw(&mut self, frame: &mut Frame, _area: Rect, _focused: bool) {
         match &mut self.current {
             Overlay::None => {}
@@ -213,8 +199,8 @@ impl Component for OverlayHost {
                     Paragraph::new(format!(
                         "{}\n{} confirm | {} cancel",
                         confirmation.message,
-                        self.keymap.display("confirm"),
-                        self.keymap.display("cancel_confirmation")
+                        self.keymap.display(CommandId::Confirm),
+                        self.keymap.display(CommandId::CancelConfirmation)
                     ))
                     .centered()
                     .block(
@@ -236,11 +222,10 @@ impl Component for OverlayHost {
 mod tests {
     use std::path::PathBuf;
 
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use oxyst_config::Config;
     use oxyst_theme::{ColorDepth, Theme, ThemeName};
 
-    use super::{Component, Event, Keymap, OverlayHost, OverlaySubmission};
+    use super::{Keymap, OverlayHost, OverlaySubmission};
     use crate::action::Action;
 
     #[test]
@@ -250,20 +235,7 @@ mod tests {
         let second = PathBuf::from("second.typ");
         overlay.open_recent(vec![PathBuf::from("first.typ"), second.clone()]);
 
-        let move_action = overlay
-            .handle_event(&Event::Key(KeyEvent::new(
-                KeyCode::Down,
-                KeyModifiers::NONE,
-            )))
-            .ok_or_else(|| "recent picker did not handle Down".to_owned())?;
-        overlay.update(move_action);
-        let submit_action = overlay
-            .handle_event(&Event::Key(KeyEvent::new(
-                KeyCode::Enter,
-                KeyModifiers::NONE,
-            )))
-            .ok_or_else(|| "recent picker did not handle Enter".to_owned())?;
-        assert!(matches!(submit_action, Action::OverlaySubmit));
+        overlay.update(Action::OverlayMove(1));
         assert!(matches!(
             overlay.submit(),
             Some(OverlaySubmission::Recent(path)) if path == second

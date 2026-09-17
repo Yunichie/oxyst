@@ -4,13 +4,7 @@ use oxyst_compiler::CompiledDocument;
 use oxyst_render::ExportFormat;
 use tokio::runtime::Handle;
 
-use crate::event::Event;
-
-pub(crate) struct ExportResult {
-    pub(crate) format: ExportFormat,
-    pub(crate) path: PathBuf,
-    pub(crate) result: Result<(), String>,
-}
+use crate::{event::Event, message::ExportResult};
 
 pub(crate) struct ExportWorker {
     sender: Sender<Event>,

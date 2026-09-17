@@ -10,16 +10,10 @@ use std::{
 
 use tokio::runtime::Handle;
 
-use crate::event::Event;
+use crate::{event::Event, message::ExplorerScanResult};
 
 pub(crate) const MAX_FILES: usize = 512;
 const MAX_DEPTH: usize = 8;
-
-pub(crate) struct ExplorerScanResult {
-    pub(crate) generation: u64,
-    pub(crate) root: PathBuf,
-    pub(crate) files: Vec<PathBuf>,
-}
 
 struct ScanRequest {
     generation: u64,

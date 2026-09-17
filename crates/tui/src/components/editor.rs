@@ -19,7 +19,7 @@ use crate::{
     style::{color, text_style},
 };
 
-use super::{Component, Diagnostics};
+use super::Component;
 
 #[derive(Debug)]
 pub(crate) struct Editor {
@@ -50,6 +50,10 @@ struct BracketMatchCache {
 }
 
 impl Editor {
+    pub(crate) fn update(&mut self, action: Action) {
+        self.apply_action(&action);
+    }
+
     pub(crate) fn new(text: &str, theme: Theme, soft_wrap: bool) -> Self {
         Self::from_source(Source::detached(text), theme, soft_wrap)
     }
@@ -613,8 +617,11 @@ impl Editor {
             + end.subrow
     }
 
-    pub(crate) fn set_diagnostics(&mut self, diagnostics: &Diagnostics) {
-        self.diagnostic_lines = diagnostics.line_severities().collect();
+    pub(crate) fn set_diagnostic_lines(
+        &mut self,
+        lines: impl IntoIterator<Item = (usize, Severity)>,
+    ) {
+        self.diagnostic_lines = lines.into_iter().collect();
     }
 
     fn cached_bracket_matches(&mut self) -> Option<[Range<usize>; 2]> {
@@ -642,6 +649,10 @@ impl Editor {
 
     pub(crate) fn source(&self) -> Source {
         self.source.clone()
+    }
+
+    pub(crate) fn source_text(&self) -> &str {
+        self.source.text()
     }
 
     pub(crate) fn replace_source(&mut self, source: Source) -> Result<(), String> {
@@ -756,10 +767,6 @@ impl Editor {
 }
 
 impl Component for Editor {
-    fn update(&mut self, action: Action) {
-        self.apply_action(&action);
-    }
-
     fn draw(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
         self.draw_editor(frame, area, focused);
     }
@@ -1425,10 +1432,10 @@ mod tests {
     use unicode_segmentation::UnicodeSegmentation;
 
     use super::{
-        Component, Diagnostics, Editor, VisualPosition, find_from, line_row_count,
-        matching_brackets, wrapped_row_count,
+        Component, Editor, VisualPosition, find_from, line_row_count, matching_brackets,
+        wrapped_row_count,
     };
-    use crate::action::Action;
+    use crate::{action::Action, components::Diagnostics};
 
     fn theme() -> Theme {
         Theme::new(ThemeName::Dark, ColorDepth::Ansi16)
@@ -1565,7 +1572,7 @@ mod tests {
             is_main: true,
             notes: Vec::new(),
         }]);
-        editor.set_diagnostics(&diagnostics);
+        editor.set_diagnostic_lines(diagnostics.line_severities());
         let backend = TestBackend::new(30, 6);
         let mut terminal = Terminal::new(backend)?;
 

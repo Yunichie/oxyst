@@ -1,8 +1,5 @@
+use oxyst_config::CommandId;
 use oxyst_document::Motion;
-
-use crate::compile::{CompileResult, PreviewPageResult};
-use crate::explorer::ExplorerScanResult;
-use crate::export::ExportResult;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Pane {
@@ -12,6 +9,7 @@ pub(crate) enum Pane {
 }
 
 pub(crate) enum Action {
+    Command(CommandId),
     Insert(char),
     InsertText(String),
     Backspace,
@@ -24,42 +22,15 @@ pub(crate) enum Action {
     PasteClipboard,
     Undo,
     Redo,
-    Recompile,
-    CompileFinished(CompileResult),
-    PreviewPagesFinished(PreviewPageResult),
-    ExplorerScanFinished(ExplorerScanResult),
-    ExportFinished(ExportResult),
-    Resize,
-    ProjectFilesChanged,
-    FileWatchFailed(String),
-    Tick,
-    SwitchFocus,
-    ToggleDiagnostics,
-    NavigateDiagnostic(isize),
     MouseDown { column: u16, row: u16 },
     MouseDrag { column: u16, row: u16 },
     ScrollAt { column: u16, row: u16, lines: isize },
-    ScrollPreviewPages(isize),
     ZoomPreview(isize),
-    ToggleFullscreen,
-    ToggleFileExplorer,
-    OpenCommandPalette,
-    OpenHelp,
-    OpenGoToLine,
-    OpenFind,
-    OpenReplace,
-    NewDocument,
-    OpenFile,
-    CloseOverlay,
     OverlayInput(char),
     OverlayInputText(String),
     OverlayBackspace,
     OverlayMove(isize),
     OverlaySubmit,
-    SearchNext(bool),
-    SearchToggleField,
-    ReplaceCurrent,
-    Save,
     RequestQuit,
     Quit,
     CancelQuit,

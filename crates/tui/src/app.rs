@@ -4,10 +4,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use oxyst_compiler::{CompiledDocument, Compiler, DocumentSync, Severity};
-use oxyst_config::Config;
+use oxyst_compiler::Compiler;
+use oxyst_config::{CommandId, Config};
 use oxyst_document::Motion;
-use oxyst_render::{ExportFormat, RenderManifest};
+use oxyst_pipeline::{CompileState, PipelineUpdate, PreviewPipeline};
+use oxyst_render::ExportFormat;
 use oxyst_theme::{Color, ColorDepth, Theme, ThemeName};
 use ratatui::{
     DefaultTerminal, Frame,
@@ -15,25 +16,22 @@ use ratatui::{
     style::Style,
     widgets::{Block, Paragraph},
 };
-use ratatui_image::picker::{Picker, ProtocolType};
+use ratatui_image::picker::Picker;
 use tokio::runtime::Handle;
 
 use crate::{
     action::{Action, Pane},
     clipboard::Clipboard,
-    compile::{
-        CompileResult, CompileResultKind, CompileWorker, PreviewPageRequest, PreviewPageResult,
-        WorldRebuild,
-    },
     components::{
-        Command, Component, ConfirmIntent, Diagnostics, Editor, FileExplorer, Header, HeaderState,
+        Component, ConfirmIntent, Diagnostics, Editor, FileExplorer, Header, HeaderState,
         OverlayHost, OverlaySubmission, Preview, Prompt, PromptKind, SearchMode, StatusBar,
         StatusBarState, Welcome, WelcomeChoice, format_diagnostic,
     },
     event::{self, Event},
-    explorer::{ExplorerScanResult, ExplorerWorker},
-    export::{ExportResult, ExportWorker},
+    explorer::ExplorerWorker,
+    export::ExportWorker,
     input::{self, InputMode, Keymap},
+    message::{ExplorerScanResult, ExportResult},
     recent::RecentFiles,
     style::{base, color},
     watcher::ProjectWatcher,
@@ -41,60 +39,19 @@ use crate::{
 };
 
 const NARROW_WIDTH: u16 = 80;
-const AUTO_COMPILE_DELAY: Duration = Duration::from_millis(150);
 const CURSOR_SYNC_DELAY: Duration = Duration::from_millis(50);
-const COMPILE_STALLED_AFTER: Duration = Duration::from_secs(5);
-const HALFBLOCK_PIXELS_PER_COLUMN: u32 = 4;
-
-fn preview_dimensions(picker: &Picker, width: u16) -> (u16, u32) {
-    let font_width = picker.font_size().width.max(1);
-    let max_columns = (2_048 / font_width).max(1);
-    let width = width.clamp(1, max_columns);
-    let pixels_per_column = match picker.protocol_type() {
-        ProtocolType::Halfblocks => HALFBLOCK_PIXELS_PER_COLUMN,
-        ProtocolType::Sixel | ProtocolType::Kitty | ProtocolType::Iterm2 => u32::from(font_width),
-    };
-    (width, u32::from(width) * pixels_per_column)
-}
 
 fn overlay_transition_requires_clear(action: &Action) -> bool {
-    matches!(action, Action::CloseOverlay | Action::OverlaySubmit)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CompileState {
-    NotStarted,
-    Compiling,
-    Ready,
-    Stale,
-    Stalled,
-    Failed(usize),
-    Error,
-}
-
-#[derive(Default)]
-struct CompileDebounce {
-    deadline: Option<Instant>,
-}
-
-impl CompileDebounce {
-    fn schedule(&mut self, now: Instant) {
-        self.deadline = Some(now + AUTO_COMPILE_DELAY);
-    }
-
-    fn cancel(&mut self) {
-        self.deadline = None;
-    }
-
-    fn take_due(&mut self, now: Instant) -> bool {
-        match self.deadline {
-            Some(deadline) if now >= deadline => {
-                self.deadline = None;
-                true
-            }
-            _ => false,
-        }
-    }
+    matches!(
+        action,
+        Action::OverlaySubmit
+            | Action::Command(
+                CommandId::CloseOverlay
+                    | CommandId::Newline
+                    | CommandId::Confirm
+                    | CommandId::CancelConfirmation
+            )
+    )
 }
 
 pub(crate) struct App {
@@ -107,27 +64,14 @@ pub(crate) struct App {
     focus: Pane,
     fullscreen: bool,
     workspace: Workspace,
-    picker: Picker,
-    compile_worker: CompileWorker,
+    pipeline: PreviewPipeline,
     explorer_worker: ExplorerWorker,
     explorer_scan_generation: u64,
     export_worker: ExportWorker,
     watcher: ProjectWatcher,
     internal_events: Receiver<Event>,
-    compile_debounce: CompileDebounce,
-    compile_generation: u64,
-    world_rebuild_pending: bool,
-    preview_target_width: u16,
-    preview_manifest: Option<(u64, u64, RenderManifest, u16)>,
-    preview_page_request: Option<(u64, Vec<usize>)>,
-    preview_stale: bool,
-    compiled_document: Option<(u64, CompiledDocument)>,
-    document_sync: Option<(u64, DocumentSync)>,
     cursor_sync_deadline: Option<Instant>,
-    compile_started_at: Option<Instant>,
-    compile_state: CompileState,
     diagnostics: Diagnostics,
-    last_compile_time: Option<Duration>,
     keymap: Keymap,
     color_depth: ColorDepth,
     theme: Theme,
@@ -170,15 +114,18 @@ impl App {
         let theme = Theme::named(&config.theme, color_depth).map_err(|error| error.to_string())?;
         let keymap = Keymap::new(&config)?;
         let overlay = OverlayHost::new(keymap.clone(), theme);
-        let header = Header::new(theme, keymap.display("help"));
+        let header = Header::new(theme, keymap.display(CommandId::Help));
         let status_bar = StatusBar::new(
             theme,
-            keymap.display("confirm"),
-            keymap.display("cancel_confirmation"),
+            keymap.display(CommandId::Confirm),
+            keymap.display(CommandId::CancelConfirmation),
         );
         let welcome = path.is_none().then(|| {
-            let mut welcome =
-                Welcome::new(theme, keymap.display("newline"), keymap.display("help"));
+            let mut welcome = Welcome::new(
+                theme,
+                keymap.display(CommandId::Newline),
+                keymap.display(CommandId::Help),
+            );
             welcome.set_recent_count(recent.entries().len());
             welcome
         });
@@ -198,27 +145,14 @@ impl App {
             focus: Pane::Editor,
             fullscreen: false,
             workspace: Workspace::new(path, root, root_is_explicit),
-            picker,
-            compile_worker: CompileWorker::new(compiler, sender.clone(), runtime.clone()),
+            pipeline: PreviewPipeline::new(compiler, picker, runtime.clone()),
             explorer_worker,
             explorer_scan_generation: 0,
             export_worker: ExportWorker::new(sender, runtime),
             watcher,
             internal_events,
-            compile_debounce: CompileDebounce::default(),
-            compile_generation: 0,
-            world_rebuild_pending: false,
-            preview_target_width: 0,
-            preview_manifest: None,
-            preview_page_request: None,
-            preview_stale: false,
-            compiled_document: None,
-            document_sync: None,
             cursor_sync_deadline: None,
-            compile_started_at: None,
-            compile_state: CompileState::NotStarted,
             diagnostics: Diagnostics::new(theme),
-            last_compile_time: None,
             keymap,
             color_depth,
             theme,
@@ -234,6 +168,7 @@ impl App {
     pub(crate) fn run(&mut self, terminal: &mut DefaultTerminal) -> std::io::Result<()> {
         let mut initial_compile_requested = self.welcome.is_some();
         while !self.should_quit {
+            self.poll_pipeline();
             terminal.draw(|frame| self.draw(frame))?;
             self.observe_preview_width();
             self.request_preview_pages();
@@ -242,23 +177,39 @@ impl App {
                 initial_compile_requested = true;
             }
             let event = event::read(&self.internal_events)?;
-            let component_action = if self.overlay.is_open() {
-                self.overlay.handle_event(&event)
-            } else if self.input_mode() == InputMode::Normal && self.focus == Pane::Editor {
-                self.editor.handle_event(&event)
-            } else {
-                None
-            };
-            let mode = self.input_mode();
-            let accepts_text = mode != InputMode::Normal || self.focus == Pane::Editor;
-            if let Some(action) =
-                component_action.or_else(|| input::resolve(event, mode, &self.keymap, accepts_text))
-            {
-                let clear_terminal =
-                    self.overlay.is_open() && overlay_transition_requires_clear(&action);
-                self.update(action);
-                if clear_terminal {
-                    terminal.clear()?;
+            match event {
+                Event::ExplorerScanFinished(result) => {
+                    self.finish_explorer_scan(result);
+                    continue;
+                }
+                Event::ExportFinished(result) => {
+                    self.finish_export(result);
+                    continue;
+                }
+                Event::ProjectFilesChanged => {
+                    self.project_files_changed();
+                    continue;
+                }
+                Event::FileWatchFailed(error) => {
+                    self.status = Some(format!("File watch failed: {error}"));
+                    continue;
+                }
+                Event::Tick => {
+                    self.tick();
+                    continue;
+                }
+                Event::Resize => continue,
+                event => {
+                    let mode = self.input_mode();
+                    let accepts_text = mode != InputMode::Normal || self.focus == Pane::Editor;
+                    if let Some(action) = input::resolve(event, mode, &self.keymap, accepts_text) {
+                        let clear_terminal =
+                            self.overlay.is_open() && overlay_transition_requires_clear(&action);
+                        self.update(action);
+                        if clear_terminal {
+                            terminal.clear()?;
+                        }
+                    }
                 }
             }
         }
@@ -281,52 +232,22 @@ impl App {
 
     fn update(&mut self, action: Action) {
         match action {
-            Action::CloseOverlay => self.overlay.close(),
+            Action::Command(command) => self.execute_command(command),
             Action::OverlayInput(_)
             | Action::OverlayInputText(_)
             | Action::OverlayBackspace
             | Action::OverlayMove(_)
             | Action::OverlaySubmit => self.update_overlay(action),
-            Action::OpenCommandPalette => self.overlay.open_palette(),
-            Action::OpenHelp => self.overlay.open_help(),
-            Action::OpenGoToLine => self.overlay.open_prompt(PromptKind::GoToLine, ""),
-            Action::OpenFind => self.open_search(SearchMode::Find),
-            Action::OpenReplace => self.open_search(SearchMode::Replace),
-            Action::NewDocument => self.start_new_document(),
-            Action::OpenFile => self.open_file_prompt(),
-            Action::SearchNext(reverse) => self.search_next(reverse),
-            Action::SearchToggleField => {
-                self.overlay.toggle_search_field();
-            }
-            Action::ReplaceCurrent => self.replace_current(),
             Action::Copy => self.copy_selection(),
             Action::Cut if self.focus == Pane::Editor => self.cut_selection(),
             Action::PasteClipboard if self.focus == Pane::Editor => self.paste_clipboard(),
-            Action::Save => self.save(),
-            Action::Recompile => self.start_compile(),
-            Action::CompileFinished(result) => self.finish_compile(result),
-            Action::PreviewPagesFinished(result) => self.finish_preview_pages(result),
-            Action::ExplorerScanFinished(result) => self.finish_explorer_scan(result),
-            Action::ExportFinished(result) => self.finish_export(result),
-            Action::Resize => {}
-            Action::ProjectFilesChanged => self.project_files_changed(),
-            Action::FileWatchFailed(error) => {
-                self.status = Some(format!("File watch failed: {error}"));
-            }
-            Action::Tick => self.tick(),
-            Action::ToggleDiagnostics => self.diagnostics.toggle(),
-            Action::ToggleFileExplorer => self.toggle_explorer(),
-            Action::ToggleFullscreen => self.fullscreen = !self.fullscreen,
             Action::ZoomPreview(direction) if self.preview.zoom(direction) => {
                 self.focus = Pane::Preview;
-                self.refresh_preview_scale();
+                self.observe_preview_width();
             }
-            Action::NavigateDiagnostic(direction) => self.navigate_diagnostic(direction),
             Action::MouseDown { column, row } => self.mouse_down(column, row),
             Action::MouseDrag { column, row } => self.mouse_drag(column, row),
             Action::ScrollAt { column, row, lines } => self.scroll_at(column, row, lines),
-            Action::SwitchFocus => self.switch_focus(),
-            Action::ScrollPreviewPages(pages) => self.preview.scroll_pages(pages),
             Action::Move(Motion::Up) if self.focus == Pane::Explorer => self.explorer.select(-1),
             Action::Move(Motion::Down) if self.focus == Pane::Explorer => self.explorer.select(1),
             Action::Insert('\n') if self.focus == Pane::Explorer => {
@@ -408,25 +329,120 @@ impl App {
         }
     }
 
-    fn execute_command(&mut self, command: Command) {
+    fn execute_command(&mut self, command: CommandId) {
         match command {
-            Command::OpenFile => self.open_file_prompt(),
-            Command::Export(format) => {
+            CommandId::OpenFile | CommandId::WelcomeOpen => self.open_file_prompt(),
+            CommandId::ExportPdf | CommandId::ExportPng | CommandId::ExportSvg => {
+                let format = match command {
+                    CommandId::ExportPdf => ExportFormat::Pdf,
+                    CommandId::ExportPng => ExportFormat::Png,
+                    CommandId::ExportSvg => ExportFormat::Svg,
+                    _ => return,
+                };
                 let path = self.default_export_path(format);
                 self.overlay
                     .open_prompt(PromptKind::Export(format), path.to_string_lossy());
             }
-            Command::GoToLine => self.overlay.open_prompt(PromptKind::GoToLine, ""),
-            Command::GoToPage => self.overlay.open_prompt(PromptKind::GoToPage, ""),
-            Command::ToggleDiagnostics => self.diagnostics.toggle(),
-            Command::ToggleFileExplorer => self.toggle_explorer(),
-            Command::UseDarkTheme => self.set_theme(ThemeName::Dark),
-            Command::UseLightTheme => self.set_theme(ThemeName::Light),
-            Command::ReloadFonts => {
+            CommandId::GoToLine => self.overlay.open_prompt(PromptKind::GoToLine, ""),
+            CommandId::GoToPage => self.overlay.open_prompt(PromptKind::GoToPage, ""),
+            CommandId::ToggleDiagnostics => self.diagnostics.toggle(),
+            CommandId::ToggleFileExplorer => self.toggle_explorer(),
+            CommandId::UseDarkTheme => self.set_theme(ThemeName::Dark),
+            CommandId::UseLightTheme => self.set_theme(ThemeName::Light),
+            CommandId::ReloadFonts => {
                 self.start_compile_with_world();
                 self.status = Some("Reloading fonts...".to_owned());
             }
-            Command::Quit => self.update(Action::RequestQuit),
+            CommandId::Quit => self.update(Action::RequestQuit),
+            CommandId::Save => self.save(),
+            CommandId::Recompile => self.start_compile(),
+            CommandId::Undo => self.update(Action::Undo),
+            CommandId::Redo => self.update(Action::Redo),
+            CommandId::MoveLeft => self.update(Action::Move(Motion::Left)),
+            CommandId::MoveRight => self.update(Action::Move(Motion::Right)),
+            CommandId::MoveUp => self.execute_direction(Motion::Up, -1),
+            CommandId::MoveDown => self.execute_direction(Motion::Down, 1),
+            CommandId::SelectLeft => self.update(Action::Select(Motion::Left)),
+            CommandId::SelectRight => self.update(Action::Select(Motion::Right)),
+            CommandId::SelectUp => self.update(Action::Select(Motion::Up)),
+            CommandId::SelectDown => self.update(Action::Select(Motion::Down)),
+            CommandId::WordLeft => self.update(Action::Move(Motion::WordLeft)),
+            CommandId::WordRight => self.update(Action::Move(Motion::WordRight)),
+            CommandId::SelectWordLeft => self.update(Action::Select(Motion::WordLeft)),
+            CommandId::SelectWordRight => self.update(Action::Select(Motion::WordRight)),
+            CommandId::LineStart => self.update(Action::Move(Motion::LineStart)),
+            CommandId::LineEnd => self.update(Action::Move(Motion::LineEnd)),
+            CommandId::SelectLineStart => self.update(Action::Select(Motion::LineStart)),
+            CommandId::SelectLineEnd => self.update(Action::Select(Motion::LineEnd)),
+            CommandId::DocumentStart => self.update(Action::Move(Motion::DocumentStart)),
+            CommandId::DocumentEnd => self.update(Action::Move(Motion::DocumentEnd)),
+            CommandId::SelectDocumentStart => self.update(Action::Select(Motion::DocumentStart)),
+            CommandId::SelectDocumentEnd => self.update(Action::Select(Motion::DocumentEnd)),
+            CommandId::SelectAll => self.update(Action::SelectAll),
+            CommandId::Copy => self.update(Action::Copy),
+            CommandId::Cut => self.update(Action::Cut),
+            CommandId::Paste => self.update(Action::PasteClipboard),
+            CommandId::Find => self.open_search(SearchMode::Find),
+            CommandId::FindReplace => self.open_search(SearchMode::Replace),
+            CommandId::FindNext => self.search_next(false),
+            CommandId::FindPrevious => self.search_next(true),
+            CommandId::SearchToggleField => self.overlay.toggle_search_field(),
+            CommandId::ReplaceCurrent => self.replace_current(),
+            CommandId::Backspace => {
+                if matches!(
+                    self.input_mode(),
+                    InputMode::Overlay | InputMode::Search | InputMode::Welcome
+                ) {
+                    self.update(Action::OverlayBackspace);
+                } else {
+                    self.update(Action::Backspace);
+                }
+            }
+            CommandId::Delete => self.update(Action::Delete),
+            CommandId::Newline => {
+                if matches!(self.input_mode(), InputMode::Overlay | InputMode::Welcome) {
+                    self.update(Action::OverlaySubmit);
+                } else {
+                    self.update(Action::Insert('\n'));
+                }
+            }
+            CommandId::SwitchFocus => self.switch_focus(),
+            CommandId::Fullscreen => self.fullscreen = !self.fullscreen,
+            CommandId::ZoomIn => self.update(Action::ZoomPreview(1)),
+            CommandId::ZoomOut => self.update(Action::ZoomPreview(-1)),
+            CommandId::PreviewPageUp => self.preview.scroll_pages(-1),
+            CommandId::PreviewPageDown => self.preview.scroll_pages(1),
+            CommandId::CommandPalette => self.overlay.open_palette(),
+            CommandId::NextDiagnostic => self.navigate_diagnostic(1),
+            CommandId::PreviousDiagnostic => self.navigate_diagnostic(-1),
+            CommandId::Help => self.overlay.open_help(),
+            CommandId::CloseOverlay => self.overlay.close(),
+            CommandId::Confirm => {
+                if self.input_mode() == InputMode::QuitConfirmation {
+                    self.update(Action::Quit);
+                } else {
+                    self.update(Action::OverlaySubmit);
+                }
+            }
+            CommandId::CancelConfirmation => {
+                if self.input_mode() == InputMode::QuitConfirmation {
+                    self.update(Action::CancelQuit);
+                } else {
+                    self.overlay.close();
+                }
+            }
+            CommandId::WelcomeNew => self.start_new_document(),
+        }
+    }
+
+    fn execute_direction(&mut self, motion: Motion, overlay_direction: isize) {
+        if matches!(
+            self.input_mode(),
+            InputMode::Overlay | InputMode::Help | InputMode::Welcome
+        ) {
+            self.update(Action::OverlayMove(overlay_direction));
+        } else {
+            self.update(Action::Move(motion));
         }
     }
 
@@ -510,19 +526,21 @@ impl App {
         let watch_error = self.watcher.retarget(&root, Some(&path)).err();
         self.editor.replace_document(&opened.text);
         self.preview.clear();
-        self.preview_manifest = None;
-        self.preview_page_request = None;
-        self.preview_stale = false;
         self.diagnostics = Diagnostics::new(self.theme);
-        self.document_sync = None;
-        self.compiled_document = None;
         self.workspace.opened(path.clone(), root.clone());
-        self.set_explorer_root(root);
+        self.set_explorer_root(root.clone());
         self.welcome = None;
         self.focus = Pane::Editor;
         self.fullscreen = false;
         self.status = None;
-        self.start_compile_with_world();
+        if let Err(error) = self
+            .pipeline
+            .reset_for_world(root, path.clone(), Instant::now())
+        {
+            self.status = Some(error);
+        } else {
+            self.start_compile();
+        }
         if opened.existed {
             self.record_recent(&path);
         }
@@ -610,11 +628,7 @@ impl App {
     }
 
     fn start_export(&mut self, format: ExportFormat, path: PathBuf) {
-        let Some((_, document)) = self
-            .compiled_document
-            .as_ref()
-            .filter(|(revision, _)| *revision == self.editor.revision() && !self.preview_stale)
-        else {
+        let Some(document) = self.pipeline.compiled_document(self.editor.revision()) else {
             self.status = Some("Current document is not compiled yet".to_owned());
             return;
         };
@@ -697,7 +711,9 @@ impl App {
             }
             Err(error) => self.status = Some(error),
         }
-        self.schedule_compile(true, true);
+        if let Err(error) = self.pipeline.project_files_changed(Instant::now()) {
+            self.status = Some(error);
+        }
     }
 
     fn set_explorer_root(&mut self, root: PathBuf) {
@@ -735,21 +751,11 @@ impl App {
         let cursor = self.editor.cursor_byte_index();
         self.editor.update(action);
         if self.editor.revision() != revision {
-            let generation = self.compile_worker.invalidate();
-            match generation {
-                Ok(generation) => self.compile_generation = generation,
-                Err(error) => {
-                    self.compile_started_at = None;
-                    self.compile_state = CompileState::Error;
-                    self.status = Some(error);
-                    return;
-                }
+            if let Err(error) = self.pipeline.document_changed(Instant::now()) {
+                self.status = Some(error);
+                return;
             }
-            self.compile_debounce.schedule(Instant::now());
             self.cursor_sync_deadline = None;
-            self.compile_started_at = None;
-            self.compile_state = CompileState::Stale;
-            self.preview_stale = true;
         } else if self.editor.cursor_byte_index() != cursor {
             self.cursor_sync_deadline = Some(Instant::now() + CURSOR_SYNC_DELAY);
         }
@@ -874,16 +880,11 @@ impl App {
 
     fn tick(&mut self) {
         let now = Instant::now();
-        if self.compile_debounce.take_due(now) {
-            self.start_compile();
-        }
-        if self.compile_state == CompileState::Compiling
-            && self
-                .compile_started_at
-                .is_some_and(|started| now.duration_since(started) >= COMPILE_STALLED_AFTER)
+        if let Some(update) = self
+            .pipeline
+            .tick(now, self.editor.revision(), self.editor.source())
         {
-            self.compile_state = CompileState::Stalled;
-            self.status = Some("Compilation is taking longer than expected".to_owned());
+            self.apply_pipeline_update(update);
         }
         if self
             .cursor_sync_deadline
@@ -896,265 +897,89 @@ impl App {
 
     fn observe_preview_width(&mut self) {
         let width = self.preview.target_width();
-        if width == self.preview_target_width {
-            return;
-        }
-        self.preview_target_width = width;
-        self.refresh_preview_scale();
-    }
-
-    fn refresh_preview_scale(&mut self) {
-        self.preview_target_width = self.preview.target_width();
-        if self.welcome.is_some() || self.preview_stale || self.compile_state != CompileState::Ready
+        if let Some(update) = self
+            .pipeline
+            .set_preview_width(width, self.editor.revision())
         {
-            return;
+            self.apply_pipeline_update(update);
         }
-        let Some((revision, document)) = self
-            .compiled_document
-            .as_ref()
-            .filter(|(revision, _)| *revision == self.editor.revision())
-        else {
-            return;
-        };
-        let revision = *revision;
-        let (width, target_pixels) = preview_dimensions(&self.picker, self.preview_target_width);
-        let manifest = match oxyst_render::render_manifest(document, target_pixels) {
-            Ok(manifest) => manifest,
-            Err(error) => {
-                self.status = Some(format!("Preview failed: {error}"));
-                return;
-            }
-        };
-        self.install_preview_manifest(self.compile_generation, revision, manifest, width, true);
-        self.request_preview_pages();
-    }
-
-    fn schedule_compile(&mut self, files_changed: bool, mark_preview_stale: bool) {
-        if self.welcome.is_some() {
-            return;
-        }
-        let invalidated = if files_changed && !self.world_rebuild_pending {
-            self.compile_worker.invalidate_files()
-        } else {
-            self.compile_worker.invalidate()
-        };
-        match invalidated {
-            Ok(generation) => self.compile_generation = generation,
-            Err(error) => {
-                self.compile_started_at = None;
-                self.compile_state = CompileState::Error;
-                self.status = Some(error);
-                return;
-            }
-        }
-        self.compile_debounce.schedule(Instant::now());
-        self.compile_started_at = None;
-        self.compile_state = CompileState::Stale;
-        self.preview_stale |= mark_preview_stale;
     }
 
     fn start_compile(&mut self) {
-        if self.world_rebuild_pending {
-            self.start_compile_with_world();
-            return;
-        }
-        self.compile_debounce.cancel();
-        self.preview_target_width = self.preview.target_width();
-        self.compile_generation = self
-            .compile_worker
-            .spawn(self.editor.revision(), self.editor.source());
-        self.preview_page_request = None;
-        self.compile_started_at = Some(Instant::now());
-        self.compile_state = CompileState::Compiling;
+        let _ = self
+            .pipeline
+            .set_preview_width(self.preview.target_width(), self.editor.revision());
+        self.pipeline
+            .start_compile(self.editor.revision(), self.editor.source(), Instant::now());
         self.status = None;
     }
 
     fn start_compile_with_world(&mut self) {
-        self.compile_debounce.cancel();
-        self.world_rebuild_pending = true;
-        self.preview_target_width = self.preview.target_width();
         let main = self.workspace.main_path();
-        self.compile_generation = self.compile_worker.spawn_with_world(
+        let _ = self
+            .pipeline
+            .set_preview_width(self.preview.target_width(), self.editor.revision());
+        self.pipeline.start_world_compile(
             self.editor.revision(),
-            WorldRebuild {
-                root: self.workspace.root().to_owned(),
-                main,
-                source: self.editor.text(),
-            },
+            self.editor.source(),
+            self.workspace.root().to_owned(),
+            main,
+            Instant::now(),
         );
-        self.preview_page_request = None;
-        self.compile_started_at = Some(Instant::now());
-        self.compile_state = CompileState::Compiling;
         self.status = None;
     }
 
-    fn finish_compile(&mut self, mut result: CompileResult) {
-        if result.generation != self.compile_generation {
-            return;
-        }
-        self.compile_started_at = None;
-        if result.revision != self.editor.revision() {
-            self.compile_state = CompileState::Stale;
-            self.status = None;
-            return;
-        }
+    fn request_preview_pages(&mut self) {
+        self.pipeline
+            .request_pages(self.editor.revision(), self.preview.page_requests());
+    }
 
-        if let Some(compiler) = result.rebuilt_compiler.take() {
-            if let Err(error) = self.editor.replace_source(compiler.main_source()) {
-                self.compile_state = CompileState::Error;
-                self.status = Some(error);
-                return;
-            }
-            if let Err(error) = self.compile_worker.install(compiler) {
-                self.compile_state = CompileState::Error;
-                self.status = Some(error);
-                return;
-            }
-            self.world_rebuild_pending = false;
-        } else if result.rebuild_attempted {
-            self.world_rebuild_pending = true;
+    fn poll_pipeline(&mut self) {
+        let updates = self
+            .pipeline
+            .poll(self.editor.revision(), self.editor.source_text());
+        for update in updates {
+            self.apply_pipeline_update(update);
         }
+    }
 
-        self.last_compile_time = Some(result.elapsed);
-        match result.outcome {
-            CompileResultKind::Success {
+    fn apply_pipeline_update(&mut self, update: PipelineUpdate) {
+        match update {
+            PipelineUpdate::SourceRebuilt(source) => {
+                if let Err(error) = self.editor.replace_source(source) {
+                    self.status = Some(error);
+                }
+            }
+            PipelineUpdate::Compiled {
                 diagnostics,
-                sync,
-                document,
+                manifest,
+                width,
             } => {
-                let document = *document;
-                self.preview_target_width = self.preview.target_width();
-                let (width, target_pixels) =
-                    preview_dimensions(&self.picker, self.preview_target_width);
-                let manifest = match oxyst_render::render_manifest(&document, target_pixels) {
-                    Ok(manifest) => manifest,
-                    Err(error) => {
-                        self.compile_state = CompileState::Error;
-                        self.status = Some(format!("Preview failed: {error}"));
-                        return;
-                    }
-                };
                 self.diagnostics.set_items(diagnostics);
-                self.editor.set_diagnostics(&self.diagnostics);
-                self.document_sync = Some((result.revision, sync));
-                self.compiled_document = Some((result.revision, document));
-                self.install_preview_manifest(
-                    result.generation,
-                    result.revision,
-                    manifest,
-                    width,
-                    false,
-                );
-                self.compile_state = CompileState::Ready;
-                self.preview_stale = false;
+                self.editor
+                    .set_diagnostic_lines(self.diagnostics.line_severities());
+                self.preview
+                    .replace_render_manifest(self.pipeline.picker(), &manifest, width);
                 self.status = None;
                 self.sync_cursor_to_preview();
                 self.request_preview_pages();
             }
-            CompileResultKind::Diagnostics(diagnostics) => {
-                let errors = diagnostics
-                    .iter()
-                    .filter(|diagnostic| diagnostic.severity == Severity::Error)
-                    .count();
+            PipelineUpdate::Failed(diagnostics) => {
                 self.status = diagnostics.first().map(format_diagnostic);
                 self.diagnostics.set_items(diagnostics);
-                self.editor.set_diagnostics(&self.diagnostics);
-                self.compile_state = CompileState::Failed(errors);
+                self.editor
+                    .set_diagnostic_lines(self.diagnostics.line_severities());
             }
-            CompileResultKind::Error(error) => {
-                self.compile_state = CompileState::Error;
-                self.status = Some(format!("Preview failed: {error}"));
+            PipelineUpdate::ManifestRescaled { manifest, width } => {
+                self.preview
+                    .rescale_render_manifest(self.pipeline.picker(), &manifest, width);
+                self.request_preview_pages();
             }
-        }
-    }
-
-    fn install_preview_manifest(
-        &mut self,
-        generation: u64,
-        revision: u64,
-        manifest: RenderManifest,
-        width: u16,
-        preserve_position: bool,
-    ) {
-        if preserve_position {
-            self.preview
-                .rescale_render_manifest(&self.picker, &manifest, width);
-        } else {
-            self.preview
-                .replace_render_manifest(&self.picker, &manifest, width);
-        }
-        self.preview_manifest = Some((generation, revision, manifest, width));
-        self.preview_page_request = None;
-    }
-
-    fn request_preview_pages(&mut self) {
-        if self.preview_stale {
-            return;
-        }
-        let pages = self.preview.page_requests();
-        if pages.is_empty() {
-            self.preview_page_request = None;
-            return;
-        }
-        if self
-            .preview_page_request
-            .as_ref()
-            .is_some_and(|(_, requested)| *requested == pages)
-        {
-            return;
-        }
-        let Some((revision, document)) = self
-            .compiled_document
-            .as_ref()
-            .filter(|(revision, _)| *revision == self.editor.revision())
-        else {
-            return;
-        };
-        let Some((_, manifest_revision, manifest, width)) =
-            self.preview_manifest
-                .as_ref()
-                .filter(|(generation, manifest_revision, _, _)| {
-                    *generation == self.compile_generation && manifest_revision == revision
-                })
-        else {
-            return;
-        };
-        let request = self.compile_worker.spawn_preview_pages(PreviewPageRequest {
-            generation: self.compile_generation,
-            revision: *manifest_revision,
-            document: document.clone(),
-            manifest: manifest.clone(),
-            picker: self.picker.clone(),
-            width: *width,
-            pages: pages.clone(),
-        });
-        self.preview_page_request = Some((request, pages));
-    }
-
-    fn finish_preview_pages(&mut self, result: PreviewPageResult) {
-        if result.generation != self.compile_generation
-            || result.revision != self.editor.revision()
-            || self
-                .preview_page_request
-                .as_ref()
-                .is_none_or(|(request, _)| *request != result.request)
-            || self
-                .preview_manifest
-                .as_ref()
-                .is_none_or(|(_, _, _, width)| *width != result.width)
-        {
-            return;
-        }
-
-        match result.outcome {
-            Ok(success) => {
-                self.preview.install_pages(success.pages);
-                self.preview_page_request = None;
+            PipelineUpdate::Pages(pages) => self.preview.install_pages(pages),
+            PipelineUpdate::Stalled => {
+                self.status = Some("Compilation is taking longer than expected".to_owned());
             }
-            Err(error) => {
-                self.preview_page_request = Some((result.request, result.requested));
-                self.status = Some(format!("Preview page failed: {error}"));
-            }
+            PipelineUpdate::Error(error) => self.status = Some(error),
         }
     }
 
@@ -1178,17 +1003,13 @@ impl App {
     }
 
     fn click_preview(&mut self, column: u16, row: u16) {
-        if self.preview_stale {
-            return;
-        }
         let Some(position) = self.preview.position_at(column, row) else {
             return;
         };
         let Some(byte) = self
-            .document_sync
-            .as_ref()
-            .filter(|(revision, _)| *revision == self.editor.revision())
-            .and_then(|(_, sync)| sync.source_from_click(position))
+            .pipeline
+            .document_sync(self.editor.revision())
+            .and_then(|sync| sync.source_from_click(position))
         else {
             return;
         };
@@ -1201,14 +1022,10 @@ impl App {
     }
 
     fn sync_cursor_to_preview(&mut self) {
-        if self.preview_stale {
-            return;
-        }
         let position = self
-            .document_sync
-            .as_ref()
-            .filter(|(revision, _)| *revision == self.editor.revision())
-            .and_then(|(_, sync)| sync.position_from_cursor(self.editor.cursor_byte_index()));
+            .pipeline
+            .document_sync(self.editor.revision())
+            .and_then(|sync| sync.position_from_cursor(self.editor.cursor_byte_index()));
         if let Some(position) = position {
             self.preview.scroll_to(position);
         }
@@ -1269,11 +1086,7 @@ impl App {
     }
 
     fn draw_workspace(&mut self, frame: &mut Frame, area: Rect) {
-        let preview_dimmed = self.preview_stale
-            || self
-                .document_sync
-                .as_ref()
-                .is_some_and(|(revision, _)| *revision != self.editor.revision());
+        let preview_dimmed = self.pipeline.is_stale();
         if self.fullscreen {
             match self.focus {
                 Pane::Explorer => {
@@ -1344,7 +1157,7 @@ impl App {
             word_count: self.editor.word_count(),
             errors: self.diagnostics.errors(),
             warnings: self.diagnostics.warnings(),
-            compile_time: self.last_compile_time,
+            compile_time: self.pipeline.last_compile_time(),
             message: self.status.clone(),
             quit_confirmation: self.quit_confirmation,
         });
@@ -1356,7 +1169,7 @@ impl App {
     }
 
     fn compile_label(&self) -> String {
-        match self.compile_state {
+        match self.pipeline.state() {
             CompileState::NotStarted => "not compiled".to_owned(),
             CompileState::Compiling => "● compiling".to_owned(),
             CompileState::Ready => "✓ up to date".to_owned(),
@@ -1368,7 +1181,7 @@ impl App {
     }
 
     fn compile_color(&self) -> Color {
-        match self.compile_state {
+        match self.pipeline.state() {
             CompileState::Failed(_) | CompileState::Error => self.theme.error,
             CompileState::Stale | CompileState::Compiling | CompileState::Stalled => {
                 self.theme.warning
@@ -1389,202 +1202,24 @@ mod tests {
     };
 
     use oxyst_compiler::{CompileOutcome, Compiler};
-    use oxyst_config::Config;
-    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
-    use ratatui_image::picker::{Picker, ProtocolType};
+    use oxyst_config::{CommandId, Config};
+    use oxyst_pipeline::CompileState;
+    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui_image::picker::Picker;
 
-    use super::{
-        App, AppInit, COMPILE_STALLED_AFTER, CompileDebounce, CompileState, Preview,
-        overlay_transition_requires_clear, preview_dimensions,
-    };
-    use crate::{action::Action, compile::PreviewPageResult, event::Event};
-
-    #[test]
-    fn compile_debounce_restarts_after_each_edit() {
-        let start = Instant::now();
-        let mut debounce = CompileDebounce::default();
-
-        debounce.schedule(start);
-        assert!(!debounce.take_due(start + Duration::from_millis(149)));
-
-        debounce.schedule(start + Duration::from_millis(100));
-        assert!(!debounce.take_due(start + Duration::from_millis(249)));
-        assert!(debounce.take_due(start + Duration::from_millis(250)));
-        assert!(!debounce.take_due(start + Duration::from_millis(300)));
-    }
+    use super::{App, AppInit, Preview, overlay_transition_requires_clear};
+    use crate::action::Action;
 
     #[test]
     fn clearing_or_submitting_an_overlay_requests_a_full_redraw() {
-        assert!(overlay_transition_requires_clear(&Action::CloseOverlay));
+        assert!(overlay_transition_requires_clear(&Action::Command(
+            oxyst_config::CommandId::CloseOverlay
+        )));
         assert!(overlay_transition_requires_clear(&Action::OverlaySubmit));
         assert!(!overlay_transition_requires_clear(&Action::OverlayInput(
             'x'
         )));
         assert!(!overlay_transition_requires_clear(&Action::OverlayMove(1)));
-    }
-
-    #[test]
-    fn halfblock_previews_render_at_four_pixels_per_column() {
-        let picker = Picker::halfblocks();
-
-        assert_eq!(preview_dimensions(&picker, 80), (80, 320));
-        assert_eq!(preview_dimensions(&picker, u16::MAX), (204, 816));
-    }
-
-    #[test]
-    fn native_preview_protocols_render_at_terminal_pixel_width() {
-        let mut picker = Picker::halfblocks();
-
-        for protocol in [
-            ProtocolType::Sixel,
-            ProtocolType::Kitty,
-            ProtocolType::Iterm2,
-        ] {
-            picker.set_protocol_type(protocol);
-            assert_eq!(preview_dimensions(&picker, 80), (80, 800));
-        }
-    }
-
-    #[test]
-    fn resource_changes_and_stalled_compile_states_are_tracked() -> Result<(), Box<dyn Error>> {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
-        let main = root.join("simple.typ");
-        let source = fs::read_to_string(&main)?;
-        let compiler = Compiler::new(&root, &main)?;
-        let runtime = tokio::runtime::Builder::new_multi_thread().build()?;
-        let mut app = App::new(AppInit {
-            path: Some(main),
-            root,
-            root_is_explicit: false,
-            text: &source,
-            compiler,
-            picker: Picker::halfblocks(),
-            runtime: runtime.handle().clone(),
-            config: Config::default(),
-            recent: crate::recent::RecentFiles::disabled(),
-            startup_status: None,
-        })
-        .map_err(std::io::Error::other)?;
-
-        app.preview.set_viewport(Rect::new(0, 0, 42, 20));
-        app.preview_target_width = app.preview.target_width();
-        let initial_generation = app.compile_generation;
-        app.schedule_compile(true, true);
-        assert!(app.compile_generation > initial_generation);
-        assert!(app.compile_debounce.deadline.is_some());
-        assert!(app.preview_stale);
-
-        app.preview_stale = false;
-        app.preview.set_viewport(Rect::new(0, 0, 62, 20));
-        let resource_generation = app.compile_generation;
-        let compile_deadline = app.compile_debounce.deadline;
-        app.observe_preview_width();
-        assert_eq!(app.compile_generation, resource_generation);
-        assert_eq!(app.compile_debounce.deadline, compile_deadline);
-        assert!(!app.preview_stale);
-
-        app.compile_debounce.cancel();
-        app.compile_state = CompileState::Compiling;
-        app.compile_started_at = Some(Instant::now() - COMPILE_STALLED_AFTER);
-        app.tick();
-        assert_eq!(app.compile_state, CompileState::Stalled);
-        assert_eq!(
-            app.status.as_deref(),
-            Some("Compilation is taking longer than expected")
-        );
-
-        drop(app);
-        runtime.shutdown_timeout(Duration::from_millis(100));
-        Ok(())
-    }
-
-    #[test]
-    fn preview_scale_changes_reuse_the_compiled_document() -> Result<(), Box<dyn Error>> {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
-        let main = root.join("multi-page.typ");
-        let source = fs::read_to_string(&main)?;
-        let compiler = Compiler::new(&root, &main)?;
-        let runtime = tokio::runtime::Builder::new_multi_thread().build()?;
-        let mut app = App::new(AppInit {
-            path: Some(main),
-            root,
-            root_is_explicit: false,
-            text: &source,
-            compiler,
-            picker: Picker::halfblocks(),
-            runtime: runtime.handle().clone(),
-            config: Config::default(),
-            recent: crate::recent::RecentFiles::disabled(),
-            startup_status: None,
-        })
-        .map_err(std::io::Error::other)?;
-
-        app.preview.set_viewport(Rect::new(0, 0, 42, 20));
-        app.start_compile();
-        let generation = app.compile_generation;
-        app.preview.set_viewport(Rect::new(0, 0, 52, 20));
-        app.observe_preview_width();
-        assert_eq!(app.compile_generation, generation);
-        let result = match app.internal_events.recv_timeout(Duration::from_secs(30))? {
-            Event::CompileFinished(result) => result,
-            _ => return Err("worker returned an unexpected event".into()),
-        };
-        app.finish_compile(result);
-        assert_eq!(app.compile_generation, generation);
-        let revision = app.editor.revision();
-        let (old_request, old_pages) = app
-            .preview_page_request
-            .clone()
-            .ok_or("initial preview pages were not requested")?;
-        let old_width = app
-            .preview_manifest
-            .as_ref()
-            .map(|(_, _, _, width)| *width)
-            .ok_or("initial preview manifest was not installed")?;
-
-        app.preview.set_viewport(Rect::new(0, 0, 62, 20));
-        app.observe_preview_width();
-
-        assert_eq!(app.compile_generation, generation);
-        assert!(app.compile_debounce.deadline.is_none());
-        assert_eq!(app.compile_state, CompileState::Ready);
-        let resized_request = app
-            .preview_page_request
-            .as_ref()
-            .map(|(request, _)| *request)
-            .ok_or("resized preview pages were not requested")?;
-        assert_ne!(resized_request, old_request);
-        assert_ne!(
-            app.preview_manifest.as_ref().map(|(_, _, _, width)| *width),
-            Some(old_width)
-        );
-
-        app.finish_preview_pages(PreviewPageResult {
-            generation,
-            revision,
-            request: old_request,
-            width: old_width,
-            requested: old_pages,
-            outcome: Err("stale scale".to_owned()),
-        });
-        assert_eq!(
-            app.preview_page_request
-                .as_ref()
-                .map(|(request, _)| *request),
-            Some(resized_request)
-        );
-        assert_ne!(
-            app.status.as_deref(),
-            Some("Preview page failed: stale scale")
-        );
-
-        app.update(Action::ZoomPreview(1));
-        assert_eq!(app.compile_generation, generation);
-        assert!(app.compile_debounce.deadline.is_none());
-
-        drop(app);
-        runtime.shutdown_timeout(Duration::from_millis(100));
-        Ok(())
     }
 
     #[test]
@@ -1609,7 +1244,8 @@ mod tests {
         for target_width in 60..100 {
             let total_started = Instant::now();
             let layout_started = Instant::now();
-            let (width, pixels) = preview_dimensions(&picker, target_width);
+            let width = target_width;
+            let pixels = u32::from(width) * 4;
             let manifest = oxyst_render::render_manifest(&document, pixels)?;
             let page_sizes = Preview::page_sizes(&picker, &manifest, width);
             layout_samples.push(layout_started.elapsed());
@@ -1670,8 +1306,14 @@ mod tests {
             startup_status: None,
         })
         .map_err(std::io::Error::other)?;
-        crate::components::Component::update(&mut app.editor, crate::action::Action::Insert('x'));
-        app.compile_state = CompileState::Ready;
+        app.editor.update(crate::action::Action::Insert('x'));
+        app.start_compile();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while app.pipeline.state() != CompileState::Ready && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            app.poll_pipeline();
+        }
+        assert_eq!(app.pipeline.state(), CompileState::Ready);
         let mut terminal = Terminal::new(TestBackend::new(100, 20))?;
         terminal.draw(|frame| app.draw(frame))?;
         let rendered = terminal
@@ -1725,6 +1367,9 @@ mod tests {
             startup_status: None,
         })
         .map_err(std::io::Error::other)?;
+
+        app.execute_command(CommandId::Backspace);
+        assert_eq!(app.editor.text(), "= Draft");
 
         app.save_as(destination.clone());
 

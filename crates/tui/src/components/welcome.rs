@@ -31,6 +31,12 @@ pub(crate) struct Welcome {
 }
 
 impl Welcome {
+    pub(crate) fn update(&mut self, action: Action) {
+        if let Action::OverlayMove(direction) = action {
+            self.move_selection(direction);
+        }
+    }
+
     const CHOICES: &[(WelcomeChoice, &str)] = &[
         (WelcomeChoice::NewDocument, "New document"),
         (WelcomeChoice::OpenFile, "Open file"),
@@ -128,12 +134,6 @@ impl Default for Welcome {
 }
 
 impl Component for Welcome {
-    fn update(&mut self, action: Action) {
-        if let Action::OverlayMove(direction) = action {
-            self.move_selection(direction);
-        }
-    }
-
     fn draw(&mut self, frame: &mut Frame, area: Rect, _focused: bool) {
         self.draw_welcome(frame, area);
     }

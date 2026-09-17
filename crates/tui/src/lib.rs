@@ -3,12 +3,12 @@
 mod action;
 mod app;
 mod clipboard;
-mod compile;
 mod components;
 mod event;
 mod explorer;
 mod export;
 mod input;
+mod message;
 mod recent;
 mod style;
 mod watcher;

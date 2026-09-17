@@ -12,7 +12,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph},
 };
 
-use crate::{action::Action, explorer::MAX_FILES, style::color};
+use crate::{explorer::MAX_FILES, style::color};
 
 use super::Component;
 
@@ -187,15 +187,6 @@ impl FileExplorer {
 }
 
 impl Component for FileExplorer {
-    fn update(&mut self, action: Action) {
-        match action {
-            Action::Move(oxyst_document::Motion::Up) => self.select(-1),
-            Action::Move(oxyst_document::Motion::Down) => self.select(1),
-            Action::ToggleFileExplorer => self.toggle(),
-            _ => {}
-        }
-    }
-
     fn draw(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
         self.draw_explorer(frame, area, focused);
     }

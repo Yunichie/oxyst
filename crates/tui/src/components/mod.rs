@@ -14,9 +14,7 @@ mod welcome;
 
 use ratatui::{Frame, layout::Rect};
 
-use crate::{action::Action, event::Event};
-
-pub(crate) use command_palette::{Command, CommandPalette};
+pub(crate) use command_palette::CommandPalette;
 pub(crate) use diagnostics::{Diagnostics, format_diagnostic};
 pub(crate) use editor::Editor;
 pub(crate) use file_explorer::FileExplorer;
@@ -31,12 +29,6 @@ pub(crate) use status_bar::{StatusBar, StatusBarState};
 pub(crate) use welcome::{Welcome, WelcomeChoice};
 
 pub(crate) trait Component {
-    fn handle_event(&mut self, _event: &Event) -> Option<Action> {
-        None
-    }
-
-    fn update(&mut self, _action: Action) {}
-
     fn draw(&mut self, frame: &mut Frame, area: Rect, focused: bool);
 }
 

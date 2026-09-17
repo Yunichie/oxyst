@@ -10,7 +10,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph},
 };
 
-use crate::{action::Action, style::color};
+use crate::style::color;
 
 use super::Component;
 
@@ -222,12 +222,6 @@ impl Default for Diagnostics {
 }
 
 impl Component for Diagnostics {
-    fn update(&mut self, action: Action) {
-        if matches!(action, Action::ToggleDiagnostics) {
-            self.toggle();
-        }
-    }
-
     fn draw(&mut self, frame: &mut Frame, area: Rect, _focused: bool) {
         self.draw_diagnostics(frame, area);
     }

@@ -3,8 +3,7 @@ use std::collections::BTreeMap;
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use oxyst_config::Config;
-use oxyst_document::Motion;
+use oxyst_config::{CommandContext, CommandId, Config};
 
 use crate::{action::Action, event::Event};
 
@@ -21,8 +20,8 @@ pub(crate) enum InputMode {
 
 #[derive(Clone, Debug)]
 pub(crate) struct Keymap {
-    bindings: BTreeMap<String, Vec<KeyChord>>,
-    labels: BTreeMap<String, Vec<String>>,
+    bindings: BTreeMap<CommandId, Vec<KeyChord>>,
+    labels: BTreeMap<CommandId, Vec<String>>,
 }
 
 impl Keymap {
@@ -31,12 +30,14 @@ impl Keymap {
             .keys
             .iter()
             .map(|(action, bindings)| {
+                let command = CommandId::from_name(action)
+                    .ok_or_else(|| format!("unknown keybinding command `{action}`"))?;
                 let chords = bindings
                     .iter()
                     .map(|binding| {
                         let chord = KeyChord::parse(binding)
                             .map_err(|error| format!("invalid `{action}` binding: {error}"))?;
-                        if !allows_printable_binding(action) && chord.is_printable() {
+                        if !command.allows_printable_binding() && chord.is_printable() {
                             return Err(format!(
                                 "invalid `{action}` binding `{binding}`: unmodified printable keys \
                                  are reserved for text input"
@@ -45,25 +46,32 @@ impl Keymap {
                         Ok(chord)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok((action.clone(), chords))
+                Ok((command, chords))
             })
             .collect::<Result<_, String>>()?;
-        Ok(Self {
-            bindings,
-            labels: config.keys.clone(),
-        })
+        let labels = config
+            .keys
+            .iter()
+            .filter_map(|(name, bindings)| {
+                CommandId::from_name(name).map(|command| (command, bindings.clone()))
+            })
+            .collect();
+        Ok(Self { bindings, labels })
     }
 
-    pub(crate) fn display(&self, action: &str) -> String {
+    pub(crate) fn display(&self, command: CommandId) -> String {
         self.labels
-            .get(action)
+            .get(&command)
             .map(|bindings| bindings.join(" / "))
             .unwrap_or_default()
     }
 
-    fn matches(&self, action: &str, key: KeyEvent) -> bool {
+    fn matches(&self, command: CommandId, context: CommandContext, key: KeyEvent) -> bool {
+        if !command.supports(context) {
+            return false;
+        }
         self.bindings
-            .get(action)
+            .get(&command)
             .is_some_and(|bindings| bindings.iter().any(|binding| binding.matches(key)))
     }
 }
@@ -75,14 +83,6 @@ pub(crate) fn resolve(
     accepts_text: bool,
 ) -> Option<Action> {
     match event {
-        Event::CompileFinished(result) => Some(Action::CompileFinished(result)),
-        Event::PreviewPagesFinished(result) => Some(Action::PreviewPagesFinished(result)),
-        Event::ExplorerScanFinished(result) => Some(Action::ExplorerScanFinished(result)),
-        Event::ExportFinished(result) => Some(Action::ExportFinished(result)),
-        Event::Resize => Some(Action::Resize),
-        Event::ProjectFilesChanged => Some(Action::ProjectFilesChanged),
-        Event::FileWatchFailed(error) => Some(Action::FileWatchFailed(error)),
-        Event::Tick => Some(Action::Tick),
         Event::Paste(text) if matches!(mode, InputMode::Normal) && accepts_text => {
             Some(Action::InsertText(text))
         }
@@ -93,7 +93,16 @@ pub(crate) fn resolve(
         Event::Key(key) if is_press(key) => {
             resolve_key_with_context(key, mode, keymap, accepts_text)
         }
-        Event::Paste(_) | Event::Key(_) | Event::Mouse(_) | Event::Ignored => None,
+        Event::Paste(_)
+        | Event::Key(_)
+        | Event::Mouse(_)
+        | Event::Resize
+        | Event::ProjectFilesChanged
+        | Event::FileWatchFailed(_)
+        | Event::ExplorerScanFinished(_)
+        | Event::ExportFinished(_)
+        | Event::Tick
+        | Event::Ignored => None,
     }
 }
 
@@ -109,52 +118,44 @@ fn resolve_key_with_context(
     accepts_text: bool,
 ) -> Option<Action> {
     match mode {
-        InputMode::QuitConfirmation => {
-            if keymap.matches("confirm", key) {
-                Some(Action::Quit)
-            } else if keymap.matches("cancel_confirmation", key) {
-                Some(Action::CancelQuit)
-            } else {
-                None
-            }
-        }
-        InputMode::Confirmation => {
-            if keymap.matches("confirm", key) {
-                Some(Action::OverlaySubmit)
-            } else if keymap.matches("cancel_confirmation", key) {
-                Some(Action::CloseOverlay)
-            } else {
-                None
-            }
-        }
-        InputMode::Help => {
-            if keymap.matches("close_overlay", key) {
-                Some(Action::CloseOverlay)
-            } else if keymap.matches("move_up", key) {
-                Some(Action::OverlayMove(-1))
-            } else if keymap.matches("move_down", key) {
-                Some(Action::OverlayMove(1))
-            } else {
-                None
-            }
-        }
+        InputMode::QuitConfirmation => resolve_command(
+            key,
+            keymap,
+            CommandContext::QuitConfirmation,
+            &[CommandId::Confirm, CommandId::CancelConfirmation],
+        ),
+        InputMode::Confirmation => resolve_command(
+            key,
+            keymap,
+            CommandContext::Confirmation,
+            &[CommandId::Confirm, CommandId::CancelConfirmation],
+        ),
+        InputMode::Help => resolve_command(
+            key,
+            keymap,
+            CommandContext::Help,
+            &[
+                CommandId::CloseOverlay,
+                CommandId::MoveUp,
+                CommandId::MoveDown,
+            ],
+        ),
         InputMode::Search => resolve_search_key(key, keymap),
-        InputMode::Overlay => resolve_overlay_key(key, keymap),
-        InputMode::Welcome => {
-            if keymap.matches("help", key) {
-                Some(Action::OpenHelp)
-            } else if keymap.matches("command_palette", key) {
-                Some(Action::OpenCommandPalette)
-            } else if keymap.matches("quit", key) {
-                Some(Action::RequestQuit)
-            } else if keymap.matches("welcome_new", key) {
-                Some(Action::NewDocument)
-            } else if keymap.matches("welcome_open", key) {
-                Some(Action::OpenFile)
-            } else {
-                resolve_overlay_key(key, keymap)
-            }
-        }
+        InputMode::Overlay => resolve_overlay_key(key, keymap, CommandContext::Overlay),
+        InputMode::Welcome => resolve_command(
+            key,
+            keymap,
+            CommandContext::Welcome,
+            &[
+                CommandId::Help,
+                CommandId::CommandPalette,
+                CommandId::Quit,
+                CommandId::OpenFile,
+                CommandId::WelcomeNew,
+                CommandId::WelcomeOpen,
+            ],
+        )
+        .or_else(|| resolve_overlay_key(key, keymap, CommandContext::Welcome)),
         InputMode::Normal => resolve_normal_key(key, keymap, accepts_text),
     }
 }
@@ -162,142 +163,122 @@ fn resolve_key_with_context(
 fn resolve_search_key(key: KeyEvent, keymap: &Keymap) -> Option<Action> {
     if let Some(character) = printable_character(key) {
         Some(Action::OverlayInput(character))
-    } else if keymap.matches("close_overlay", key) {
-        Some(Action::CloseOverlay)
-    } else if keymap.matches("find_previous", key) {
-        Some(Action::SearchNext(true))
-    } else if keymap.matches("replace_current", key) {
-        Some(Action::ReplaceCurrent)
-    } else if keymap.matches("find_next", key) {
-        Some(Action::SearchNext(false))
-    } else if keymap.matches("search_toggle_field", key) {
-        Some(Action::SearchToggleField)
-    } else if keymap.matches("backspace", key) {
-        Some(Action::OverlayBackspace)
     } else {
-        None
+        resolve_command(
+            key,
+            keymap,
+            CommandContext::Search,
+            &[
+                CommandId::CloseOverlay,
+                CommandId::FindPrevious,
+                CommandId::ReplaceCurrent,
+                CommandId::FindNext,
+                CommandId::SearchToggleField,
+                CommandId::Backspace,
+            ],
+        )
     }
 }
 
-fn resolve_overlay_key(key: KeyEvent, keymap: &Keymap) -> Option<Action> {
+fn resolve_overlay_key(key: KeyEvent, keymap: &Keymap, context: CommandContext) -> Option<Action> {
     if let Some(character) = printable_character(key) {
         Some(Action::OverlayInput(character))
-    } else if keymap.matches("close_overlay", key) {
-        Some(Action::CloseOverlay)
-    } else if keymap.matches("move_up", key) {
-        Some(Action::OverlayMove(-1))
-    } else if keymap.matches("move_down", key) {
-        Some(Action::OverlayMove(1))
-    } else if keymap.matches("newline", key) {
-        Some(Action::OverlaySubmit)
-    } else if keymap.matches("backspace", key) {
-        Some(Action::OverlayBackspace)
     } else {
-        None
+        resolve_command(
+            key,
+            keymap,
+            context,
+            &[
+                CommandId::CloseOverlay,
+                CommandId::MoveUp,
+                CommandId::MoveDown,
+                CommandId::Newline,
+                CommandId::Backspace,
+            ],
+        )
     }
 }
 
 fn resolve_normal_key(key: KeyEvent, keymap: &Keymap, accepts_text: bool) -> Option<Action> {
-    let binding = |name| keymap.matches(name, key);
     if accepts_text && let Some(character) = printable_character(key) {
         Some(Action::Insert(character))
-    } else if binding("quit") {
-        Some(Action::RequestQuit)
-    } else if binding("select_all") {
-        Some(Action::SelectAll)
-    } else if binding("copy") {
-        Some(Action::Copy)
-    } else if binding("cut") {
-        Some(Action::Cut)
-    } else if binding("paste") {
-        Some(Action::PasteClipboard)
-    } else if binding("find_replace") {
-        Some(Action::OpenReplace)
-    } else if binding("find") {
-        Some(Action::OpenFind)
-    } else if binding("recompile") {
-        Some(Action::Recompile)
-    } else if binding("save") {
-        Some(Action::Save)
-    } else if binding("toggle_diagnostics") {
-        Some(Action::ToggleDiagnostics)
-    } else if binding("toggle_file_explorer") {
-        Some(Action::ToggleFileExplorer)
-    } else if binding("command_palette") {
-        Some(Action::OpenCommandPalette)
-    } else if binding("help") {
-        Some(Action::OpenHelp)
-    } else if binding("go_to_line") {
-        Some(Action::OpenGoToLine)
-    } else if binding("fullscreen") {
-        Some(Action::ToggleFullscreen)
-    } else if binding("zoom_in") {
-        Some(Action::ZoomPreview(1))
-    } else if binding("zoom_out") {
-        Some(Action::ZoomPreview(-1))
-    } else if binding("redo") {
-        Some(Action::Redo)
-    } else if binding("undo") {
-        Some(Action::Undo)
-    } else if binding("word_left") {
-        Some(Action::Move(Motion::WordLeft))
-    } else if binding("word_right") {
-        Some(Action::Move(Motion::WordRight))
-    } else if binding("move_left") {
-        Some(Action::Move(Motion::Left))
-    } else if binding("move_right") {
-        Some(Action::Move(Motion::Right))
-    } else if binding("move_up") {
-        Some(Action::Move(Motion::Up))
-    } else if binding("move_down") {
-        Some(Action::Move(Motion::Down))
-    } else if binding("select_word_left") {
-        Some(Action::Select(Motion::WordLeft))
-    } else if binding("select_word_right") {
-        Some(Action::Select(Motion::WordRight))
-    } else if binding("select_left") {
-        Some(Action::Select(Motion::Left))
-    } else if binding("select_right") {
-        Some(Action::Select(Motion::Right))
-    } else if binding("select_up") {
-        Some(Action::Select(Motion::Up))
-    } else if binding("select_down") {
-        Some(Action::Select(Motion::Down))
-    } else if binding("preview_page_up") {
-        Some(Action::ScrollPreviewPages(-1))
-    } else if binding("preview_page_down") {
-        Some(Action::ScrollPreviewPages(1))
-    } else if binding("switch_focus") {
-        Some(Action::SwitchFocus)
-    } else if binding("previous_diagnostic") {
-        Some(Action::NavigateDiagnostic(-1))
-    } else if binding("next_diagnostic") {
-        Some(Action::NavigateDiagnostic(1))
-    } else if binding("document_start") {
-        Some(Action::Move(Motion::DocumentStart))
-    } else if binding("document_end") {
-        Some(Action::Move(Motion::DocumentEnd))
-    } else if binding("line_start") {
-        Some(Action::Move(Motion::LineStart))
-    } else if binding("line_end") {
-        Some(Action::Move(Motion::LineEnd))
-    } else if binding("select_document_start") {
-        Some(Action::Select(Motion::DocumentStart))
-    } else if binding("select_document_end") {
-        Some(Action::Select(Motion::DocumentEnd))
-    } else if binding("select_line_start") {
-        Some(Action::Select(Motion::LineStart))
-    } else if binding("select_line_end") {
-        Some(Action::Select(Motion::LineEnd))
-    } else if binding("backspace") {
-        Some(Action::Backspace)
-    } else if binding("delete") {
-        Some(Action::Delete)
-    } else if binding("newline") {
-        Some(Action::Insert('\n'))
     } else {
-        None
+        resolve_command(
+            key,
+            keymap,
+            CommandContext::Normal,
+            &[
+                CommandId::Quit,
+                CommandId::SelectAll,
+                CommandId::Copy,
+                CommandId::Cut,
+                CommandId::Paste,
+                CommandId::FindReplace,
+                CommandId::Find,
+                CommandId::Recompile,
+                CommandId::Save,
+                CommandId::ToggleDiagnostics,
+                CommandId::ToggleFileExplorer,
+                CommandId::CommandPalette,
+                CommandId::Help,
+                CommandId::OpenFile,
+                CommandId::ExportPdf,
+                CommandId::ExportPng,
+                CommandId::ExportSvg,
+                CommandId::GoToLine,
+                CommandId::GoToPage,
+                CommandId::UseDarkTheme,
+                CommandId::UseLightTheme,
+                CommandId::ReloadFonts,
+                CommandId::Fullscreen,
+                CommandId::ZoomIn,
+                CommandId::ZoomOut,
+                CommandId::Redo,
+                CommandId::Undo,
+                CommandId::WordLeft,
+                CommandId::WordRight,
+                CommandId::MoveLeft,
+                CommandId::MoveRight,
+                CommandId::MoveUp,
+                CommandId::MoveDown,
+                CommandId::SelectWordLeft,
+                CommandId::SelectWordRight,
+                CommandId::SelectLeft,
+                CommandId::SelectRight,
+                CommandId::SelectUp,
+                CommandId::SelectDown,
+                CommandId::PreviewPageUp,
+                CommandId::PreviewPageDown,
+                CommandId::SwitchFocus,
+                CommandId::PreviousDiagnostic,
+                CommandId::NextDiagnostic,
+                CommandId::DocumentStart,
+                CommandId::DocumentEnd,
+                CommandId::LineStart,
+                CommandId::LineEnd,
+                CommandId::SelectDocumentStart,
+                CommandId::SelectDocumentEnd,
+                CommandId::SelectLineStart,
+                CommandId::SelectLineEnd,
+                CommandId::Backspace,
+                CommandId::Delete,
+                CommandId::Newline,
+            ],
+        )
     }
+}
+
+fn resolve_command(
+    key: KeyEvent,
+    keymap: &Keymap,
+    context: CommandContext,
+    commands: &[CommandId],
+) -> Option<Action> {
+    commands
+        .iter()
+        .copied()
+        .find(|command| keymap.matches(*command, context, key))
+        .map(Action::Command)
 }
 
 fn printable_character(key: KeyEvent) -> Option<char> {
@@ -311,18 +292,6 @@ fn printable_character(key: KeyEvent) -> Option<char> {
         KeyCode::Char(character) => Some(character),
         _ => None,
     }
-}
-
-fn allows_printable_binding(action: &str) -> bool {
-    matches!(
-        action,
-        "command_palette"
-            | "help"
-            | "confirm"
-            | "cancel_confirmation"
-            | "welcome_new"
-            | "welcome_open"
-    )
 }
 
 fn resolve_mouse(mouse: MouseEvent) -> Option<Action> {
@@ -446,7 +415,7 @@ fn codes_match(expected: KeyCode, actual: KeyCode) -> bool {
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use oxyst_config::Config;
+    use oxyst_config::{CommandId, Config};
 
     use super::{InputMode, KeyChord, Keymap, resolve_key};
     use crate::action::Action;
@@ -465,7 +434,7 @@ mod tests {
                 InputMode::Normal,
                 &keymap
             ),
-            Some(Action::Save)
+            Some(Action::Command(CommandId::Save))
         ));
         assert!(!matches!(
             resolve_key(
@@ -473,7 +442,26 @@ mod tests {
                 InputMode::Normal,
                 &keymap
             ),
-            Some(Action::Save)
+            Some(Action::Command(CommandId::Save))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn palette_only_commands_can_be_bound() -> Result<(), String> {
+        let mut config = Config::default();
+        config
+            .keys
+            .insert("reload_fonts".to_owned(), vec!["alt+r".to_owned()]);
+        let keymap = Keymap::new(&config)?;
+
+        assert!(matches!(
+            resolve_key(
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT),
+                InputMode::Normal,
+                &keymap
+            ),
+            Some(Action::Command(CommandId::ReloadFonts))
         ));
         Ok(())
     }
@@ -565,19 +553,19 @@ mod tests {
         ));
         assert!(matches!(
             super::resolve(key(':'), InputMode::Normal, &keymap, false),
-            Some(Action::OpenCommandPalette)
+            Some(Action::Command(CommandId::CommandPalette))
         ));
         assert!(matches!(
             super::resolve(key('?'), InputMode::Normal, &keymap, false),
-            Some(Action::OpenHelp)
+            Some(Action::Command(CommandId::Help))
         ));
         assert!(matches!(
             super::resolve(key(':'), InputMode::Welcome, &keymap, false),
-            Some(Action::OpenCommandPalette)
+            Some(Action::Command(CommandId::CommandPalette))
         ));
         assert!(matches!(
             super::resolve(key('?'), InputMode::Welcome, &keymap, false),
-            Some(Action::OpenHelp)
+            Some(Action::Command(CommandId::Help))
         ));
         Ok(())
     }
@@ -598,7 +586,7 @@ mod tests {
                 &keymap,
                 false
             ),
-            Some(Action::OpenCommandPalette)
+            Some(Action::Command(CommandId::CommandPalette))
         ));
         assert!(matches!(
             super::resolve(
@@ -607,7 +595,7 @@ mod tests {
                 &keymap,
                 false
             ),
-            Some(Action::OpenHelp)
+            Some(Action::Command(CommandId::Help))
         ));
         Ok(())
     }
@@ -659,9 +647,12 @@ mod tests {
             &keymap,
         );
 
-        assert!(matches!(selection, Some(Action::Select(_))));
-        assert!(matches!(copy, Some(Action::Copy)));
-        assert!(matches!(paste, Some(Action::PasteClipboard)));
+        assert!(matches!(
+            selection,
+            Some(Action::Command(CommandId::SelectRight))
+        ));
+        assert!(matches!(copy, Some(Action::Command(CommandId::Copy))));
+        assert!(matches!(paste, Some(Action::Command(CommandId::Paste))));
         Ok(())
     }
 
@@ -679,27 +670,30 @@ mod tests {
             &keymap,
         );
 
-        assert!(matches!(replace, Some(Action::ReplaceCurrent)));
-        assert!(matches!(previous, Some(Action::SearchNext(true))));
+        assert!(matches!(
+            replace,
+            Some(Action::Command(CommandId::ReplaceCurrent))
+        ));
+        assert!(matches!(
+            previous,
+            Some(Action::Command(CommandId::FindPrevious))
+        ));
         Ok(())
     }
 
     #[test]
-    fn internal_layout_and_file_events_bypass_input_modes() -> Result<(), String> {
+    fn internal_events_do_not_enter_input_resolution() -> Result<(), String> {
         let keymap = Keymap::new(&Config::default())?;
-        assert!(matches!(
-            super::resolve(super::Event::Resize, InputMode::Help, &keymap, true),
-            Some(Action::Resize)
-        ));
-        assert!(matches!(
+        assert!(super::resolve(super::Event::Resize, InputMode::Help, &keymap, true).is_none());
+        assert!(
             super::resolve(
                 super::Event::ProjectFilesChanged,
                 InputMode::Confirmation,
                 &keymap,
                 true
-            ),
-            Some(Action::ProjectFilesChanged)
-        ));
+            )
+            .is_none()
+        );
         Ok(())
     }
 
@@ -726,7 +720,7 @@ mod tests {
                 InputMode::QuitConfirmation,
                 &keymap
             ),
-            Some(Action::Quit)
+            Some(Action::Command(CommandId::Confirm))
         ));
         assert!(matches!(
             resolve_key(
@@ -734,7 +728,7 @@ mod tests {
                 InputMode::Confirmation,
                 &keymap
             ),
-            Some(Action::CloseOverlay)
+            Some(Action::Command(CommandId::CancelConfirmation))
         ));
         assert!(matches!(
             resolve_key(
@@ -742,7 +736,7 @@ mod tests {
                 InputMode::Welcome,
                 &keymap
             ),
-            Some(Action::NewDocument)
+            Some(Action::Command(CommandId::WelcomeNew))
         ));
         assert!(matches!(
             resolve_key(
@@ -750,7 +744,7 @@ mod tests {
                 InputMode::Welcome,
                 &keymap
             ),
-            Some(Action::OpenFile)
+            Some(Action::Command(CommandId::WelcomeOpen))
         ));
         assert!(
             resolve_key(

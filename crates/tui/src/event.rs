@@ -6,11 +6,7 @@ use std::{
 
 use crossterm::event::{self, KeyEvent, MouseEvent};
 
-use crate::{
-    compile::{CompileResult, PreviewPageResult},
-    explorer::ExplorerScanResult,
-    export::ExportResult,
-};
+use crate::message::{ExplorerScanResult, ExportResult};
 
 pub(crate) enum Event {
     Key(KeyEvent),
@@ -19,8 +15,6 @@ pub(crate) enum Event {
     Resize,
     ProjectFilesChanged,
     FileWatchFailed(String),
-    CompileFinished(CompileResult),
-    PreviewPagesFinished(PreviewPageResult),
     ExplorerScanFinished(ExplorerScanResult),
     ExportFinished(ExportResult),
     Tick,
