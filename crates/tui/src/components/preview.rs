@@ -207,6 +207,7 @@ impl Preview {
                     true
                 }
             })
+            .take(1)
             .collect()
     }
 
@@ -647,7 +648,11 @@ mod tests {
         text::Line,
         widgets::Paragraph,
     };
-    use ratatui_image::picker::{Picker, ProtocolType};
+    use ratatui_image::{
+        picker::{Picker, ProtocolType},
+        protocol::halfblocks::Halfblocks,
+        sliced::SlicedProtocol,
+    };
 
     use super::Preview;
 
@@ -765,14 +770,18 @@ mod tests {
     }
 
     #[test]
-    fn requests_only_visible_pages_and_adjacent_overscan() {
+    fn requests_the_current_page_before_overscan() {
         let mut preview = Preview::new(theme());
         preview.replace_manifest(vec![Size::new(20, 10); 10]);
         preview.set_viewport(Rect::new(0, 0, 22, 7));
 
-        assert_eq!(preview.page_requests(), vec![0, 1]);
+        assert_eq!(preview.required_pages(), vec![0, 1]);
+        assert_eq!(preview.page_requests(), vec![0]);
+        preview.install_pages(vec![(0, SlicedProtocol::Halfblocks(Halfblocks::default()))]);
+        assert_eq!(preview.page_requests(), vec![1]);
         assert!(preview.go_to_page(5));
-        assert_eq!(preview.page_requests(), vec![4, 3, 5]);
+        assert_eq!(preview.required_pages(), vec![4, 3, 5]);
+        assert_eq!(preview.page_requests(), vec![4]);
     }
 
     #[test]
