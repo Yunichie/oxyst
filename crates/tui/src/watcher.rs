@@ -246,7 +246,7 @@ mod tests {
             Mutex,
             mpsc::{TryRecvError, channel},
         },
-        time::{Duration, SystemTime},
+        time::{Duration, Instant, SystemTime},
     };
 
     use notify::{
@@ -431,17 +431,22 @@ mod tests {
         let watcher = ProjectWatcher::new(&root, sender).map_err(std::io::Error::other)?;
 
         fs::write(root.join("included.typ"), "watched")?;
-        let event = receiver.recv_timeout(Duration::from_secs(5))?;
-        assert!(matches!(event, AppEvent::ProjectFilesChanged));
-        let changes = watcher
-            .take_project_changes()
-            .map_err(std::io::Error::other)?;
-        assert!(
-            changes
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let event =
+                receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))?;
+            assert!(matches!(event, AppEvent::ProjectFilesChanged));
+            let changes = watcher
+                .take_project_changes()
+                .map_err(std::io::Error::other)?;
+            if changes
                 .paths()
                 .iter()
                 .any(|path| path.ends_with("included.typ"))
-        );
+            {
+                break;
+            }
+        }
 
         drop(watcher);
         fs::remove_dir_all(root)?;
