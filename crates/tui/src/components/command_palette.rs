@@ -178,6 +178,7 @@ mod tests {
         for _ in 1..command_count {
             palette.move_selection(1);
         }
+        let selected = palette.selected().unwrap_or(CommandId::Quit);
         let mut terminal = Terminal::new(TestBackend::new(40, 8))?;
         terminal.draw(|frame| palette.draw(frame, &theme))?;
         let buffer = terminal.backend().buffer();
@@ -186,12 +187,12 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Quit"));
+        assert!(rendered.contains(selected.label()));
         assert!(
             buffer
                 .content()
                 .iter()
-                .any(|cell| cell.symbol() == "Q" && cell.bg == Color::DarkGray)
+                .any(|cell| cell.symbol() == &selected.label()[..1] && cell.bg == Color::DarkGray)
         );
 
         let mut filtered = CommandPalette::default();

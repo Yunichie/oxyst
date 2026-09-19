@@ -8,6 +8,7 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
+use crate::documents::DocumentId;
 use crate::style::{base, color};
 
 use super::modal_area;
@@ -15,22 +16,22 @@ use super::modal_area;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PromptKind {
     OpenFile,
-    SaveAs,
-    Export(ExportFormat),
-    GoToLine,
-    GoToPage,
+    SaveAs(DocumentId),
+    Export(DocumentId, ExportFormat),
+    GoToLine(DocumentId),
+    GoToPage(DocumentId),
 }
 
 impl PromptKind {
     const fn title(self) -> &'static str {
         match self {
             Self::OpenFile => " Open file ",
-            Self::SaveAs => " Save as ",
-            Self::Export(ExportFormat::Pdf) => " Export PDF ",
-            Self::Export(ExportFormat::Png) => " Export PNG ",
-            Self::Export(ExportFormat::Svg) => " Export SVG ",
-            Self::GoToLine => " Go to line ",
-            Self::GoToPage => " Go to page ",
+            Self::SaveAs(_) => " Save as ",
+            Self::Export(_, ExportFormat::Pdf) => " Export PDF ",
+            Self::Export(_, ExportFormat::Png) => " Export PNG ",
+            Self::Export(_, ExportFormat::Svg) => " Export SVG ",
+            Self::GoToLine(_) => " Go to line ",
+            Self::GoToPage(_) => " Go to page ",
         }
     }
 }

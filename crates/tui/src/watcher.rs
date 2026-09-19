@@ -41,26 +41,15 @@ struct PendingProjectChanges {
 }
 
 impl ProjectWatcher {
-    pub(crate) fn new(
-        root: &Path,
-        main: Option<&Path>,
-        sender: Sender<AppEvent>,
-    ) -> Result<Self, String> {
+    pub(crate) fn new(root: &Path, sender: Sender<AppEvent>) -> Result<Self, String> {
         let root = fs::canonicalize(root)
             .map_err(|error| format!("could not watch project root {}: {error}", root.display()))?;
-        let main = main.map(|path| absolute_path(path, &root));
         let callback_sender = sender.clone();
         let callback_root = root.clone();
         let pending = Arc::new(Mutex::new(PendingProjectChanges::default()));
         let callback_pending = Arc::clone(&pending);
         let mut watcher = notify::recommended_watcher(move |result| {
-            forward(
-                result,
-                &callback_root,
-                main.as_deref(),
-                &callback_sender,
-                &callback_pending,
-            );
+            forward(result, &callback_root, &callback_sender, &callback_pending);
         })
         .map_err(|error| format!("could not initialize project watcher: {error}"))?;
         watcher
@@ -74,8 +63,8 @@ impl ProjectWatcher {
         })
     }
 
-    pub(crate) fn retarget(&mut self, root: &Path, main: Option<&Path>) -> Result<(), String> {
-        *self = Self::new(root, main, self.sender.clone())?;
+    pub(crate) fn retarget(&mut self, root: &Path) -> Result<(), String> {
+        *self = Self::new(root, self.sender.clone())?;
         Ok(())
     }
 
@@ -92,12 +81,11 @@ impl ProjectWatcher {
 fn forward(
     result: notify::Result<notify::Event>,
     root: &Path,
-    main: Option<&Path>,
     sender: &Sender<AppEvent>,
     pending: &Mutex<PendingProjectChanges>,
 ) {
     match result {
-        Ok(event) if event_requires_compile(&event, root, main) => {
+        Ok(event) if event_requires_compile(&event, root) => {
             let should_notify = match pending.lock() {
                 Ok(mut pending) => {
                     merge_explorer_changes(&event, root, &mut pending.changes);
@@ -205,7 +193,7 @@ fn record_typst_path(path: &Path, root: &Path, changes: &mut ProjectChanges) {
     }
 }
 
-fn event_requires_compile(event: &notify::Event, root: &Path, main: Option<&Path>) -> bool {
+fn event_requires_compile(event: &notify::Event, root: &Path) -> bool {
     if event.need_rescan() {
         return true;
     }
@@ -218,17 +206,11 @@ fn event_requires_compile(event: &notify::Event, root: &Path, main: Option<&Path
         && event
             .paths
             .iter()
-            .any(|path| is_project_resource(path, root, main))
+            .any(|path| is_project_resource(path, root))
 }
 
-fn is_project_resource(path: &Path, root: &Path, main: Option<&Path>) -> bool {
-    let Some(path) = project_path(path, root) else {
-        return false;
-    };
-    if main.is_some_and(|main| path == main) {
-        return false;
-    }
-    true
+fn is_project_resource(path: &Path, root: &Path) -> bool {
+    project_path(path, root).is_some()
 }
 
 fn project_path(path: &Path, root: &Path) -> Option<PathBuf> {
@@ -282,7 +264,7 @@ mod tests {
     use crate::event::Event as AppEvent;
 
     #[test]
-    fn filters_main_file_noise_and_paths_outside_the_project() -> Result<(), Box<dyn Error>> {
+    fn accepts_open_files_and_filters_paths_outside_the_project() -> Result<(), Box<dyn Error>> {
         let root = std::env::current_dir()?.join("watch-filter-root");
         let main = root.join("main.typ");
         let changed = |path| {
@@ -291,23 +273,16 @@ mod tests {
 
         assert!(event_requires_compile(
             &changed(root.join("included.typ")),
-            &root,
-            Some(&main)
+            &root
         ));
-        assert!(!event_requires_compile(
-            &changed(main),
-            &root,
-            Some(&root.join("main.typ"))
-        ));
+        assert!(event_requires_compile(&changed(main), &root));
         assert!(!event_requires_compile(
             &changed(root.join("target/generated.typ")),
-            &root,
-            None
+            &root
         ));
         assert!(!event_requires_compile(
             &changed(root.join(".git/index")),
-            &root,
-            None
+            &root
         ));
         assert!(!event_requires_compile(
             &changed(
@@ -316,7 +291,6 @@ mod tests {
                     .join("outside.typ")
             ),
             &root,
-            None
         ));
 
         let access = Event::new(EventKind::Access(AccessKind::Open(AccessMode::Read)))
@@ -325,11 +299,11 @@ mod tests {
             MetadataKind::Permissions,
         )))
         .add_path(root.join("included.typ"));
-        assert!(!event_requires_compile(&access, &root, None));
-        assert!(!event_requires_compile(&metadata, &root, None));
+        assert!(!event_requires_compile(&access, &root));
+        assert!(!event_requires_compile(&metadata, &root));
 
         let rescan = Event::new(EventKind::Other).set_flag(Flag::Rescan);
-        assert!(event_requires_compile(&rescan, &root, None));
+        assert!(event_requires_compile(&rescan, &root));
         Ok(())
     }
 
@@ -344,7 +318,7 @@ mod tests {
         let pending = Mutex::new(PendingProjectChanges::default());
 
         for index in 0..100 {
-            forward(Ok(changed(index)), &root, None, &sender, &pending);
+            forward(Ok(changed(index)), &root, &sender, &pending);
         }
 
         assert!(matches!(
@@ -361,7 +335,7 @@ mod tests {
             pending.changes = super::ProjectChanges::default();
             pending.notified = false;
         }
-        forward(Ok(changed(100)), &root, None, &sender, &pending);
+        forward(Ok(changed(100)), &root, &sender, &pending);
         assert!(matches!(
             receiver.recv_timeout(Duration::from_secs(1))?,
             AppEvent::ProjectFilesChanged
@@ -454,7 +428,7 @@ mod tests {
             std::env::temp_dir().join(format!("oxyst-watch-{}-{unique}", std::process::id()));
         fs::create_dir_all(&root)?;
         let (sender, receiver) = channel();
-        let watcher = ProjectWatcher::new(&root, None, sender).map_err(std::io::Error::other)?;
+        let watcher = ProjectWatcher::new(&root, sender).map_err(std::io::Error::other)?;
 
         fs::write(root.join("included.typ"), "watched")?;
         let event = receiver.recv_timeout(Duration::from_secs(5))?;

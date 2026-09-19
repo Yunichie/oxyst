@@ -8,8 +8,7 @@ pub(crate) enum Pane {
     Preview,
 }
 
-pub(crate) enum Action {
-    Command(CommandId),
+pub(crate) enum EditorAction {
     Insert(char),
     InsertText(String),
     Backspace,
@@ -17,11 +16,16 @@ pub(crate) enum Action {
     Move(Motion),
     Select(Motion),
     SelectAll,
+    Undo,
+    Redo,
+}
+
+pub(crate) enum Action {
+    Command(CommandId),
+    Editor(EditorAction),
     Copy,
     Cut,
     PasteClipboard,
-    Undo,
-    Redo,
     MouseDown { column: u16, row: u16 },
     MouseDrag { column: u16, row: u16 },
     ScrollAt { column: u16, row: u16, lines: isize },
@@ -32,6 +36,4 @@ pub(crate) enum Action {
     OverlayMove(isize),
     OverlaySubmit,
     RequestQuit,
-    Quit,
-    CancelQuit,
 }

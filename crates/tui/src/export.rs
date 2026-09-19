@@ -4,7 +4,7 @@ use oxyst_compiler::CompiledDocument;
 use oxyst_render::ExportFormat;
 use tokio::runtime::Handle;
 
-use crate::{event::Event, message::ExportResult};
+use crate::{documents::DocumentId, event::Event, message::ExportResult};
 
 pub(crate) struct ExportWorker {
     sender: Sender<Event>,
@@ -16,12 +16,19 @@ impl ExportWorker {
         Self { sender, runtime }
     }
 
-    pub(crate) fn spawn(&self, document: CompiledDocument, format: ExportFormat, path: PathBuf) {
+    pub(crate) fn spawn(
+        &self,
+        source: DocumentId,
+        document: CompiledDocument,
+        format: ExportFormat,
+        path: PathBuf,
+    ) {
         let sender = self.sender.clone();
         drop(self.runtime.spawn_blocking(move || {
             let result =
                 oxyst_render::export(&document, format, &path).map_err(|error| error.to_string());
             let _ = sender.send(Event::ExportFinished(ExportResult {
+                document: source,
                 format,
                 path,
                 result,

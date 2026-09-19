@@ -4,47 +4,30 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use oxyst_render::ExportFormat;
-
 pub(crate) struct OpenedSource {
     pub(crate) text: String,
     pub(crate) existed: bool,
 }
 
 pub(crate) struct Workspace {
-    path: Option<PathBuf>,
     root: PathBuf,
     root_is_explicit: bool,
-    display_name: String,
 }
 
 impl Workspace {
-    pub(crate) fn new(path: Option<PathBuf>, root: PathBuf, root_is_explicit: bool) -> Self {
-        let display_name = display_name(path.as_deref());
+    pub(crate) fn new(root: PathBuf, root_is_explicit: bool) -> Self {
         Self {
-            path,
             root,
             root_is_explicit,
-            display_name,
         }
-    }
-
-    pub(crate) fn path(&self) -> Option<&Path> {
-        self.path.as_deref()
     }
 
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }
 
-    pub(crate) fn display_name(&self) -> &str {
-        &self.display_name
-    }
-
-    pub(crate) fn main_path(&self) -> PathBuf {
-        self.path
-            .clone()
-            .unwrap_or_else(|| self.root.join("untitled.typ"))
+    pub(crate) fn virtual_path(&self, document: u64) -> PathBuf {
+        self.root.join(format!(".oxyst-untitled-{document}.typ"))
     }
 
     pub(crate) fn resolve_path(&self, value: &str) -> Result<PathBuf, String> {
@@ -104,22 +87,12 @@ impl Workspace {
             .ok_or_else(|| format!("Could not determine project root for {}", path.display()))
     }
 
-    pub(crate) fn opened(&mut self, path: PathBuf, root: PathBuf) {
-        self.display_name = display_name(Some(&path));
-        self.path = Some(path);
+    pub(crate) fn set_root(&mut self, root: PathBuf) {
         self.root = root;
     }
 
-    pub(crate) fn saved_as(&mut self, path: PathBuf, root: PathBuf) {
-        self.root = root;
-        self.display_name = display_name(Some(&path));
-        self.path = Some(path);
-    }
-
-    pub(crate) fn default_export_path(&self, format: ExportFormat) -> PathBuf {
-        let mut path = self.main_path();
-        path.set_extension(format.extension());
-        path
+    pub(crate) fn canonical_path(path: &Path) -> Result<PathBuf, String> {
+        canonical_document_path(path)
     }
 }
 
@@ -139,13 +112,6 @@ fn canonical_document_path(path: &Path) -> Result<PathBuf, String> {
         .file_name()
         .ok_or_else(|| format!("Could not determine file name for {}", path.display()))?;
     Ok(parent.join(name))
-}
-
-fn display_name(path: Option<&Path>) -> String {
-    path.and_then(Path::file_name).map_or_else(
-        || "Untitled".to_owned(),
-        |name| name.to_string_lossy().into_owned(),
-    )
 }
 
 #[cfg(test)]
@@ -173,12 +139,11 @@ mod tests {
         let canonical_root = fs::canonicalize(&root)?;
         let canonical_outside = fs::canonicalize(&outside)?;
 
-        let fixed = Workspace::new(None, root.clone(), true);
+        let fixed = Workspace::new(root.clone(), true);
         assert_eq!(fixed.root_for_document(&nested_document)?, canonical_root);
         assert!(fixed.root_for_document(&outside_document).is_err());
 
-        let mut inferred = Workspace::new(None, root, false);
-        assert_eq!(inferred.display_name(), "Untitled");
+        let mut inferred = Workspace::new(root, false);
         assert_eq!(
             inferred.root_for_document(&nested_document)?,
             canonical_root
@@ -188,8 +153,7 @@ mod tests {
             canonical_outside
         );
 
-        inferred.saved_as(outside_document.clone(), canonical_outside.clone());
-        assert_eq!(inferred.display_name(), "report.typ");
+        inferred.set_root(canonical_outside.clone());
         assert_eq!(inferred.root(), canonical_outside);
 
         fs::remove_dir_all(base)?;
@@ -216,7 +180,7 @@ mod tests {
             }
         };
         if linked.is_ok() {
-            let workspace = Workspace::new(None, root, true);
+            let workspace = Workspace::new(root, true);
             assert!(workspace.root_for_document(&link).is_err());
         }
 

@@ -16,15 +16,17 @@ use super::{
 };
 use crate::{
     action::Action,
+    documents::DocumentId,
     input::{InputMode, Keymap},
     style::{base, color},
 };
 
 #[derive(Debug)]
 pub(crate) enum ConfirmIntent {
-    Open(PathBuf),
-    SaveAs(PathBuf),
-    Export(ExportFormat, PathBuf),
+    SaveAs(DocumentId, PathBuf),
+    Export(DocumentId, ExportFormat, PathBuf),
+    Close(DocumentId),
+    Quit(DocumentId),
 }
 
 #[derive(Debug)]
@@ -146,6 +148,23 @@ impl OverlayHost {
         }
     }
 
+    pub(crate) fn discard_confirmation(&mut self) -> Option<ConfirmIntent> {
+        match std::mem::take(&mut self.current) {
+            Overlay::Confirm(confirmation)
+                if matches!(
+                    confirmation.intent,
+                    ConfirmIntent::Close(_) | ConfirmIntent::Quit(_)
+                ) =>
+            {
+                Some(confirmation.intent)
+            }
+            other => {
+                self.current = other;
+                None
+            }
+        }
+    }
+
     pub(crate) fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
     }
@@ -195,22 +214,34 @@ impl Component for OverlayHost {
             Overlay::Confirm(confirmation) => {
                 let area = modal_area(frame.area(), 72, 5);
                 frame.render_widget(Clear, area);
-                frame.render_widget(
-                    Paragraph::new(format!(
-                        "{}\n{} confirm | {} cancel",
-                        confirmation.message,
+                let choices = if matches!(
+                    confirmation.intent,
+                    ConfirmIntent::Close(_) | ConfirmIntent::Quit(_)
+                ) {
+                    format!(
+                        "{} save | {} discard | {} cancel",
+                        self.keymap.display(CommandId::Confirm),
+                        self.keymap.display(CommandId::DiscardChanges),
+                        self.keymap.display(CommandId::CancelConfirmation)
+                    )
+                } else {
+                    format!(
+                        "{} confirm | {} cancel",
                         self.keymap.display(CommandId::Confirm),
                         self.keymap.display(CommandId::CancelConfirmation)
-                    ))
-                    .centered()
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_type(BorderType::Rounded)
-                            .border_style(Style::default().fg(color(self.theme.warning)))
-                            .style(base(&self.theme))
-                            .title(" Confirm "),
-                    ),
+                    )
+                };
+                frame.render_widget(
+                    Paragraph::new(format!("{}\n{}", confirmation.message, choices))
+                        .centered()
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .border_type(BorderType::Rounded)
+                                .border_style(Style::default().fg(color(self.theme.warning)))
+                                .style(base(&self.theme))
+                                .title(" Confirm "),
+                        ),
                     area,
                 );
             }

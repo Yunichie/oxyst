@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     path::{Path, PathBuf},
     sync::mpsc::{Receiver, channel},
     time::{Duration, Instant},
@@ -20,13 +21,14 @@ use ratatui_image::picker::Picker;
 use tokio::runtime::Handle;
 
 use crate::{
-    action::{Action, Pane},
+    action::{Action, EditorAction, Pane},
     clipboard::Clipboard,
     components::{
         Component, ConfirmIntent, Diagnostics, Editor, FileExplorer, Header, HeaderState,
-        OverlayHost, OverlaySubmission, Preview, Prompt, PromptKind, SearchMode, StatusBar,
-        StatusBarState, Welcome, WelcomeChoice, format_diagnostic,
+        OverlayHost, OverlaySubmission, Preview, PreviewViewState, Prompt, PromptKind, SearchMode,
+        StatusBar, StatusBarState, Tabs, Welcome, WelcomeChoice, format_diagnostic,
     },
+    documents::{DocumentId, Documents},
     event::{self, Event},
     explorer::ExplorerWorker,
     export::ExportWorker,
@@ -49,6 +51,7 @@ fn overlay_transition_requires_clear(action: &Action) -> bool {
                 CommandId::CloseOverlay
                     | CommandId::Newline
                     | CommandId::Confirm
+                    | CommandId::DiscardChanges
                     | CommandId::CancelConfirmation
             )
     )
@@ -56,6 +59,8 @@ fn overlay_transition_requires_clear(action: &Action) -> bool {
 
 pub(crate) struct App {
     editor: Editor,
+    documents: Documents,
+    tabs: Tabs,
     header: Header,
     status_bar: StatusBar,
     clipboard: Clipboard,
@@ -73,14 +78,23 @@ pub(crate) struct App {
     cursor_sync_deadline: Option<Instant>,
     diagnostics: Diagnostics,
     keymap: Keymap,
+    soft_wrap: bool,
     color_depth: ColorDepth,
     theme: Theme,
     welcome: Option<Welcome>,
     overlay: OverlayHost,
-    quit_confirmation: bool,
+    quit_queue: VecDeque<DocumentId>,
+    after_save: Option<AfterSave>,
+    pending_preview_restore: Option<(DocumentId, PreviewViewState)>,
     should_quit: bool,
     status: Option<String>,
     recent: RecentFiles,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AfterSave {
+    Close(DocumentId),
+    Quit,
 }
 
 pub(crate) struct AppInit<'a> {
@@ -129,14 +143,32 @@ impl App {
             welcome.set_recent_count(recent.entries().len());
             welcome
         });
+        let document_path = path.as_deref().map(Workspace::canonical_path).transpose()?;
         let (sender, internal_events) = channel();
-        let watcher = ProjectWatcher::new(&root, path.as_deref(), sender.clone())?;
+        let watcher = ProjectWatcher::new(&root, sender.clone())?;
         let explorer_worker = ExplorerWorker::new(sender.clone(), runtime.clone());
         let mut source = compiler.main_source();
         source.replace(text);
+        let mut editor = Editor::default();
+        let mut diagnostics = Diagnostics::new(theme);
+        let mut documents = Documents::default();
+        if let Some(path) = document_path {
+            documents.insert(
+                Some(path),
+                Editor::from_source(source, theme, config.soft_wrap),
+                Diagnostics::new(theme),
+                PreviewViewState::default(),
+                &mut editor,
+                &mut diagnostics,
+            );
+        } else {
+            editor = Editor::from_source(source, theme, config.soft_wrap);
+        }
 
         Ok(Self {
-            editor: Editor::from_source(source, theme, config.soft_wrap),
+            editor,
+            documents,
+            tabs: Tabs::new(theme),
             header,
             status_bar,
             clipboard: Clipboard::new(),
@@ -144,7 +176,7 @@ impl App {
             explorer: FileExplorer::new(root.clone(), theme),
             focus: Pane::Editor,
             fullscreen: false,
-            workspace: Workspace::new(path, root, root_is_explicit),
+            workspace: Workspace::new(root, root_is_explicit),
             pipeline: PreviewPipeline::new(compiler, picker, runtime.clone()),
             explorer_worker,
             explorer_scan_generation: 0,
@@ -152,13 +184,16 @@ impl App {
             watcher,
             internal_events,
             cursor_sync_deadline: None,
-            diagnostics: Diagnostics::new(theme),
+            diagnostics,
             keymap,
+            soft_wrap: config.soft_wrap,
             color_depth,
             theme,
             welcome,
             overlay,
-            quit_confirmation: false,
+            quit_queue: VecDeque::new(),
+            after_save: None,
+            pending_preview_restore: None,
             should_quit: false,
             status: startup_status,
             recent,
@@ -218,9 +253,6 @@ impl App {
     }
 
     fn input_mode(&self) -> InputMode {
-        if self.quit_confirmation {
-            return InputMode::QuitConfirmation;
-        }
         if let Some(mode) = self.overlay.input_mode() {
             mode
         } else if self.welcome.is_some() {
@@ -248,27 +280,25 @@ impl App {
             Action::MouseDown { column, row } => self.mouse_down(column, row),
             Action::MouseDrag { column, row } => self.mouse_drag(column, row),
             Action::ScrollAt { column, row, lines } => self.scroll_at(column, row, lines),
-            Action::Move(Motion::Up) if self.focus == Pane::Explorer => self.explorer.select(-1),
-            Action::Move(Motion::Down) if self.focus == Pane::Explorer => self.explorer.select(1),
-            Action::Insert('\n') if self.focus == Pane::Explorer => {
+            Action::Editor(EditorAction::Move(Motion::Up)) if self.focus == Pane::Explorer => {
+                self.explorer.select(-1);
+            }
+            Action::Editor(EditorAction::Move(Motion::Down)) if self.focus == Pane::Explorer => {
+                self.explorer.select(1);
+            }
+            Action::Editor(EditorAction::Insert('\n')) if self.focus == Pane::Explorer => {
                 if let Some(path) = self.explorer.selected_path() {
                     self.request_open(path);
                 }
             }
-            Action::Move(Motion::Up) if self.focus == Pane::Preview => {
+            Action::Editor(EditorAction::Move(Motion::Up)) if self.focus == Pane::Preview => {
                 self.preview.scroll_lines(-1);
             }
-            Action::Move(Motion::Down) if self.focus == Pane::Preview => {
+            Action::Editor(EditorAction::Move(Motion::Down)) if self.focus == Pane::Preview => {
                 self.preview.scroll_lines(1);
             }
-            Action::RequestQuit if self.editor.is_dirty() => {
-                self.quit_confirmation = true;
-                self.overlay.close();
-                self.status = None;
-            }
-            Action::RequestQuit | Action::Quit => self.should_quit = true,
-            Action::CancelQuit => self.quit_confirmation = false,
-            action if self.focus == Pane::Editor => self.update_editor(action),
+            Action::RequestQuit => self.request_quit(),
+            Action::Editor(action) if self.focus == Pane::Editor => self.update_editor(action),
             _ => {}
         }
     }
@@ -331,20 +361,32 @@ impl App {
 
     fn execute_command(&mut self, command: CommandId) {
         match command {
+            CommandId::NewDocument => self.start_new_document(),
             CommandId::OpenFile | CommandId::WelcomeOpen => self.open_file_prompt(),
             CommandId::ExportPdf | CommandId::ExportPng | CommandId::ExportSvg => {
+                let Some(document) = self.documents.active_id() else {
+                    return;
+                };
                 let format = match command {
                     CommandId::ExportPdf => ExportFormat::Pdf,
                     CommandId::ExportPng => ExportFormat::Png,
                     CommandId::ExportSvg => ExportFormat::Svg,
                     _ => return,
                 };
-                let path = self.default_export_path(format);
+                let path = self.default_export_path(document, format);
                 self.overlay
-                    .open_prompt(PromptKind::Export(format), path.to_string_lossy());
+                    .open_prompt(PromptKind::Export(document, format), path.to_string_lossy());
             }
-            CommandId::GoToLine => self.overlay.open_prompt(PromptKind::GoToLine, ""),
-            CommandId::GoToPage => self.overlay.open_prompt(PromptKind::GoToPage, ""),
+            CommandId::GoToLine => {
+                if let Some(document) = self.documents.active_id() {
+                    self.overlay.open_prompt(PromptKind::GoToLine(document), "");
+                }
+            }
+            CommandId::GoToPage => {
+                if let Some(document) = self.documents.active_id() {
+                    self.overlay.open_prompt(PromptKind::GoToPage(document), "");
+                }
+            }
             CommandId::ToggleDiagnostics => self.diagnostics.toggle(),
             CommandId::ToggleFileExplorer => self.toggle_explorer(),
             CommandId::UseDarkTheme => self.set_theme(ThemeName::Dark),
@@ -354,31 +396,62 @@ impl App {
                 self.status = Some("Reloading fonts...".to_owned());
             }
             CommandId::Quit => self.update(Action::RequestQuit),
+            CommandId::CloseTab => self.request_close_active(),
+            CommandId::NextTab => self.activate_relative(1),
+            CommandId::PreviousTab => self.activate_relative(-1),
             CommandId::Save => self.save(),
             CommandId::Recompile => self.start_compile(),
-            CommandId::Undo => self.update(Action::Undo),
-            CommandId::Redo => self.update(Action::Redo),
-            CommandId::MoveLeft => self.update(Action::Move(Motion::Left)),
-            CommandId::MoveRight => self.update(Action::Move(Motion::Right)),
+            CommandId::Undo => self.update(Action::Editor(EditorAction::Undo)),
+            CommandId::Redo => self.update(Action::Editor(EditorAction::Redo)),
+            CommandId::MoveLeft => self.update(Action::Editor(EditorAction::Move(Motion::Left))),
+            CommandId::MoveRight => self.update(Action::Editor(EditorAction::Move(Motion::Right))),
             CommandId::MoveUp => self.execute_direction(Motion::Up, -1),
             CommandId::MoveDown => self.execute_direction(Motion::Down, 1),
-            CommandId::SelectLeft => self.update(Action::Select(Motion::Left)),
-            CommandId::SelectRight => self.update(Action::Select(Motion::Right)),
-            CommandId::SelectUp => self.update(Action::Select(Motion::Up)),
-            CommandId::SelectDown => self.update(Action::Select(Motion::Down)),
-            CommandId::WordLeft => self.update(Action::Move(Motion::WordLeft)),
-            CommandId::WordRight => self.update(Action::Move(Motion::WordRight)),
-            CommandId::SelectWordLeft => self.update(Action::Select(Motion::WordLeft)),
-            CommandId::SelectWordRight => self.update(Action::Select(Motion::WordRight)),
-            CommandId::LineStart => self.update(Action::Move(Motion::LineStart)),
-            CommandId::LineEnd => self.update(Action::Move(Motion::LineEnd)),
-            CommandId::SelectLineStart => self.update(Action::Select(Motion::LineStart)),
-            CommandId::SelectLineEnd => self.update(Action::Select(Motion::LineEnd)),
-            CommandId::DocumentStart => self.update(Action::Move(Motion::DocumentStart)),
-            CommandId::DocumentEnd => self.update(Action::Move(Motion::DocumentEnd)),
-            CommandId::SelectDocumentStart => self.update(Action::Select(Motion::DocumentStart)),
-            CommandId::SelectDocumentEnd => self.update(Action::Select(Motion::DocumentEnd)),
-            CommandId::SelectAll => self.update(Action::SelectAll),
+            CommandId::SelectLeft => {
+                self.update(Action::Editor(EditorAction::Select(Motion::Left)))
+            }
+            CommandId::SelectRight => {
+                self.update(Action::Editor(EditorAction::Select(Motion::Right)));
+            }
+            CommandId::SelectUp => self.update(Action::Editor(EditorAction::Select(Motion::Up))),
+            CommandId::SelectDown => {
+                self.update(Action::Editor(EditorAction::Select(Motion::Down)))
+            }
+            CommandId::WordLeft => {
+                self.update(Action::Editor(EditorAction::Move(Motion::WordLeft)))
+            }
+            CommandId::WordRight => {
+                self.update(Action::Editor(EditorAction::Move(Motion::WordRight)));
+            }
+            CommandId::SelectWordLeft => {
+                self.update(Action::Editor(EditorAction::Select(Motion::WordLeft)));
+            }
+            CommandId::SelectWordRight => {
+                self.update(Action::Editor(EditorAction::Select(Motion::WordRight)));
+            }
+            CommandId::LineStart => {
+                self.update(Action::Editor(EditorAction::Move(Motion::LineStart)))
+            }
+            CommandId::LineEnd => self.update(Action::Editor(EditorAction::Move(Motion::LineEnd))),
+            CommandId::SelectLineStart => {
+                self.update(Action::Editor(EditorAction::Select(Motion::LineStart)));
+            }
+            CommandId::SelectLineEnd => {
+                self.update(Action::Editor(EditorAction::Select(Motion::LineEnd)));
+            }
+            CommandId::DocumentStart => {
+                self.update(Action::Editor(EditorAction::Move(Motion::DocumentStart)));
+            }
+            CommandId::DocumentEnd => {
+                self.update(Action::Editor(EditorAction::Move(Motion::DocumentEnd)));
+            }
+            CommandId::SelectDocumentStart => {
+                self.update(Action::Editor(EditorAction::Select(Motion::DocumentStart)));
+            }
+            CommandId::SelectDocumentEnd => {
+                self.update(Action::Editor(EditorAction::Select(Motion::DocumentEnd)));
+            }
+            CommandId::SelectAll => self.update(Action::Editor(EditorAction::SelectAll)),
             CommandId::Copy => self.update(Action::Copy),
             CommandId::Cut => self.update(Action::Cut),
             CommandId::Paste => self.update(Action::PasteClipboard),
@@ -395,15 +468,15 @@ impl App {
                 ) {
                     self.update(Action::OverlayBackspace);
                 } else {
-                    self.update(Action::Backspace);
+                    self.update(Action::Editor(EditorAction::Backspace));
                 }
             }
-            CommandId::Delete => self.update(Action::Delete),
+            CommandId::Delete => self.update(Action::Editor(EditorAction::Delete)),
             CommandId::Newline => {
                 if matches!(self.input_mode(), InputMode::Overlay | InputMode::Welcome) {
                     self.update(Action::OverlaySubmit);
                 } else {
-                    self.update(Action::Insert('\n'));
+                    self.update(Action::Editor(EditorAction::Insert('\n')));
                 }
             }
             CommandId::SwitchFocus => self.switch_focus(),
@@ -416,21 +489,14 @@ impl App {
             CommandId::NextDiagnostic => self.navigate_diagnostic(1),
             CommandId::PreviousDiagnostic => self.navigate_diagnostic(-1),
             CommandId::Help => self.overlay.open_help(),
-            CommandId::CloseOverlay => self.overlay.close(),
-            CommandId::Confirm => {
-                if self.input_mode() == InputMode::QuitConfirmation {
-                    self.update(Action::Quit);
-                } else {
-                    self.update(Action::OverlaySubmit);
-                }
+            CommandId::CloseOverlay => {
+                self.overlay.close();
+                self.after_save = None;
+                self.quit_queue.clear();
             }
-            CommandId::CancelConfirmation => {
-                if self.input_mode() == InputMode::QuitConfirmation {
-                    self.update(Action::CancelQuit);
-                } else {
-                    self.overlay.close();
-                }
-            }
+            CommandId::Confirm => self.update(Action::OverlaySubmit),
+            CommandId::DiscardChanges => self.discard_changes(),
+            CommandId::CancelConfirmation => self.cancel_confirmation(),
             CommandId::WelcomeNew => self.start_new_document(),
         }
     }
@@ -442,7 +508,7 @@ impl App {
         ) {
             self.update(Action::OverlayMove(overlay_direction));
         } else {
-            self.update(Action::Move(motion));
+            self.update(Action::Editor(EditorAction::Move(motion)));
         }
     }
 
@@ -454,95 +520,134 @@ impl App {
                     self.request_open(path);
                 }
             }
-            PromptKind::SaveAs => {
+            PromptKind::SaveAs(document) => {
                 if let Some(path) = self.resolve_path(&value) {
                     if path.exists() {
-                        self.confirm_overwrite(ConfirmIntent::SaveAs(path));
+                        self.confirm_overwrite(ConfirmIntent::SaveAs(document, path));
                     } else {
-                        self.save_as(path);
+                        self.save_as(document, path);
                     }
+                } else {
+                    self.abort_pending_operation();
                 }
             }
-            PromptKind::Export(format) => {
+            PromptKind::Export(document, format) => {
                 if let Some(mut path) = self.resolve_path(&value) {
                     if path.extension().is_none() {
                         path.set_extension(format.extension());
                     }
                     if path.exists() {
-                        self.confirm_overwrite(ConfirmIntent::Export(format, path));
+                        self.confirm_overwrite(ConfirmIntent::Export(document, format, path));
                     } else {
-                        self.start_export(format, path);
+                        self.start_export(document, format, path);
                     }
                 }
             }
-            PromptKind::GoToLine => self.go_to_line(&value),
-            PromptKind::GoToPage => self.go_to_page(&value),
+            PromptKind::GoToLine(document) => self.go_to_line(document, &value),
+            PromptKind::GoToPage(document) => self.go_to_page(document, &value),
         }
     }
 
     fn confirm(&mut self, intent: ConfirmIntent) {
         match intent {
-            ConfirmIntent::Open(path) => self.open_path(path),
-            ConfirmIntent::SaveAs(path) => self.save_as(path),
-            ConfirmIntent::Export(format, path) => self.start_export(format, path),
+            ConfirmIntent::SaveAs(document, path) => self.save_as(document, path),
+            ConfirmIntent::Export(document, format, path) => {
+                self.start_export(document, format, path);
+            }
+            ConfirmIntent::Close(document) => {
+                self.save_document(document, Some(AfterSave::Close(document)));
+            }
+            ConfirmIntent::Quit(document) => {
+                self.save_document(document, Some(AfterSave::Quit));
+            }
         }
     }
 
     fn confirm_overwrite(&mut self, intent: ConfirmIntent) {
         let path = match &intent {
-            ConfirmIntent::Open(path) | ConfirmIntent::SaveAs(path) => path,
-            ConfirmIntent::Export(_, path) => path,
+            ConfirmIntent::SaveAs(_, path) | ConfirmIntent::Export(_, _, path) => path,
+            ConfirmIntent::Close(_) | ConfirmIntent::Quit(_) => return,
         };
         self.overlay
             .confirm(format!("Overwrite {}?", path.display()), intent);
     }
 
     fn request_open(&mut self, path: PathBuf) {
-        if self.editor.is_dirty() {
-            self.overlay.confirm(
-                "Discard unsaved changes and open file?".to_owned(),
-                ConfirmIntent::Open(path),
-            );
-        } else {
-            self.open_path(path);
-        }
+        self.open_path(path);
     }
 
     fn open_path(&mut self, path: PathBuf) {
-        let root = match self.workspace.root_for_document(&path) {
+        let canonical = match Workspace::canonical_path(&path) {
+            Ok(path) => path,
+            Err(error) => {
+                self.status = Some(error);
+                return;
+            }
+        };
+        if let Some(document) = self.documents.find_path(&canonical) {
+            self.activate_document(document);
+            return;
+        }
+        let root = match self.workspace.root_for_document(&canonical) {
             Ok(root) => root,
             Err(error) => {
                 self.status = Some(error);
                 return;
             }
         };
-        let opened = match Workspace::read_source(&path) {
+        let current_root = match std::fs::canonicalize(self.workspace.root()) {
+            Ok(root) => root,
+            Err(error) => {
+                self.status = Some(format!("Could not resolve project root: {error}"));
+                return;
+            }
+        };
+        if !self.documents.is_empty() && root != current_root {
+            self.status = Some(format!(
+                "{} is outside project root {}",
+                canonical.display(),
+                self.workspace.root().display()
+            ));
+            return;
+        }
+        let opened = match Workspace::read_source(&canonical) {
             Ok(opened) => opened,
             Err(error) => {
                 self.status = Some(error);
                 return;
             }
         };
-        let watch_error = self.watcher.retarget(&root, Some(&path)).err();
-        self.editor.replace_document(&opened.text);
+        let watch_error = if self.documents.is_empty() && root != current_root {
+            self.workspace.set_root(root.clone());
+            self.set_explorer_root(root.clone());
+            self.watcher.retarget(&root).err()
+        } else {
+            None
+        };
+        let document = self.documents.insert(
+            Some(canonical.clone()),
+            Editor::new(&opened.text, self.theme, self.soft_wrap),
+            Diagnostics::new(self.theme),
+            self.preview.view_state(),
+            &mut self.editor,
+            &mut self.diagnostics,
+        );
         self.preview.clear();
-        self.diagnostics = Diagnostics::new(self.theme);
-        self.workspace.opened(path.clone(), root.clone());
-        self.set_explorer_root(root.clone());
+        self.pending_preview_restore = Some((document, PreviewViewState::default()));
         self.welcome = None;
         self.focus = Pane::Editor;
         self.fullscreen = false;
         self.status = None;
         if let Err(error) = self
             .pipeline
-            .reset_for_world(root, path.clone(), Instant::now())
+            .reset_for_world(root, canonical.clone(), Instant::now())
         {
             self.status = Some(error);
         } else {
             self.start_compile();
         }
         if opened.existed {
-            self.record_recent(&path);
+            self.record_recent(&canonical);
         }
         if let Some(error) = watch_error {
             self.status = Some(format!("File watch failed: {error}"));
@@ -550,9 +655,32 @@ impl App {
     }
 
     fn start_new_document(&mut self) {
+        let text = if self.documents.is_empty() {
+            self.editor.text()
+        } else {
+            String::new()
+        };
+        let document = self.documents.insert(
+            None,
+            Editor::new(&text, self.theme, self.soft_wrap),
+            Diagnostics::new(self.theme),
+            self.preview.view_state(),
+            &mut self.editor,
+            &mut self.diagnostics,
+        );
         self.welcome = None;
         self.status = None;
-        self.start_compile();
+        self.preview.clear();
+        self.pending_preview_restore = Some((document, PreviewViewState::default()));
+        let main = self.workspace.virtual_path(document.value());
+        if let Err(error) =
+            self.pipeline
+                .reset_for_world(self.workspace.root().to_owned(), main, Instant::now())
+        {
+            self.status = Some(error);
+        } else {
+            self.start_compile();
+        }
     }
 
     fn open_file_prompt(&mut self) {
@@ -560,43 +688,101 @@ impl App {
     }
 
     fn save(&mut self) {
-        let Some(path) = self.workspace.path().map(Path::to_owned) else {
-            self.overlay.open_prompt(PromptKind::SaveAs, "");
+        let Some(document) = self.documents.active_id() else {
             return;
         };
-        if self.write_document(&path) {
+        self.save_document(document, None);
+    }
+
+    fn save_document(&mut self, document: DocumentId, after: Option<AfterSave>) {
+        let Some(path) = self.documents.path(document).map(Path::to_owned) else {
+            if self.documents.active_id() != Some(document) {
+                self.activate_document(document);
+            }
+            self.after_save = after;
+            self.overlay.open_prompt(PromptKind::SaveAs(document), "");
+            return;
+        };
+        if self.write_document(document, &path) {
             self.record_recent(&path);
+            self.finish_after_save(after);
+        } else if after.is_some() {
+            self.abort_pending_operation();
         }
     }
 
-    fn save_as(&mut self, path: PathBuf) {
+    fn save_as(&mut self, document: DocumentId, path: PathBuf) {
         let root = match self.workspace.root_for_document(&path) {
             Ok(root) => root,
             Err(error) => {
                 self.status = Some(error);
+                self.abort_pending_operation();
                 return;
             }
         };
-        if !self.write_document(&path) {
+        let current_root = match std::fs::canonicalize(self.workspace.root()) {
+            Ok(root) => root,
+            Err(error) => {
+                self.status = Some(format!("Could not resolve project root: {error}"));
+                self.abort_pending_operation();
+                return;
+            }
+        };
+        if root != current_root {
+            self.status = Some(format!(
+                "{} is outside project root {}",
+                path.display(),
+                self.workspace.root().display()
+            ));
+            self.abort_pending_operation();
             return;
         }
-        self.workspace.saved_as(path.clone(), root);
-        let watch_error = self
-            .watcher
-            .retarget(self.workspace.root(), Some(&path))
-            .err();
-        self.set_explorer_root(self.workspace.root().to_owned());
-        self.start_compile_with_world();
-        self.record_recent(&path);
-        if let Some(error) = watch_error {
-            self.status = Some(format!("File watch failed: {error}"));
+        let canonical = match Workspace::canonical_path(&path) {
+            Ok(path) => path,
+            Err(error) => {
+                self.status = Some(error);
+                self.abort_pending_operation();
+                return;
+            }
+        };
+        if self
+            .documents
+            .find_path(&canonical)
+            .is_some_and(|open| open != document)
+        {
+            self.status = Some(format!("{} is already open", canonical.display()));
+            self.abort_pending_operation();
+            return;
         }
+        if !self.write_document(document, &canonical) {
+            self.abort_pending_operation();
+            return;
+        }
+        self.documents.rename(document, canonical.clone());
+        if self.documents.active_id() == Some(document) {
+            self.start_compile_with_world();
+        }
+        self.record_recent(&canonical);
+        let after = self.after_save.take();
+        self.finish_after_save(after);
     }
 
-    fn write_document(&mut self, path: &Path) -> bool {
-        match Workspace::write_source(path, &self.editor.text()) {
+    fn write_document(&mut self, document: DocumentId, path: &Path) -> bool {
+        let text = if self.documents.active_id() == Some(document) {
+            self.editor.text()
+        } else if let Some(editor) = self.documents.editor(document) {
+            editor.text()
+        } else {
+            self.status = Some("Document is no longer open".to_owned());
+            return false;
+        };
+        match Workspace::write_source(path, &text) {
             Ok(()) => {
-                self.editor.mark_saved();
+                if self.documents.active_id() == Some(document) {
+                    self.editor.mark_saved();
+                } else if let Some(editor) = self.documents.editor_mut(document) {
+                    editor.mark_saved();
+                }
                 self.status = Some(format!("Saved {}", path.display()));
                 true
             }
@@ -623,31 +809,209 @@ impl App {
         }
     }
 
-    fn default_export_path(&self, format: ExportFormat) -> PathBuf {
-        self.workspace.default_export_path(format)
+    fn default_export_path(&self, document: DocumentId, format: ExportFormat) -> PathBuf {
+        let mut path = self
+            .documents
+            .path(document)
+            .map(Path::to_owned)
+            .unwrap_or_else(|| {
+                self.workspace
+                    .root()
+                    .join(self.documents.display_name(document).unwrap_or("Untitled"))
+            });
+        path.set_extension(format.extension());
+        path
     }
 
-    fn start_export(&mut self, format: ExportFormat, path: PathBuf) {
-        let Some(document) = self.pipeline.compiled_document(self.editor.revision()) else {
+    fn start_export(&mut self, document: DocumentId, format: ExportFormat, path: PathBuf) {
+        if self.documents.active_id() != Some(document) {
+            self.status = Some("Export source is no longer active".to_owned());
+            return;
+        }
+        let Some(compiled) = self.pipeline.compiled_document(self.editor.revision()) else {
             self.status = Some("Current document is not compiled yet".to_owned());
             return;
         };
         self.status = Some(format!("Exporting {}...", format.label()));
-        self.export_worker.spawn(document.clone(), format, path);
+        self.export_worker
+            .spawn(document, compiled.clone(), format, path);
     }
 
     fn finish_export(&mut self, result: ExportResult) {
+        let source = self
+            .documents
+            .display_name(result.document)
+            .unwrap_or("closed document");
         self.status = Some(match result.result {
             Ok(()) => format!(
-                "Exported {} to {}",
+                "Exported {source} as {} to {}",
                 result.format.label(),
                 result.path.display()
             ),
-            Err(error) => format!("Export failed: {error}"),
+            Err(error) => format!("Export failed for {source}: {error}"),
         });
     }
 
-    fn go_to_line(&mut self, value: &str) {
+    fn request_close_active(&mut self) {
+        let Some(document) = self.documents.active_id() else {
+            return;
+        };
+        if self.editor.is_dirty() {
+            let name = self.documents.active_display_name().unwrap_or("document");
+            self.overlay.confirm(
+                format!("Save changes to {name} before closing?"),
+                ConfirmIntent::Close(document),
+            );
+        } else {
+            self.close_active(document);
+        }
+    }
+
+    fn close_active(&mut self, document: DocumentId) {
+        if self.documents.active_id() != Some(document) {
+            return;
+        }
+        let Some((_, preview)) = self
+            .documents
+            .remove_active(&mut self.editor, &mut self.diagnostics)
+        else {
+            return;
+        };
+        self.preview.clear();
+        self.cursor_sync_deadline = None;
+        self.status = None;
+        if let Some(active) = self.documents.active_id() {
+            self.preview.restore_view_state(preview);
+            self.pending_preview_restore = Some((active, preview));
+            self.reset_active_pipeline();
+        } else {
+            self.editor.replace_document("");
+            self.diagnostics = Diagnostics::new(self.theme);
+            self.pending_preview_restore = None;
+            if let Err(error) = self.pipeline.deactivate() {
+                self.status = Some(error);
+            }
+            self.welcome = Some(self.make_welcome());
+        }
+    }
+
+    fn activate_relative(&mut self, offset: isize) {
+        if let Some(document) = self.documents.relative_id(offset) {
+            self.activate_document(document);
+        }
+    }
+
+    fn activate_document(&mut self, document: DocumentId) {
+        let Some(preview) = self.documents.activate(
+            document,
+            &mut self.editor,
+            &mut self.diagnostics,
+            self.preview.view_state(),
+        ) else {
+            return;
+        };
+        self.preview.clear();
+        self.preview.restore_view_state(preview);
+        self.pending_preview_restore = Some((document, preview));
+        self.cursor_sync_deadline = None;
+        self.welcome = None;
+        self.status = None;
+        self.reset_active_pipeline();
+    }
+
+    fn reset_active_pipeline(&mut self) {
+        let Some(document) = self.documents.active_id() else {
+            return;
+        };
+        let main = self
+            .documents
+            .active_path()
+            .map(Path::to_owned)
+            .unwrap_or_else(|| self.workspace.virtual_path(document.value()));
+        if let Err(error) =
+            self.pipeline
+                .reset_for_world(self.workspace.root().to_owned(), main, Instant::now())
+        {
+            self.status = Some(error);
+        } else {
+            self.start_compile();
+        }
+    }
+
+    fn request_quit(&mut self) {
+        self.quit_queue = self
+            .documents
+            .ids()
+            .filter(|document| self.documents.is_dirty(*document, &self.editor))
+            .collect();
+        if self.quit_queue.is_empty() {
+            self.should_quit = true;
+        } else {
+            self.prompt_next_quit_document();
+        }
+    }
+
+    fn prompt_next_quit_document(&mut self) {
+        while let Some(document) = self.quit_queue.pop_front() {
+            if !self.documents.is_dirty(document, &self.editor) {
+                continue;
+            }
+            self.activate_document(document);
+            let name = self.documents.display_name(document).unwrap_or("document");
+            self.overlay.confirm(
+                format!("Save changes to {name} before quitting?"),
+                ConfirmIntent::Quit(document),
+            );
+            return;
+        }
+        self.should_quit = true;
+    }
+
+    fn discard_changes(&mut self) {
+        let Some(intent) = self.overlay.discard_confirmation() else {
+            return;
+        };
+        match intent {
+            ConfirmIntent::Close(document) => self.close_active(document),
+            ConfirmIntent::Quit(_) => self.prompt_next_quit_document(),
+            ConfirmIntent::SaveAs(_, _) | ConfirmIntent::Export(_, _, _) => {}
+        }
+    }
+
+    fn cancel_confirmation(&mut self) {
+        self.overlay.close();
+        self.quit_queue.clear();
+        self.after_save = None;
+    }
+
+    fn abort_pending_operation(&mut self) {
+        if self.after_save.is_some() || !self.quit_queue.is_empty() {
+            self.cancel_confirmation();
+        }
+    }
+
+    fn finish_after_save(&mut self, after: Option<AfterSave>) {
+        match after {
+            Some(AfterSave::Close(document)) => self.close_active(document),
+            Some(AfterSave::Quit) => self.prompt_next_quit_document(),
+            None => {}
+        }
+    }
+
+    fn make_welcome(&self) -> Welcome {
+        let mut welcome = Welcome::new(
+            self.theme,
+            self.keymap.display(CommandId::Newline),
+            self.keymap.display(CommandId::Help),
+        );
+        welcome.set_recent_count(self.recent.entries().len());
+        welcome
+    }
+
+    fn go_to_line(&mut self, document: DocumentId, value: &str) {
+        if self.documents.active_id() != Some(document) {
+            return;
+        }
         let line = value.parse::<usize>().ok().filter(|line| *line > 0);
         if let Some(line) = line
             && self.editor.set_cursor_line_char(line - 1, 0)
@@ -660,7 +1024,10 @@ impl App {
         self.status = Some("Line is outside the document".to_owned());
     }
 
-    fn go_to_page(&mut self, value: &str) {
+    fn go_to_page(&mut self, document: DocumentId, value: &str) {
+        if self.documents.active_id() != Some(document) {
+            return;
+        }
         let page = value.parse::<usize>().ok().unwrap_or(0);
         if self.preview.go_to_page(page) {
             self.focus = Pane::Preview;
@@ -673,6 +1040,8 @@ impl App {
     fn set_theme(&mut self, name: ThemeName) {
         self.theme = Theme::new(name, self.color_depth);
         self.editor.set_theme(self.theme);
+        self.documents.set_theme(self.theme);
+        self.tabs.set_theme(self.theme);
         self.preview.set_theme(self.theme);
         self.diagnostics.set_theme(self.theme);
         self.explorer.set_theme(self.theme);
@@ -711,7 +1080,9 @@ impl App {
             }
             Err(error) => self.status = Some(error),
         }
-        if let Err(error) = self.pipeline.project_files_changed(Instant::now()) {
+        if !self.documents.is_empty()
+            && let Err(error) = self.pipeline.project_files_changed(Instant::now())
+        {
             self.status = Some(error);
         }
     }
@@ -746,7 +1117,7 @@ impl App {
         };
     }
 
-    fn update_editor(&mut self, action: Action) {
+    fn update_editor(&mut self, action: EditorAction) {
         let revision = self.editor.revision();
         let cursor = self.editor.cursor_byte_index();
         self.editor.update(action);
@@ -805,9 +1176,9 @@ impl App {
             return;
         }
         if replacement.is_empty() {
-            self.update_editor(Action::Delete);
+            self.update_editor(EditorAction::Delete);
         } else {
-            self.update_editor(Action::InsertText(replacement));
+            self.update_editor(EditorAction::InsertText(replacement));
         }
         self.search_next(false);
     }
@@ -831,7 +1202,7 @@ impl App {
             return;
         };
         let system = self.clipboard.copy(&text);
-        self.update_editor(Action::Delete);
+        self.update_editor(EditorAction::Delete);
         self.status = Some(if system {
             "Cut selection".to_owned()
         } else {
@@ -844,14 +1215,18 @@ impl App {
             self.status = Some("Clipboard is empty or unavailable".to_owned());
             return;
         };
-        self.update_editor(Action::InsertText(text));
+        self.update_editor(EditorAction::InsertText(text));
         if !system {
             self.status = Some("Pasted from internal register".to_owned());
         }
     }
 
     fn mouse_down(&mut self, column: u16, row: u16) {
-        if self.preview.contains(column, row) {
+        if let Some(index) = self.tabs.tab_at(column, row)
+            && let Some(document) = self.documents.id_at(index)
+        {
+            self.activate_document(document);
+        } else if self.preview.contains(column, row) {
             self.click_preview(column, row);
         } else if self.editor.place_cursor(column, row, false) {
             self.focus = Pane::Editor;
@@ -879,6 +1254,9 @@ impl App {
     }
 
     fn tick(&mut self) {
+        if self.documents.is_empty() {
+            return;
+        }
         let now = Instant::now();
         if let Some(update) = self
             .pipeline
@@ -896,6 +1274,9 @@ impl App {
     }
 
     fn observe_preview_width(&mut self) {
+        if self.documents.is_empty() {
+            return;
+        }
         let width = self.preview.target_width();
         if let Some(update) = self
             .pipeline
@@ -906,6 +1287,9 @@ impl App {
     }
 
     fn start_compile(&mut self) {
+        if self.documents.is_empty() {
+            return;
+        }
         let _ = self
             .pipeline
             .set_preview_width(self.preview.target_width(), self.editor.revision());
@@ -915,7 +1299,14 @@ impl App {
     }
 
     fn start_compile_with_world(&mut self) {
-        let main = self.workspace.main_path();
+        let Some(document) = self.documents.active_id() else {
+            return;
+        };
+        let main = self
+            .documents
+            .active_path()
+            .map(Path::to_owned)
+            .unwrap_or_else(|| self.workspace.virtual_path(document.value()));
         let _ = self
             .pipeline
             .set_preview_width(self.preview.target_width(), self.editor.revision());
@@ -930,11 +1321,17 @@ impl App {
     }
 
     fn request_preview_pages(&mut self) {
+        if self.documents.is_empty() {
+            return;
+        }
         self.pipeline
             .request_pages(self.editor.revision(), self.preview.page_requests());
     }
 
     fn poll_pipeline(&mut self) {
+        if self.documents.is_empty() {
+            return;
+        }
         let updates = self
             .pipeline
             .poll(self.editor.revision(), self.editor.source_text());
@@ -960,6 +1357,11 @@ impl App {
                     .set_diagnostic_lines(self.diagnostics.line_severities());
                 self.preview
                     .replace_render_manifest(self.pipeline.picker(), &manifest, width);
+                if let Some((document, view)) = self.pending_preview_restore.take()
+                    && self.documents.active_id() == Some(document)
+                {
+                    self.preview.restore_view_state(view);
+                }
                 self.status = None;
                 self.sync_cursor_to_preview();
                 self.request_preview_pages();
@@ -1053,15 +1455,28 @@ impl App {
     }
 
     fn draw_editor(&mut self, frame: &mut Frame) {
-        let [header_area, content_area, status_area] = Layout::vertical([
+        let [tabs_area, header_area, content_area, status_area] = Layout::vertical([
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Fill(1),
             Constraint::Length(1),
         ])
         .areas(frame.area());
 
+        let tab_states = self.documents.tab_states(self.editor.is_dirty());
+        self.tabs.draw(
+            frame,
+            tabs_area,
+            &tab_states,
+            self.documents.active_index().unwrap_or(0),
+        );
+
         let header_state = HeaderState {
-            display_name: self.workspace.display_name().to_owned(),
+            display_name: self
+                .documents
+                .active_display_name()
+                .unwrap_or("Untitled")
+                .to_owned(),
             dirty: self.editor.is_dirty(),
             compile_label: self.compile_label(),
             compile_color: self.compile_color(),
@@ -1159,7 +1574,7 @@ impl App {
             warnings: self.diagnostics.warnings(),
             compile_time: self.pipeline.last_compile_time(),
             message: self.status.clone(),
-            quit_confirmation: self.quit_confirmation,
+            quit_confirmation: false,
         });
         self.status_bar.draw(frame, area, false);
     }
@@ -1216,6 +1631,9 @@ mod tests {
             oxyst_config::CommandId::CloseOverlay
         )));
         assert!(overlay_transition_requires_clear(&Action::OverlaySubmit));
+        assert!(overlay_transition_requires_clear(&Action::Command(
+            oxyst_config::CommandId::DiscardChanges
+        )));
         assert!(!overlay_transition_requires_clear(&Action::OverlayInput(
             'x'
         )));
@@ -1306,7 +1724,7 @@ mod tests {
             startup_status: None,
         })
         .map_err(std::io::Error::other)?;
-        app.editor.update(crate::action::Action::Insert('x'));
+        app.editor.update(crate::action::EditorAction::Insert('x'));
         app.start_compile();
         let deadline = Instant::now() + Duration::from_secs(30);
         while app.pipeline.state() != CompileState::Ready && Instant::now() < deadline {
@@ -1327,7 +1745,7 @@ mod tests {
         assert!(rendered.contains("✓ up to date"));
         assert!(rendered.contains("2 words"));
 
-        app.quit_confirmation = true;
+        app.request_quit();
         terminal.draw(|frame| app.draw(frame))?;
         let rendered = terminal
             .backend()
@@ -1336,7 +1754,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("alt+y quit"));
+        assert!(rendered.contains("alt+y save"));
+        assert!(rendered.contains("d discard"));
         assert!(rendered.contains("alt+n cancel"));
 
         drop(app);
@@ -1371,10 +1790,15 @@ mod tests {
         app.execute_command(CommandId::Backspace);
         assert_eq!(app.editor.text(), "= Draft");
 
-        app.save_as(destination.clone());
+        app.start_new_document();
+        let document = app
+            .documents
+            .active_id()
+            .ok_or("new document was not created")?;
+        app.save_as(document, destination.clone());
 
         assert!(!destination.exists());
-        assert!(app.workspace.path().is_none());
+        assert!(app.documents.active_path().is_none());
         assert_eq!(app.workspace.root(), root);
         assert!(
             app.status
@@ -1385,6 +1809,125 @@ mod tests {
         drop(app);
         runtime.shutdown_timeout(Duration::from_millis(100));
         fs::remove_dir_all(outside)?;
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_open_activates_the_existing_document() -> Result<(), Box<dyn Error>> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        let main = root.join("simple.typ");
+        let compiler = Compiler::new(&root, &main)?;
+        let runtime = tokio::runtime::Builder::new_multi_thread().build()?;
+        let mut app = App::new(AppInit {
+            path: Some(main.clone()),
+            root: root.clone(),
+            root_is_explicit: false,
+            text: "= Existing",
+            compiler,
+            picker: Picker::halfblocks(),
+            runtime: runtime.handle().clone(),
+            config: Config::default(),
+            recent: crate::recent::RecentFiles::disabled(),
+            startup_status: None,
+        })
+        .map_err(std::io::Error::other)?;
+
+        app.start_new_document();
+        assert_eq!(app.documents.ids().count(), 2);
+        app.open_path(root.join(".").join("simple.typ"));
+
+        assert_eq!(app.documents.ids().count(), 2);
+        assert_eq!(
+            app.documents.active_path(),
+            Some(fs::canonicalize(main)?.as_path())
+        );
+
+        drop(app);
+        runtime.shutdown_timeout(Duration::from_millis(100));
+        Ok(())
+    }
+
+    #[test]
+    fn quit_walks_dirty_tabs_and_discard_finishes_the_sequence() -> Result<(), Box<dyn Error>> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        let main = root.join("simple.typ");
+        let compiler = Compiler::new(&root, &main)?;
+        let runtime = tokio::runtime::Builder::new_multi_thread().build()?;
+        let mut app = App::new(AppInit {
+            path: Some(main),
+            root,
+            root_is_explicit: false,
+            text: "one",
+            compiler,
+            picker: Picker::halfblocks(),
+            runtime: runtime.handle().clone(),
+            config: Config::default(),
+            recent: crate::recent::RecentFiles::disabled(),
+            startup_status: None,
+        })
+        .map_err(std::io::Error::other)?;
+        app.editor.update(crate::action::EditorAction::Insert('!'));
+        app.start_new_document();
+        app.editor.update(crate::action::EditorAction::Insert('?'));
+
+        app.request_quit();
+        assert!(app.overlay.is_open());
+        app.discard_changes();
+        assert!(app.overlay.is_open());
+        app.discard_changes();
+        assert!(app.should_quit);
+
+        drop(app);
+        runtime.shutdown_timeout(Duration::from_millis(100));
+        Ok(())
+    }
+
+    #[test]
+    fn active_document_imports_use_the_inactive_tabs_saved_file() -> Result<(), Box<dyn Error>> {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("oxyst-tabs-import-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&root)?;
+        let main = root.join("main.typ");
+        let chapter = root.join("chapter.typ");
+        fs::write(&main, "#include \"chapter.typ\"")?;
+        fs::write(&chapter, "= Saved chapter")?;
+        let compiler = Compiler::new(&root, &main)?;
+        let runtime = tokio::runtime::Builder::new_multi_thread().build()?;
+        let mut app = App::new(AppInit {
+            path: Some(main),
+            root: root.clone(),
+            root_is_explicit: true,
+            text: "#include \"chapter.typ\"",
+            compiler,
+            picker: Picker::halfblocks(),
+            runtime: runtime.handle().clone(),
+            config: Config::default(),
+            recent: crate::recent::RecentFiles::disabled(),
+            startup_status: None,
+        })
+        .map_err(std::io::Error::other)?;
+        let main_document = app
+            .documents
+            .active_id()
+            .ok_or("main document is missing")?;
+        app.open_path(chapter);
+        app.editor.update(crate::action::EditorAction::InsertText(
+            "#unknown-function(\n".to_owned(),
+        ));
+        assert!(app.editor.is_dirty());
+
+        app.activate_document(main_document);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while app.pipeline.state() == CompileState::Compiling && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            app.poll_pipeline();
+        }
+        assert_eq!(app.pipeline.state(), CompileState::Ready);
+
+        drop(app);
+        runtime.shutdown_timeout(Duration::from_millis(100));
+        fs::remove_dir_all(root)?;
         Ok(())
     }
 }

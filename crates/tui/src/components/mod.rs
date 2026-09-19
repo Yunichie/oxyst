@@ -10,6 +10,7 @@ mod prompt;
 mod recent_picker;
 mod search;
 mod status_bar;
+mod tabs;
 mod welcome;
 
 use ratatui::{Frame, layout::Rect};
@@ -21,11 +22,12 @@ pub(crate) use file_explorer::FileExplorer;
 pub(crate) use header::{Header, HeaderState};
 pub(crate) use help::Help;
 pub(crate) use overlay::{ConfirmIntent, OverlayHost, OverlaySubmission};
-pub(crate) use preview::Preview;
+pub(crate) use preview::{Preview, PreviewViewState};
 pub(crate) use prompt::{Prompt, PromptKind};
 pub(crate) use recent_picker::RecentPicker;
 pub(crate) use search::{Search, SearchMode};
 pub(crate) use status_bar::{StatusBar, StatusBarState};
+pub(crate) use tabs::Tabs;
 pub(crate) use welcome::{Welcome, WelcomeChoice};
 
 pub(crate) trait Component {

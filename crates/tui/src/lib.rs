@@ -4,6 +4,7 @@ mod action;
 mod app;
 mod clipboard;
 mod components;
+mod documents;
 mod event;
 mod explorer;
 mod export;

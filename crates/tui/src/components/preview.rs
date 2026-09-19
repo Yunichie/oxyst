@@ -24,6 +24,25 @@ use super::Component;
 
 const ENCODED_PAGE_CACHE_LIMIT: usize = 5;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PreviewViewState {
+    zoom: u16,
+    page: usize,
+    offset: usize,
+    page_height: usize,
+}
+
+impl Default for PreviewViewState {
+    fn default() -> Self {
+        Self {
+            zoom: 100,
+            page: 0,
+            offset: 0,
+            page_height: 1,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 struct EncodedPageKey {
     fingerprint: u64,
@@ -238,6 +257,39 @@ impl Preview {
         self.pages.clear();
         self.page_lru.clear();
         self.scroll = 0;
+    }
+
+    pub(crate) fn view_state(&self) -> PreviewViewState {
+        let Some(page) = self.current_page_index() else {
+            return PreviewViewState {
+                zoom: self.zoom,
+                ..PreviewViewState::default()
+            };
+        };
+        let page_height = usize::from(self.page_sizes[page].height.max(1));
+        PreviewViewState {
+            zoom: self.zoom,
+            page,
+            offset: self
+                .scroll
+                .saturating_sub(self.page_top(page))
+                .min(page_height),
+            page_height,
+        }
+    }
+
+    pub(crate) fn restore_view_state(&mut self, state: PreviewViewState) {
+        self.zoom = state.zoom.clamp(50, 200);
+        self.scroll = self
+            .page_sizes
+            .get(state.page)
+            .map(|size| {
+                let height = usize::from(size.height.max(1));
+                self.page_top(state.page)
+                    .saturating_add(state.offset.saturating_mul(height) / state.page_height.max(1))
+            })
+            .unwrap_or(0);
+        self.clamp_scroll();
     }
 
     pub(crate) fn target_width(&self) -> u16 {
@@ -741,6 +793,26 @@ mod tests {
         assert_eq!(preview.current_page(), 5);
         assert_eq!(preview.scroll, preview.page_top(4) + 10);
         assert!(preview.pages.is_empty());
+    }
+
+    #[test]
+    fn view_state_restores_after_switching_documents() {
+        let mut preview = Preview::new(theme());
+        preview.replace_manifest(vec![Size::new(20, 10); 6]);
+        preview.set_viewport(Rect::new(0, 0, 22, 7));
+        assert!(preview.go_to_page(4));
+        preview.scroll_lines(5);
+        assert!(preview.zoom(1));
+        let state = preview.view_state();
+
+        preview.clear();
+        preview.restore_view_state(state);
+        preview.replace_manifest(vec![Size::new(30, 20); 6]);
+        preview.restore_view_state(state);
+
+        assert_eq!(preview.current_page(), 4);
+        assert_eq!(preview.scroll, preview.page_top(3) + 10);
+        assert_eq!(preview.zoom, 125);
     }
 
     #[test]

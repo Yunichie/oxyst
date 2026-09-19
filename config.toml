@@ -7,7 +7,11 @@ soft_wrap = false
 
 [keys]
 # Session
+new_document = ["ctrl+n"]
 quit = ["ctrl+q"]
+close_tab = ["ctrl+w"]
+next_tab = ["alt+right"]
+previous_tab = ["alt+left"]
 save = ["ctrl+s"]
 recompile = ["ctrl+r"]
 
@@ -74,6 +78,7 @@ close_overlay = ["esc"]
 
 # Prompts and welcome screen
 confirm = ["y"]
+discard_changes = ["d"]
 cancel_confirmation = ["n", "esc"]
 welcome_new = ["n"]
 welcome_open = ["o"]

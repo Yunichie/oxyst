@@ -5,7 +5,10 @@ use crossterm::event::{
 };
 use oxyst_config::{CommandContext, CommandId, Config};
 
-use crate::{action::Action, event::Event};
+use crate::{
+    action::{Action, EditorAction},
+    event::Event,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InputMode {
@@ -15,7 +18,6 @@ pub(crate) enum InputMode {
     Search,
     Welcome,
     Confirmation,
-    QuitConfirmation,
 }
 
 #[derive(Clone, Debug)]
@@ -84,7 +86,7 @@ pub(crate) fn resolve(
 ) -> Option<Action> {
     match event {
         Event::Paste(text) if matches!(mode, InputMode::Normal) && accepts_text => {
-            Some(Action::InsertText(text))
+            Some(Action::Editor(EditorAction::InsertText(text)))
         }
         Event::Paste(text) if matches!(mode, InputMode::Overlay | InputMode::Search) => {
             Some(Action::OverlayInputText(text))
@@ -118,17 +120,15 @@ fn resolve_key_with_context(
     accepts_text: bool,
 ) -> Option<Action> {
     match mode {
-        InputMode::QuitConfirmation => resolve_command(
-            key,
-            keymap,
-            CommandContext::QuitConfirmation,
-            &[CommandId::Confirm, CommandId::CancelConfirmation],
-        ),
         InputMode::Confirmation => resolve_command(
             key,
             keymap,
             CommandContext::Confirmation,
-            &[CommandId::Confirm, CommandId::CancelConfirmation],
+            &[
+                CommandId::Confirm,
+                CommandId::DiscardChanges,
+                CommandId::CancelConfirmation,
+            ],
         ),
         InputMode::Help => resolve_command(
             key,
@@ -153,9 +153,13 @@ fn resolve_key_with_context(
                 CommandId::OpenFile,
                 CommandId::WelcomeNew,
                 CommandId::WelcomeOpen,
+                CommandId::CloseOverlay,
+                CommandId::MoveUp,
+                CommandId::MoveDown,
+                CommandId::Newline,
+                CommandId::Backspace,
             ],
-        )
-        .or_else(|| resolve_overlay_key(key, keymap, CommandContext::Welcome)),
+        ),
         InputMode::Normal => resolve_normal_key(key, keymap, accepts_text),
     }
 }
@@ -201,7 +205,7 @@ fn resolve_overlay_key(key: KeyEvent, keymap: &Keymap, context: CommandContext) 
 
 fn resolve_normal_key(key: KeyEvent, keymap: &Keymap, accepts_text: bool) -> Option<Action> {
     if accepts_text && let Some(character) = printable_character(key) {
-        Some(Action::Insert(character))
+        Some(Action::Editor(EditorAction::Insert(character)))
     } else {
         resolve_command(
             key,
@@ -209,6 +213,10 @@ fn resolve_normal_key(key: KeyEvent, keymap: &Keymap, accepts_text: bool) -> Opt
             CommandContext::Normal,
             &[
                 CommandId::Quit,
+                CommandId::NewDocument,
+                CommandId::CloseTab,
+                CommandId::NextTab,
+                CommandId::PreviousTab,
                 CommandId::SelectAll,
                 CommandId::Copy,
                 CommandId::Cut,
@@ -272,11 +280,12 @@ fn resolve_command(
     key: KeyEvent,
     keymap: &Keymap,
     context: CommandContext,
-    commands: &[CommandId],
+    precedence: &[CommandId],
 ) -> Option<Action> {
-    commands
+    precedence
         .iter()
         .copied()
+        .chain(CommandId::all().filter(|command| !precedence.contains(command)))
         .find(|command| keymap.matches(*command, context, key))
         .map(Action::Command)
 }
@@ -417,7 +426,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use oxyst_config::{CommandId, Config};
 
-    use super::{InputMode, KeyChord, Keymap, resolve_key};
+    use super::{EditorAction, InputMode, KeyChord, Keymap, resolve_command, resolve_key};
     use crate::action::Action;
 
     #[test]
@@ -448,6 +457,41 @@ mod tests {
     }
 
     #[test]
+    fn command_precedence_remains_context_specific() -> Result<(), String> {
+        let mut config = Config::default();
+        for command in ["open_file", "quit", "help"] {
+            config
+                .keys
+                .insert(command.to_owned(), vec!["alt+x".to_owned()]);
+        }
+        for command in ["close_overlay", "backspace"] {
+            config
+                .keys
+                .insert(command.to_owned(), vec!["alt+z".to_owned()]);
+        }
+        let keymap = Keymap::new(&config)?;
+        let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT);
+
+        assert!(matches!(
+            resolve_key(key, InputMode::Normal, &keymap),
+            Some(Action::Command(CommandId::Quit))
+        ));
+        assert!(matches!(
+            resolve_key(key, InputMode::Welcome, &keymap),
+            Some(Action::Command(CommandId::Help))
+        ));
+        assert!(matches!(
+            resolve_key(
+                KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT),
+                InputMode::Welcome,
+                &keymap
+            ),
+            Some(Action::Command(CommandId::CloseOverlay))
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn palette_only_commands_can_be_bound() -> Result<(), String> {
         let mut config = Config::default();
         config
@@ -460,6 +504,27 @@ mod tests {
                 KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT),
                 InputMode::Normal,
                 &keymap
+            ),
+            Some(Action::Command(CommandId::ReloadFonts))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn declared_context_makes_a_command_reachable_without_a_precedence_entry() -> Result<(), String>
+    {
+        let mut config = Config::default();
+        config
+            .keys
+            .insert("reload_fonts".to_owned(), vec!["alt+r".to_owned()]);
+        let keymap = Keymap::new(&config)?;
+
+        assert!(matches!(
+            resolve_command(
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT),
+                &keymap,
+                oxyst_config::CommandContext::Normal,
+                &[]
             ),
             Some(Action::Command(CommandId::ReloadFonts))
         ));
@@ -481,7 +546,10 @@ mod tests {
             InputMode::Normal,
             &keymap,
         );
-        assert!(matches!(action, Some(Action::Insert('A'))));
+        assert!(matches!(
+            action,
+            Some(Action::Editor(EditorAction::Insert('A')))
+        ));
         Ok(())
     }
 
@@ -499,7 +567,10 @@ mod tests {
                 InputMode::Normal,
                 &keymap,
             );
-            assert!(matches!(action, Some(Action::Insert(actual)) if actual == character));
+            assert!(matches!(
+                action,
+                Some(Action::Editor(EditorAction::Insert(actual))) if actual == character
+            ));
         }
         Ok(())
     }
@@ -545,11 +616,11 @@ mod tests {
 
         assert!(matches!(
             super::resolve(key(':'), InputMode::Normal, &keymap, true),
-            Some(Action::Insert(':'))
+            Some(Action::Editor(EditorAction::Insert(':')))
         ));
         assert!(matches!(
             super::resolve(key('?'), InputMode::Normal, &keymap, true),
-            Some(Action::Insert('?'))
+            Some(Action::Editor(EditorAction::Insert('?')))
         ));
         assert!(matches!(
             super::resolve(key(':'), InputMode::Normal, &keymap, false),
@@ -619,7 +690,7 @@ mod tests {
 
         assert!(matches!(
             normal,
-            Some(Action::InsertText(pasted)) if pasted == text
+            Some(Action::Editor(EditorAction::InsertText(pasted))) if pasted == text
         ));
         assert!(matches!(
             overlay,
@@ -717,7 +788,7 @@ mod tests {
         assert!(matches!(
             resolve_key(
                 KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT),
-                InputMode::QuitConfirmation,
+                InputMode::Confirmation,
                 &keymap
             ),
             Some(Action::Command(CommandId::Confirm))

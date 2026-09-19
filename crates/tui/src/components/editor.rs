@@ -15,7 +15,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    action::Action,
+    action::EditorAction,
     style::{color, text_style},
 };
 
@@ -50,7 +50,7 @@ struct BracketMatchCache {
 }
 
 impl Editor {
-    pub(crate) fn update(&mut self, action: Action) {
+    pub(crate) fn update(&mut self, action: EditorAction) {
         self.apply_action(&action);
     }
 
@@ -86,30 +86,30 @@ impl Editor {
         self.theme = theme;
     }
 
-    fn apply_action(&mut self, action: &Action) {
+    fn apply_action(&mut self, action: &EditorAction) {
         let revision = self.document.revision();
         let cursor = self.document.cursor_char_index();
         if !matches!(
             action,
-            Action::Move(Motion::Up | Motion::Down) | Action::Select(Motion::Up | Motion::Down)
+            EditorAction::Move(Motion::Up | Motion::Down)
+                | EditorAction::Select(Motion::Up | Motion::Down)
         ) {
             self.preferred_visual_column = None;
         }
         match action {
-            Action::Insert(character) => self.document.insert_char(*character),
-            Action::InsertText(text) => self.document.insert_text(text),
-            Action::Backspace => self.document.backspace(),
-            Action::Delete => self.document.delete(),
-            Action::Move(Motion::Up) => self.move_vertically(-1, false),
-            Action::Move(Motion::Down) => self.move_vertically(1, false),
-            Action::Move(motion) => self.document.move_cursor(*motion),
-            Action::Select(Motion::Up) => self.move_vertically(-1, true),
-            Action::Select(Motion::Down) => self.move_vertically(1, true),
-            Action::Select(motion) => self.document.move_cursor_selecting(*motion, true),
-            Action::SelectAll => self.document.select_all(),
-            Action::Undo => self.document.undo(),
-            Action::Redo => self.document.redo(),
-            _ => {}
+            EditorAction::Insert(character) => self.document.insert_char(*character),
+            EditorAction::InsertText(text) => self.document.insert_text(text),
+            EditorAction::Backspace => self.document.backspace(),
+            EditorAction::Delete => self.document.delete(),
+            EditorAction::Move(Motion::Up) => self.move_vertically(-1, false),
+            EditorAction::Move(Motion::Down) => self.move_vertically(1, false),
+            EditorAction::Move(motion) => self.document.move_cursor(*motion),
+            EditorAction::Select(Motion::Up) => self.move_vertically(-1, true),
+            EditorAction::Select(Motion::Down) => self.move_vertically(1, true),
+            EditorAction::Select(motion) => self.document.move_cursor_selecting(*motion, true),
+            EditorAction::SelectAll => self.document.select_all(),
+            EditorAction::Undo => self.document.undo(),
+            EditorAction::Redo => self.document.redo(),
         }
 
         if self.document.revision() != revision {
@@ -1435,7 +1435,7 @@ mod tests {
         Component, Editor, VisualPosition, find_from, line_row_count, matching_brackets,
         wrapped_row_count,
     };
-    use crate::{action::Action, components::Diagnostics};
+    use crate::{action::EditorAction, components::Diagnostics};
 
     fn theme() -> Theme {
         Theme::new(ThemeName::Dark, ColorDepth::Ansi16)
@@ -1488,12 +1488,12 @@ mod tests {
     fn applies_document_edits_to_the_syntax_source() {
         let source = "#let value = 1";
         let mut editor = Editor::new(source, theme(), false);
-        editor.update(Action::Move(Motion::DocumentEnd));
+        editor.update(EditorAction::Move(Motion::DocumentEnd));
 
-        editor.update(Action::Insert('0'));
+        editor.update(EditorAction::Insert('0'));
         assert_eq!(editor.source.text(), "#let value = 10");
 
-        editor.update(Action::Undo);
+        editor.update(EditorAction::Undo);
         assert_eq!(editor.source.text(), source);
     }
 
@@ -1504,7 +1504,7 @@ mod tests {
         terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
 
         assert!(editor.set_cursor_line_char(0, 3));
-        editor.update(Action::Insert('\n'));
+        editor.update(EditorAction::Insert('\n'));
 
         assert_eq!(editor.line_rows.len(), editor.source.lines().len_lines());
         for line in 0..editor.line_rows.len() {
@@ -1539,7 +1539,7 @@ mod tests {
         );
 
         assert!(editor.set_cursor_line_char(0, 6));
-        editor.update(Action::Insert('\n'));
+        editor.update(EditorAction::Insert('\n'));
         assert_eq!(
             editor.scroll,
             VisualPosition {
@@ -1548,7 +1548,7 @@ mod tests {
             }
         );
 
-        editor.update(Action::Undo);
+        editor.update(EditorAction::Undo);
         assert_eq!(
             editor.scroll,
             VisualPosition {
@@ -1594,8 +1594,8 @@ mod tests {
     #[test]
     fn selection_background_preserves_the_editor_content() -> Result<(), Infallible> {
         let mut editor = Editor::new("first", theme(), false);
-        editor.update(Action::Select(Motion::Right));
-        editor.update(Action::Select(Motion::Right));
+        editor.update(EditorAction::Select(Motion::Right));
+        editor.update(EditorAction::Select(Motion::Right));
         let backend = TestBackend::new(30, 5);
         let mut terminal = Terminal::new(backend)?;
 
@@ -1646,7 +1646,7 @@ mod tests {
         assert!(editor.viewport_rows.len() > 1);
         assert!(editor.viewport_rows[1].continuation);
         let continuation_column = editor.viewport_rows[1].start_visual_column;
-        editor.update(Action::Move(Motion::Down));
+        editor.update(EditorAction::Move(Motion::Down));
         assert_eq!(editor.cursor_position().line, 0);
         assert_eq!(editor.cursor_position().visual_column, continuation_column);
         assert!(editor.place_cursor(editor.text_area.x, editor.text_area.y + 1, false,));
@@ -1671,9 +1671,9 @@ mod tests {
         terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
         assert!(editor.set_cursor_line_char(0, 3));
 
-        editor.update(Action::Move(Motion::Down));
+        editor.update(EditorAction::Move(Motion::Down));
         assert_eq!(editor.cursor_position().visual_column, 1);
-        editor.update(Action::Move(Motion::Down));
+        editor.update(EditorAction::Move(Motion::Down));
         assert_eq!(editor.cursor_position().visual_column, 3);
 
         Ok(())
@@ -1702,7 +1702,7 @@ mod tests {
         assert!(!rendered.contains("line-0"));
         assert!(rendered.contains("line-3"));
 
-        editor.update(Action::Move(Motion::DocumentEnd));
+        editor.update(EditorAction::Move(Motion::DocumentEnd));
         terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
         assert_eq!(
             editor.scroll,
@@ -1756,7 +1756,7 @@ mod tests {
     fn horizontal_window_follows_the_cursor_without_wrapping_the_line() -> Result<(), Infallible> {
         let source = format!("{}visible-tail", "x".repeat(100_000));
         let mut editor = Editor::new(&source, theme(), false);
-        editor.update(Action::Move(Motion::DocumentEnd));
+        editor.update(EditorAction::Move(Motion::DocumentEnd));
         let mut terminal = Terminal::new(TestBackend::new(30, 5))?;
 
         terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
@@ -1792,8 +1792,8 @@ mod tests {
         };
         assert_count(&editor);
 
-        editor.update(Action::Move(Motion::DocumentEnd));
-        editor.update(Action::InsertText("\nnew words".to_owned()));
+        editor.update(EditorAction::Move(Motion::DocumentEnd));
+        editor.update(EditorAction::InsertText("\nnew words".to_owned()));
         assert_count(&editor);
 
         let newline = editor
@@ -1802,12 +1802,12 @@ mod tests {
             .find("\r\n")
             .ok_or("test source does not contain CRLF")?;
         assert!(editor.select_byte_range(newline..newline + 2));
-        editor.update(Action::Delete);
+        editor.update(EditorAction::Delete);
         assert_count(&editor);
 
-        editor.update(Action::Undo);
+        editor.update(EditorAction::Undo);
         assert_count(&editor);
-        editor.update(Action::Redo);
+        editor.update(EditorAction::Redo);
         assert_count(&editor);
         Ok(())
     }
@@ -1826,7 +1826,7 @@ mod tests {
                 for replacement in ["", "x", "two words", "\n", "\r\njoined", "\u{301}mark"] {
                     let mut editor = Editor::new(original, theme(), false);
                     assert!(editor.select_byte_range(start..end));
-                    editor.update(Action::InsertText(replacement.to_owned()));
+                    editor.update(EditorAction::InsertText(replacement.to_owned()));
                     assert_eq!(
                         editor.word_count(),
                         editor.source.text().unicode_words().count(),
@@ -1901,7 +1901,7 @@ mod tests {
         assert_eq!(editor.cached_bracket_matches(), initial);
         assert_eq!(editor.bracket_cache, initial_cache);
 
-        editor.update(Action::Move(Motion::Right));
+        editor.update(EditorAction::Move(Motion::Right));
         let _ = editor.cached_bracket_matches();
         assert_eq!(
             editor.bracket_cache.as_ref().map(|cache| cache.cursor),
@@ -1909,7 +1909,7 @@ mod tests {
         );
 
         let revision = editor.revision();
-        editor.update(Action::Insert('y'));
+        editor.update(EditorAction::Insert('y'));
         let _ = editor.cached_bracket_matches();
         assert_ne!(editor.revision(), revision);
         assert_eq!(
@@ -2023,7 +2023,7 @@ mod tests {
         let mut draw_samples = Vec::new();
         for _ in 0..20 {
             let edit_started = Instant::now();
-            editor.update(Action::Insert('x'));
+            editor.update(EditorAction::Insert('x'));
             edit_samples.push(edit_started.elapsed());
             let draw_started = Instant::now();
             terminal.draw(|frame| editor.draw(frame, frame.area(), true))?;
