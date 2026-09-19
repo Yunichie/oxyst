@@ -1,72 +1,3 @@
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-#[repr(usize)]
-pub enum CommandId {
-    OpenFile,
-    ExportPdf,
-    ExportPng,
-    ExportSvg,
-    GoToLine,
-    GoToPage,
-    ToggleDiagnostics,
-    ToggleFileExplorer,
-    UseDarkTheme,
-    UseLightTheme,
-    ReloadFonts,
-    Quit,
-    Save,
-    Recompile,
-    Undo,
-    Redo,
-    MoveLeft,
-    MoveRight,
-    MoveUp,
-    MoveDown,
-    SelectLeft,
-    SelectRight,
-    SelectUp,
-    SelectDown,
-    WordLeft,
-    WordRight,
-    SelectWordLeft,
-    SelectWordRight,
-    LineStart,
-    LineEnd,
-    SelectLineStart,
-    SelectLineEnd,
-    DocumentStart,
-    DocumentEnd,
-    SelectDocumentStart,
-    SelectDocumentEnd,
-    SelectAll,
-    Copy,
-    Cut,
-    Paste,
-    Find,
-    FindReplace,
-    FindNext,
-    FindPrevious,
-    SearchToggleField,
-    ReplaceCurrent,
-    Backspace,
-    Delete,
-    Newline,
-    SwitchFocus,
-    Fullscreen,
-    ZoomIn,
-    ZoomOut,
-    PreviewPageUp,
-    PreviewPageDown,
-    CommandPalette,
-    NextDiagnostic,
-    PreviousDiagnostic,
-    Help,
-    CloseOverlay,
-    Confirm,
-    CancelConfirmation,
-    WelcomeNew,
-    WelcomeOpen,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandContext {
     Normal,
@@ -75,7 +6,6 @@ pub enum CommandContext {
     Help,
     Welcome,
     Confirmation,
-    QuitConfirmation,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -115,10 +45,7 @@ const NORMAL_OVERLAY_WELCOME: &[CommandContext] = &[
     CommandContext::Welcome,
 ];
 const SEARCH: &[CommandContext] = &[CommandContext::Search];
-const CONFIRMATION: &[CommandContext] = &[
-    CommandContext::Confirmation,
-    CommandContext::QuitConfirmation,
-];
+const CONFIRMATION: &[CommandContext] = &[CommandContext::Confirmation];
 const WELCOME: &[CommandContext] = &[CommandContext::Welcome];
 
 macro_rules! command {
@@ -147,7 +74,29 @@ macro_rules! command {
     };
 }
 
-const COMMANDS: &[CommandSpec] = &[
+macro_rules! define_commands {
+    ($(command!($id:ident, $($spec:tt)*)),* $(,)?) => {
+        #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+        #[repr(usize)]
+        pub enum CommandId {
+            $($id),*
+        }
+
+        const COMMANDS: &[CommandSpec] = &[
+            $(command!($id, $($spec)*)),*
+        ];
+    };
+}
+
+define_commands! {
+    command!(
+        NewDocument,
+        "new_document",
+        "New document",
+        &["ctrl+n"],
+        NORMAL,
+        palette
+    ),
     command!(
         OpenFile,
         "open_file",
@@ -230,6 +179,23 @@ const COMMANDS: &[CommandSpec] = &[
         palette
     ),
     command!(Quit, "quit", "Quit", &["ctrl+q"], NORMAL_WELCOME, palette),
+    command!(CloseTab, "close_tab", "Close tab", &["ctrl+w"], NORMAL, palette),
+    command!(
+        NextTab,
+        "next_tab",
+        "Next tab",
+        &["alt+right"],
+        NORMAL,
+        palette
+    ),
+    command!(
+        PreviousTab,
+        "previous_tab",
+        "Previous tab",
+        &["alt+left"],
+        NORMAL,
+        palette
+    ),
     command!(Save, "save", "Save", &["ctrl+s"], NORMAL),
     command!(Recompile, "recompile", "Recompile", &["ctrl+r"], NORMAL),
     command!(Undo, "undo", "Undo", &["ctrl+z"], NORMAL),
@@ -483,6 +449,14 @@ const COMMANDS: &[CommandSpec] = &[
         printable
     ),
     command!(
+        DiscardChanges,
+        "discard_changes",
+        "Discard changes",
+        &["d"],
+        CONFIRMATION,
+        printable
+    ),
+    command!(
         WelcomeNew,
         "welcome_new",
         "Create a new document",
@@ -498,7 +472,7 @@ const COMMANDS: &[CommandSpec] = &[
         WELCOME,
         printable
     ),
-];
+}
 
 impl CommandId {
     pub fn all() -> impl ExactSizeIterator<Item = Self> {

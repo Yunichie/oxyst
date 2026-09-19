@@ -72,6 +72,9 @@ clap.workspace = true
 oxyst-app.workspace = true
 oxyst-config.workspace = true
 
+[dev-dependencies]
+toml.workspace = true
+
 [lints]
 workspace = true
 

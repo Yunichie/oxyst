@@ -184,6 +184,26 @@ impl PreviewPipeline {
         }
     }
 
+    pub fn deactivate(&mut self) -> Result<(), String> {
+        self.world_target = None;
+        self.debounce_deadline = None;
+        self.manifest = None;
+        self.page_request = None;
+        self.compiled_document = None;
+        self.document_sync = None;
+        self.compile_started_at = None;
+        self.last_compile_time = None;
+        self.stale = false;
+        self.state = CompileState::NotStarted;
+        match self.worker.invalidate() {
+            Ok(generation) => {
+                self.generation = generation;
+                Ok(())
+            }
+            Err(error) => self.invalidation_failed(error),
+        }
+    }
+
     pub fn start_compile(&mut self, revision: u64, source: Source, now: Instant) {
         self.debounce_deadline = None;
         self.generation = if let Some(target) = &self.world_target {
@@ -507,6 +527,23 @@ mod tests {
                 .is_none()
         );
         assert_eq!(pipeline.state(), CompileState::Compiling);
+        runtime.shutdown_timeout(Duration::from_millis(100));
+        Ok(())
+    }
+
+    #[test]
+    fn deactivation_clears_output_and_rejects_in_flight_work() -> Result<(), Box<dyn Error>> {
+        let (mut pipeline, runtime, source) = pipeline("= closing")?;
+        pipeline.set_preview_width(40, 1);
+        pipeline.start_compile(1, source, Instant::now());
+        pipeline.deactivate()?;
+
+        assert_eq!(pipeline.state(), CompileState::NotStarted);
+        assert!(!pipeline.is_stale());
+        assert!(pipeline.compiled_document(1).is_none());
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(pipeline.poll(1, "= closing").is_empty());
+
         runtime.shutdown_timeout(Duration::from_millis(100));
         Ok(())
     }
